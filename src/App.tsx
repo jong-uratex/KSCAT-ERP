@@ -521,21 +521,6 @@ export default function App() {
                 permissions={permissions}
                 enabledModules={enabledModules}
                 focusHint={searchFocus?.moduleKey === 'billing' ? searchFocus : null}
-                onNavigateModule={(moduleKey, subTab) => {
-                  setActiveModule(moduleKey);
-                  if (subTab && moduleKey === 'commerce') {
-                    setSearchFocus({
-                      moduleKey,
-                      subTab,
-                      recordId: 0,
-                      ref: '',
-                      title: '',
-                      ts: Date.now(),
-                    });
-                  } else {
-                    setSearchFocus(null);
-                  }
-                }}
                 onNotify={notify}
               />
             )}

@@ -2671,8 +2671,8 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
       (await db.prepare('UPDATE invoices SET amount_paid = ?, status = ? WHERE id = ?').run(nextPaid, nextStatus, id));
       (await db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(balanceDelta, Number(bankAccountId)));
       (await db.prepare(
-        `INSERT INTO bank_transactions (bank_account_id, tx_date, label, category, amount, direction, invoice_ref, reconciled, reconciled_at, reconciled_invoice_id, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+        `INSERT INTO bank_transactions (bank_account_id, tx_date, label, category, amount, direction, invoice_ref, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         Number(bankAccountId),
         txDate,
@@ -2681,8 +2681,6 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
         payAmount,
         direction,
         inv.ref,
-        txDate,
-        id,
         req.authUser!.email
       ));
       (await db.exec('COMMIT'));

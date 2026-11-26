@@ -2,40 +2,29 @@ import { useEffect, useState, type FormEvent } from 'react';
 import {
   ArrowLeftRight,
   BookOpen,
-  Building2,
-  Car,
   CreditCard,
   Download,
-  FileSpreadsheet,
-  FolderKanban,
   HeartHandshake,
   Landmark,
-  Mail,
   Pencil,
+  PieChart,
   Plus,
   Receipt,
-  Send,
-  Sparkles,
   Trash2,
-  Users,
   Wallet,
 } from 'lucide-react';
 import { apiRequest, can } from '../lib/api';
 import { formatCurrency, formatDate } from '../lib/format';
 import type {
   AccountingAccount,
-  AccountingReports,
   BankAccount,
   BankTransaction,
   DocumentLine,
   DonationItem,
   EnabledModulesMap,
-  FixedAssetItem,
   Invoice,
   JournalEntry,
   LoanItem,
-  MileageClaimItem,
-  PayrollRunItem,
   PermissionMap,
   ProductItem,
   SearchFocusHint,
@@ -44,15 +33,11 @@ import type {
 } from '../types/erp';
 import { ConfirmDeleteModal, Modal } from './Modal';
 import { StatusText } from './StatusText';
-import { AiFinancePartnerPanel } from './billing/AiFinancePartnerPanel';
-import { FixedAssetsPanel, MileagePanel, PayrollPanel } from './billing/AssetsPayrollMileage';
-import { BankReconciliationPanel, FinancialReportsPanel } from './billing/ReconciliationAndReports';
 
 interface BillingViewProps {
   permissions: PermissionMap;
   enabledModules: EnabledModulesMap;
   focusHint?: SearchFocusHint | null;
-  onNavigateModule?: (moduleKey: 'commerce' | 'hr' | 'projects', subTab?: string) => void;
   onNotify: (msg: string, type?: 'success' | 'error') => void;
 }
 
@@ -64,34 +49,16 @@ interface MarginStats {
   vat_deductible: number;
 }
 
-interface EmployeeBrief {
-  id: number;
-  ref: string;
-  full_name: string;
-  department: string;
-  annual_salary: number;
-  status: string;
-}
-
 type BillingTab =
   | 'customer_invoices'
   | 'supplier_bills'
   | 'treasury'
-  | 'accounting'
-  | 'reports'
-  | 'fixed_assets'
-  | 'payroll'
-  | 'mileage'
   | 'sepa'
-  | 'donations_loans';
+  | 'accounting'
+  | 'donations_loans'
+  | 'margins';
 
-export function BillingView({
-  permissions,
-  enabledModules,
-  focusHint,
-  onNavigateModule,
-  onNotify,
-}: BillingViewProps) {
+export function BillingView({ permissions, enabledModules, focusHint, onNotify }: BillingViewProps) {
   const [tab, setTab] = useState<BillingTab>('customer_invoices');
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
@@ -104,13 +71,6 @@ export function BillingView({
   const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
   const [donations, setDonations] = useState<DonationItem[]>([]);
   const [loans, setLoans] = useState<LoanItem[]>([]);
-  const [fixedAssets, setFixedAssets] = useState<FixedAssetItem[]>([]);
-  const [payrollRuns, setPayrollRuns] = useState<PayrollRunItem[]>([]);
-  const [mileageClaims, setMileageClaims] = useState<MileageClaimItem[]>([]);
-  const [employees, setEmployees] = useState<EmployeeBrief[]>([]);
-  const [reports, setReports] = useState<AccountingReports | null>(null);
-  const [aiOpen, setAiOpen] = useState(false);
-
   const [marginStats, setMarginStats] = useState<MarginStats>({
     revenue_ht: 0,
     credit_notes_ht: 0,
@@ -124,11 +84,6 @@ export function BillingView({
   const [payAccountId, setPayAccountId] = useState('');
   const [payAmount, setPayAmount] = useState('');
   const [payLabel, setPayLabel] = useState('');
-
-  const [sendModal, setSendModal] = useState<Invoice | null>(null);
-  const [sendEmail, setSendEmail] = useState('');
-  const [sendMessage, setSendMessage] = useState('');
-  const [sendingInv, setSendingInv] = useState(false);
 
   // Invoice Create / Edit modal
   const [invoiceModal, setInvoiceModal] = useState(false);
@@ -250,11 +205,6 @@ export function BillingView({
           donations: DonationItem[];
           loans: LoanItem[];
           marginStats: MarginStats;
-          fixedAssets?: FixedAssetItem[];
-          payrollRuns?: PayrollRunItem[];
-          mileageClaims?: MileageClaimItem[];
-          employees?: EmployeeBrief[];
-          reports?: AccountingReports;
         }>('/api/finance-extensions'),
       ]);
       setInvoices(invRes.invoices);
@@ -268,11 +218,6 @@ export function BillingView({
       setDonations(finRes.donations);
       setLoans(finRes.loans);
       if (finRes.marginStats) setMarginStats(finRes.marginStats);
-      if (finRes.fixedAssets) setFixedAssets(finRes.fixedAssets);
-      if (finRes.payrollRuns) setPayrollRuns(finRes.payrollRuns);
-      if (finRes.mileageClaims) setMileageClaims(finRes.mileageClaims);
-      if (finRes.employees) setEmployees(finRes.employees);
-      if (finRes.reports) setReports(finRes.reports);
 
       if (bankRes.accounts[0]) {
         if (!payAccountId) setPayAccountId(String(bankRes.accounts[0].id));
@@ -351,35 +296,6 @@ export function BillingView({
       await loadBilling();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Payment failed.', 'error');
-    }
-  }
-
-  function openSendInvoice(inv: Invoice) {
-    const party = thirdParties.find((tp) => tp.id === inv.third_party_id);
-    setSendModal(inv);
-    setSendEmail(party?.email ?? '');
-    setSendMessage(`Please find invoice ${inv.ref} for ${formatCurrency(inv.total_ttc)} due ${formatDate(inv.due_date)}.`);
-  }
-
-  async function handleSendInvoice(e: FormEvent) {
-    e.preventDefault();
-    if (!sendModal) return;
-    setSendingInv(true);
-    try {
-      const res = await apiRequest<{ sentTo: string; paymentCode: string }>(
-        `/api/invoices/${sendModal.id}/send`,
-        {
-          method: 'POST',
-          body: { recipientEmail: sendEmail, message: sendMessage },
-        }
-      );
-      onNotify(`Sent ${sendModal.ref} to ${res.sentTo} (Ref ${res.paymentCode}).`);
-      setSendModal(null);
-      await loadBilling();
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Unable to send invoice.', 'error');
-    } finally {
-      setSendingInv(false);
     }
   }
 
@@ -963,11 +879,15 @@ export function BillingView({
   const customerInvoices = invoices.filter((i) => i.invoice_type === 'customer');
   const supplierBills = invoices.filter((i) => i.invoice_type === 'supplier');
   const displayedInvoices = tab === 'customer_invoices' ? customerInvoices : supplierBills;
-  const unreconciledCount = transactions.filter((t) => !t.reconciled).length;
+
+  const netSalesHt = marginStats.revenue_ht - marginStats.credit_notes_ht;
+  const grossMargin = netSalesHt - marginStats.purchases_ht;
+  const marginPct = netSalesHt > 0 ? Math.round((grossMargin / netSalesHt) * 1000) / 10 : 0;
+  const netVat = marginStats.vat_collected - marginStats.vat_deductible;
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg bg-zinc-200/70 dark:bg-zinc-800 self-start">
           <button
             type="button"
@@ -979,7 +899,7 @@ export function BillingView({
             }`}
           >
             <Receipt className="w-3.5 h-3.5" />
-            <span>Invoices ({customerInvoices.length})</span>
+            <span>Customer Invoices ({customerInvoices.length})</span>
           </button>
           <button
             type="button"
@@ -991,7 +911,7 @@ export function BillingView({
             }`}
           >
             <CreditCard className="w-3.5 h-3.5" />
-            <span>Pay Bills ({supplierBills.length})</span>
+            <span>Supplier Bills ({supplierBills.length})</span>
           </button>
           <button
             type="button"
@@ -1003,72 +923,10 @@ export function BillingView({
             }`}
           >
             <Landmark className="w-3.5 h-3.5" />
-            <span>
-              Bank & Reconcile ({unreconciledCount > 0 ? `${unreconciledCount} due` : accounts.length})
-            </span>
+            <span>Bank & Treasury ({accounts.length})</span>
           </button>
           {showAccounting && (
             <>
-              <button
-                type="button"
-                onClick={() => setTab('reports')}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
-                  tab === 'reports'
-                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
-                    : 'text-zinc-600 dark:text-zinc-400'
-                }`}
-              >
-                <FileSpreadsheet className="w-3.5 h-3.5" />
-                <span>Reports</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setTab('accounting')}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
-                  tab === 'accounting'
-                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
-                    : 'text-zinc-600 dark:text-zinc-400'
-                }`}
-              >
-                <BookOpen className="w-3.5 h-3.5" />
-                <span>Ledger ({glAccounts.length})</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setTab('fixed_assets')}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
-                  tab === 'fixed_assets'
-                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
-                    : 'text-zinc-600 dark:text-zinc-400'
-                }`}
-              >
-                <Building2 className="w-3.5 h-3.5" />
-                <span>Fixed Assets ({fixedAssets.length})</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setTab('payroll')}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
-                  tab === 'payroll'
-                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
-                    : 'text-zinc-600 dark:text-zinc-400'
-                }`}
-              >
-                <Users className="w-3.5 h-3.5" />
-                <span>Payroll ({payrollRuns.length})</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setTab('mileage')}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
-                  tab === 'mileage'
-                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
-                    : 'text-zinc-600 dark:text-zinc-400'
-                }`}
-              >
-                <Car className="w-3.5 h-3.5" />
-                <span>Mileage ({mileageClaims.length})</span>
-              </button>
               <button
                 type="button"
                 onClick={() => setTab('sepa')}
@@ -1083,6 +941,18 @@ export function BillingView({
               </button>
               <button
                 type="button"
+                onClick={() => setTab('accounting')}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
+                  tab === 'accounting'
+                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
+                    : 'text-zinc-600 dark:text-zinc-400'
+                }`}
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>Accounting ({glAccounts.length})</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => setTab('donations_loans')}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
                   tab === 'donations_loans'
@@ -1093,24 +963,23 @@ export function BillingView({
                 <HeartHandshake className="w-3.5 h-3.5" />
                 <span>Donations & Loans</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setTab('margins')}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
+                  tab === 'margins'
+                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
+                    : 'text-zinc-600 dark:text-zinc-400'
+                }`}
+              >
+                <PieChart className="w-3.5 h-3.5" />
+                <span>Margins & Reports</span>
+              </button>
             </>
           )}
         </div>
 
-        <div className="flex items-center gap-2 shrink-0 flex-wrap">
-          <button
-            type="button"
-            onClick={() => setAiOpen((prev) => !prev)}
-            className={`px-3.5 py-2 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
-              aiOpen
-                ? 'border-orange-700 bg-orange-50 dark:bg-orange-950/40 text-orange-800 dark:text-orange-300'
-                : 'border-zinc-300 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200'
-            }`}
-          >
-            <Sparkles className="w-3.5 h-3.5 text-orange-700 dark:text-orange-400" />
-            <span>AI Finance Partner</span>
-          </button>
-
+        <div className="flex items-center gap-2 shrink-0">
           {canWrite && (tab === 'customer_invoices' || tab === 'supplier_bills') && (
             <button
               type="button"
@@ -1130,7 +999,7 @@ export function BillingView({
                   disabled={accounts.length === 0}
                   className="px-3.5 py-2 rounded-lg border border-zinc-300 dark:border-zinc-700 text-xs font-medium disabled:opacity-50 whitespace-nowrap"
                 >
-                  + Record Statement Line
+                  + Record Entry
                 </button>
               )}
               {canWrite && (
@@ -1196,45 +1065,6 @@ export function BillingView({
         </div>
       </div>
 
-      {onNavigateModule && (
-        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-xs">
-          <span className="text-zinc-500 font-medium">Connected Accounting Workflows:</span>
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={() => onNavigateModule('commerce', 'proposals')}
-              className="text-zinc-700 dark:text-zinc-300 hover:text-orange-700 dark:hover:text-orange-400 font-medium whitespace-nowrap"
-            >
-              Send Quotes →
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigateModule('commerce', 'purchase_orders')}
-              className="text-zinc-700 dark:text-zinc-300 hover:text-orange-700 dark:hover:text-orange-400 font-medium whitespace-nowrap"
-            >
-              Create Purchase Orders →
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigateModule('hr')}
-              className="text-zinc-700 dark:text-zinc-300 hover:text-orange-700 dark:hover:text-orange-400 font-medium whitespace-nowrap"
-            >
-              Claim Expenses →
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigateModule('projects')}
-              className="inline-flex items-center gap-1 text-zinc-700 dark:text-zinc-300 hover:text-orange-700 dark:hover:text-orange-400 font-medium whitespace-nowrap"
-            >
-              <FolderKanban className="w-3.5 h-3.5" />
-              <span>Track Projects →</span>
-            </button>
-          </div>
-        </div>
-      )}
-
-      <AiFinancePartnerPanel open={aiOpen} onClose={() => setAiOpen(false)} onNotify={onNotify} />
-
       {loading ? (
         <div className="p-8 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-center text-sm text-zinc-500">
           Loading financial ledger...
@@ -1293,16 +1123,6 @@ export function BillingView({
                             Validate
                           </button>
                         )}
-                        {canWrite && inv.invoice_type === 'customer' && inv.status !== 'cancelled' && (
-                          <button
-                            type="button"
-                            onClick={() => openSendInvoice(inv)}
-                            className="inline-flex items-center gap-1 text-xs font-medium text-zinc-700 dark:text-zinc-300 hover:text-orange-700 dark:hover:text-orange-400"
-                          >
-                            <Send className="w-3 h-3" />
-                            <span>Send</span>
-                          </button>
-                        )}
                         {canRecordPay && (inv.status === 'validated' || inv.status === 'partial') && (
                           <button
                             type="button"
@@ -1313,7 +1133,7 @@ export function BillingView({
                             className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
                           >
                             <Wallet className="w-3.5 h-3.5" />
-                            <span>{inv.invoice_type === 'supplier' ? 'Pay Bill' : 'Accept Payment'}</span>
+                            <span>Record Payment</span>
                           </button>
                         )}
                         {canWrite && (
@@ -1410,25 +1230,78 @@ export function BillingView({
             ))}
           </div>
 
-          <BankReconciliationPanel
-            accounts={accounts}
-            transactions={transactions}
-            invoices={invoices}
-            glAccounts={glAccounts}
-            canRecordPay={canRecordPay}
-            canDelete={canDelete}
-            onEditTx={openEditTx}
-            onPromptDeleteTx={(tx) =>
-              promptDelete(
-                `/api/bank-transactions/${tx.id}`,
-                'Delete Bank Transaction',
-                tx.label,
-                'Deleting this entry automatically reverses its cash impact on the linked bank account.'
-              )
-            }
-            onReload={loadBilling}
-            onNotify={onNotify}
-          />
+          <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
+            <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800">
+              <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Treasury Bank Ledger</h3>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-zinc-950/50 text-zinc-500">
+                    <th className="py-2.5 px-4 font-medium">Date</th>
+                    <th className="py-2.5 px-4 font-medium">Account</th>
+                    <th className="py-2.5 px-4 font-medium">Description</th>
+                    <th className="py-2.5 px-4 font-medium">Category</th>
+                    <th className="py-2.5 px-4 font-medium text-right">Amount</th>
+                    <th className="py-2.5 px-4 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+                  {transactions.map((tx) => (
+                    <tr key={tx.id}>
+                      <td className="py-2.5 px-4 font-mono text-zinc-500">{formatDate(tx.tx_date)}</td>
+                      <td className="py-2.5 px-4 font-medium text-zinc-800 dark:text-zinc-200">
+                        {tx.account_ref} · {tx.account_name}
+                      </td>
+                      <td className="py-2.5 px-4 text-zinc-700 dark:text-zinc-300">{tx.label}</td>
+                      <td className="py-2.5 px-4 text-zinc-500">{tx.category}</td>
+                      <td
+                        className={`py-2.5 px-4 font-mono tabular-nums text-right font-semibold ${
+                          tx.direction === 'credit'
+                            ? 'text-emerald-700 dark:text-emerald-400'
+                            : 'text-red-700 dark:text-red-400'
+                        }`}
+                      >
+                        {tx.direction === 'credit' ? '+' : '-'}
+                        {formatCurrency(tx.amount)}
+                      </td>
+                      <td className="py-2.5 px-4 text-right space-x-2.5 whitespace-nowrap">
+                        {canRecordPay && (
+                          <button
+                            type="button"
+                            onClick={() => openEditTx(tx)}
+                            title="Edit transaction"
+                            aria-label={`Edit transaction ${tx.label}`}
+                            className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 inline-flex items-center align-middle"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              promptDelete(
+                                `/api/bank-transactions/${tx.id}`,
+                                'Delete Bank Transaction',
+                                tx.label,
+                                'Deleting this entry automatically reverses its cash impact on the linked bank account.'
+                              )
+                            }
+                            title="Delete transaction"
+                            aria-label={`Delete transaction ${tx.label}`}
+                            className="text-zinc-400 hover:text-red-600 inline-flex items-center align-middle"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       ) : tab === 'sepa' ? (
         <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
@@ -1788,41 +1661,48 @@ export function BillingView({
             </div>
           </div>
         </div>
-      ) : tab === 'reports' ? (
-        <FinancialReportsPanel reports={reports} marginStats={marginStats} onNotify={onNotify} />
-      ) : tab === 'fixed_assets' ? (
-        <FixedAssetsPanel
-          assets={fixedAssets}
-          canWrite={canWrite}
-          canDelete={canDelete}
-          onPromptDelete={promptDelete}
-          onReload={loadBilling}
-          onNotify={onNotify}
-        />
-      ) : tab === 'payroll' ? (
-        <PayrollPanel
-          runs={payrollRuns}
-          employees={employees}
-          accounts={accounts}
-          canWrite={canWrite}
-          canRecordPay={canRecordPay}
-          canDelete={canDelete}
-          onPromptDelete={promptDelete}
-          onReload={loadBilling}
-          onNotify={onNotify}
-        />
       ) : (
-        <MileagePanel
-          claims={mileageClaims}
-          employees={employees}
-          accounts={accounts}
-          canWrite={canWrite}
-          canRecordPay={canRecordPay}
-          canDelete={canDelete}
-          onPromptDelete={promptDelete}
-          onReload={loadBilling}
-          onNotify={onNotify}
-        />
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="p-5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+              <div className="text-xs text-zinc-500">Net Sales Revenue (HT)</div>
+              <div className="mt-2 text-2xl font-mono tabular-nums font-semibold text-zinc-900 dark:text-zinc-100">
+                {formatCurrency(netSalesHt)}
+              </div>
+              <div className="mt-1 text-xs text-zinc-500">
+                Credit Notes deducted: {formatCurrency(marginStats.credit_notes_ht)}
+              </div>
+            </div>
+            <div className="p-5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+              <div className="text-xs text-zinc-500">Supplier Purchases (HT)</div>
+              <div className="mt-2 text-2xl font-mono tabular-nums font-semibold text-zinc-900 dark:text-zinc-100">
+                {formatCurrency(marginStats.purchases_ht)}
+              </div>
+              <div className="mt-1 text-xs text-zinc-500">Direct procurement cost</div>
+            </div>
+            <div className="p-5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+              <div className="text-xs text-zinc-500">Commercial Gross Margin</div>
+              <div
+                className={`mt-2 text-2xl font-mono tabular-nums font-semibold ${
+                  grossMargin >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'
+                }`}
+              >
+                {formatCurrency(grossMargin)}
+              </div>
+              <div className="mt-1 text-xs font-mono text-zinc-500">Margin Rate: {marginPct}%</div>
+            </div>
+            <div className="p-5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+              <div className="text-xs text-zinc-500">Net VAT Position</div>
+              <div className="mt-2 text-2xl font-mono tabular-nums font-semibold text-zinc-900 dark:text-zinc-100">
+                {formatCurrency(netVat)}
+              </div>
+              <div className="mt-1 text-xs text-zinc-500">
+                Collected {formatCurrency(marginStats.vat_collected)} − Deductible{' '}
+                {formatCurrency(marginStats.vat_deductible)}
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Record Payment Modal */}
@@ -2968,67 +2848,6 @@ export function BillingView({
             </button>
           </div>
         </form>
-      </Modal>
-
-      {/* Send Invoice Modal */}
-      <Modal
-        open={Boolean(sendModal)}
-        onClose={() => setSendModal(null)}
-        title={sendModal ? `Send Invoice — ${sendModal.ref}` : ''}
-        subtitle={
-          sendModal
-            ? `${sendModal.party_name} · Amount Due ${formatCurrency(Math.max(0, sendModal.total_ttc - sendModal.amount_paid))}`
-            : ''
-        }
-      >
-        {sendModal && (
-          <form onSubmit={handleSendInvoice} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Recipient Email
-              </label>
-              <div className="relative">
-                <Mail className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="email"
-                  required
-                  value={sendEmail}
-                  onChange={(e) => setSendEmail(e.target.value)}
-                  placeholder="billing@customer.example"
-                  className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950"
-                />
-              </div>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Message & Payment Instructions
-              </label>
-              <textarea
-                rows={3}
-                value={sendMessage}
-                onChange={(e) => setSendMessage(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setSendModal(null)}
-                className="px-4 py-2 rounded-lg border border-zinc-300 dark:border-zinc-700 text-xs font-medium"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={sendingInv}
-                className="px-4 py-2 rounded-lg bg-orange-700 hover:bg-orange-800 text-white text-xs font-medium inline-flex items-center gap-1.5"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>{sendingInv ? 'Sending...' : 'Send Invoice'}</span>
-              </button>
-            </div>
-          </form>
-        )}
       </Modal>
 
       <ConfirmDeleteModal
