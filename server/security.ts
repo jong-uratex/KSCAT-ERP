@@ -1,7 +1,15 @@
 import crypto from 'node:crypto';
 import QRCode from 'qrcode';
 
-const EPHEMERAL_SIGNING_KEY = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+let ephemeralSigningKey: string | null = null;
+function getFallbackSigningKey(): string {
+  if (!ephemeralSigningKey) {
+    ephemeralSigningKey =
+      (typeof process !== 'undefined' && process.env?.SESSION_SECRET) ||
+      crypto.randomBytes(32).toString('hex');
+  }
+  return ephemeralSigningKey;
+}
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 export function hashPassword(password: string): string {
@@ -50,7 +58,7 @@ export function signChallengeToken(
   ttlSeconds = 300,
   signingSecret?: string
 ): string {
-  const key = signingSecret || EPHEMERAL_SIGNING_KEY;
+  const key = signingSecret || getFallbackSigningKey();
   const payload: ChallengePayload = {
     sub: userId,
     purpose,
@@ -76,7 +84,7 @@ export function verifyChallengeToken(
   const [encoded, sig] = parts;
   if (!encoded || !sig) return null;
 
-  const key = signingSecret || EPHEMERAL_SIGNING_KEY;
+  const key = signingSecret || getFallbackSigningKey();
   const expectedSig = crypto
     .createHmac('sha256', key)
     .update(encoded)
