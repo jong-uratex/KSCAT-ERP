@@ -487,6 +487,10 @@ export interface BankTransaction {
   amount: number;
   direction: 'credit' | 'debit';
   invoice_ref: string;
+  reconciled?: number;
+  reconciled_at?: string;
+  reconciled_invoice_id?: number | null;
+  gl_account_code?: string;
   created_by: string;
 }
 
@@ -822,3 +826,119 @@ export interface SearchFocusHint {
   title: string;
   ts: number;
 }
+
+export interface FixedAssetItem {
+  id: number;
+  ref: string;
+  name: string;
+  category: string;
+  purchase_date: string;
+  purchase_cost: number;
+  salvage_value: number;
+  useful_life_months: number;
+  depreciation_method: 'straight_line' | 'declining_balance';
+  accumulated_depreciation: number;
+  last_depreciation_date: string;
+  status: 'active' | 'disposed';
+  notes: string;
+}
+
+export interface PayrollLineItem {
+  id?: number;
+  payroll_run_id?: number;
+  employee_id: number | null;
+  employee_name: string;
+  base_salary: number;
+  overtime_allowances: number;
+  tax_deductions: number;
+  net_pay: number;
+}
+
+export interface PayrollRunItem {
+  id: number;
+  ref: string;
+  pay_period_start: string;
+  pay_period_end: string;
+  pay_date: string;
+  employee_count: number;
+  total_gross: number;
+  total_deductions: number;
+  total_net: number;
+  status: 'draft' | 'approved' | 'paid';
+  bank_account_id: number | null;
+  bank_account_name?: string | null;
+  bank_account_ref?: string | null;
+  notes: string;
+  lines: PayrollLineItem[];
+}
+
+export interface MileageClaimItem {
+  id: number;
+  ref: string;
+  employee_id: number | null;
+  employee_name: string;
+  claim_date: string;
+  origin: string;
+  destination: string;
+  distance_km: number;
+  rate_per_km: number;
+  total_amount: number;
+  vehicle: string;
+  project_ref: string;
+  notes: string;
+  status: 'draft' | 'submitted' | 'approved' | 'paid';
+  bank_account_id: number | null;
+}
+
+export interface AgingBucketSummary {
+  current: number;
+  d1_30: number;
+  d31_60: number;
+  d61_plus: number;
+  total: number;
+}
+
+export interface AccountingReports {
+  pnl: {
+    revenueAccounts: AccountingAccount[];
+    expenseAccounts: AccountingAccount[];
+    totalRevenue: number;
+    totalExpenses: number;
+    netIncome: number;
+  };
+  balanceSheet: {
+    assetAccounts: AccountingAccount[];
+    liabilityAccounts: AccountingAccount[];
+    equityAccounts: AccountingAccount[];
+    totalAssets: number;
+    totalLiabilities: number;
+    totalEquity: number;
+    currentYearNetIncome: number;
+  };
+  trialBalance: {
+    rows: Array<{ code: string; label: string; account_class: string; debit: number; credit: number }>;
+    totalDebits: number;
+    totalCredits: number;
+  };
+  aging: {
+    receivables: AgingBucketSummary;
+    payables: AgingBucketSummary;
+    overdueItems: Array<{
+      id: number;
+      ref: string;
+      invoice_type: 'customer' | 'supplier';
+      party_name: string;
+      due_date: string;
+      days_overdue: number;
+      balance_due: number;
+    }>;
+  };
+  vatSummary: {
+    taxableSalesHt: number;
+    taxablePurchasesHt: number;
+    vatCollected: number;
+    vatDeductible: number;
+    netVatPayable: number;
+  };
+}
+

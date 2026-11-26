@@ -450,6 +450,10 @@ export const SCHEMA_SQL = `
     amount REAL NOT NULL,
     direction TEXT NOT NULL CHECK (direction IN ('credit', 'debit')),
     invoice_ref TEXT NOT NULL DEFAULT '',
+    reconciled INTEGER NOT NULL DEFAULT 0,
+    reconciled_at TEXT NOT NULL DEFAULT '',
+    reconciled_invoice_id INTEGER REFERENCES invoices(id),
+    gl_account_code TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -754,6 +758,70 @@ export const SCHEMA_SQL = `
     date_format TEXT NOT NULL DEFAULT 'MMM d, yyyy',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS fixed_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'Equipment',
+    purchase_date TEXT NOT NULL,
+    purchase_cost REAL NOT NULL DEFAULT 0,
+    salvage_value REAL NOT NULL DEFAULT 0,
+    useful_life_months INTEGER NOT NULL DEFAULT 36,
+    depreciation_method TEXT NOT NULL DEFAULT 'straight_line' CHECK (depreciation_method IN ('straight_line', 'declining_balance')),
+    accumulated_depreciation REAL NOT NULL DEFAULT 0,
+    last_depreciation_date TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disposed')),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS payroll_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    pay_period_start TEXT NOT NULL,
+    pay_period_end TEXT NOT NULL,
+    pay_date TEXT NOT NULL,
+    employee_count INTEGER NOT NULL DEFAULT 0,
+    total_gross REAL NOT NULL DEFAULT 0,
+    total_deductions REAL NOT NULL DEFAULT 0,
+    total_net REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved', 'paid')),
+    bank_account_id INTEGER REFERENCES bank_accounts(id),
+    notes TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS payroll_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payroll_run_id INTEGER NOT NULL REFERENCES payroll_runs(id) ON DELETE CASCADE,
+    employee_id INTEGER REFERENCES employees(id),
+    employee_name TEXT NOT NULL,
+    base_salary REAL NOT NULL DEFAULT 0,
+    overtime_allowances REAL NOT NULL DEFAULT 0,
+    tax_deductions REAL NOT NULL DEFAULT 0,
+    net_pay REAL NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS mileage_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    employee_id INTEGER REFERENCES employees(id),
+    employee_name TEXT NOT NULL,
+    claim_date TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    distance_km REAL NOT NULL DEFAULT 0,
+    rate_per_km REAL NOT NULL DEFAULT 0.67,
+    total_amount REAL NOT NULL DEFAULT 0,
+    vehicle TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'submitted', 'approved', 'paid')),
+    bank_account_id INTEGER REFERENCES bank_accounts(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `;
 
 async function ensureColumn(db: DbClient, table: string, column: string, definition: string): Promise<void> {
@@ -848,6 +916,14 @@ export async function ensureDefaults(db: DbClient): Promise<void> {
     (await insAcct.run('6100', 'Facilities & Warehouse Lease', 'expense', 6800.0));
     (await insAcct.run('6200', 'Payroll & Benefits', 'expense', 14500.0));
   }
+
+  const insAcctIgnore = db.prepare(
+    `INSERT OR IGNORE INTO accounting_accounts (code, label, account_class, balance) VALUES (?, ?, ?, ?)`
+  );
+  (await insAcctIgnore.run('1500', 'Fixed Assets & Equipment', 'asset', 124500.0));
+  (await insAcctIgnore.run('1590', 'Accumulated Depreciation', 'asset', -18200.0));
+  (await insAcctIgnore.run('6300', 'Depreciation & Amortization Expense', 'expense', 3100.0));
+  (await insAcctIgnore.run('6400', 'Mileage & Fleet Travel Expense', 'expense', 640.0));
 
   const defaultIntegrations: Record<string, Record<string, unknown>> = {
     ldap: {
@@ -1201,6 +1277,101 @@ export async function seedExtendedBusinessData(db: DbClient, actorEmail: string)
   } catch (err) {
     (await db.exec('ROLLBACK'));
     throw err;
+  }
+
+  await seedXeroAccountingData(db, actorEmail);
+}
+
+export async function seedXeroAccountingData(db: DbClient, actorEmail: string): Promise<void> {
+  const faCount = (await db.prepare('SELECT COUNT(*) as cnt FROM fixed_assets').get()) as { cnt: number };
+  if (faCount.cnt === 0) {
+    (await db.prepare(
+      `INSERT INTO fixed_assets (ref, name, category, purchase_date, purchase_cost, salvage_value, useful_life_months, depreciation_method, accumulated_depreciation, last_depreciation_date, status, notes)
+       VALUES
+       ('FA-1001', 'CNC Precision Calibration Bench #2', 'Machinery & Lab', '2025-07-01', 64000, 6400, 60, 'straight_line', 14400, '2026-10-31', 'active', 'Financed under Silicon Valley Commercial equipment facility.'),
+       ('FA-1002', 'Warehouse Forklift & Reach Stacker', 'Warehouse Fleet', '2025-11-15', 38500, 3500, 48, 'straight_line', 3200, '2026-10-31', 'active', 'Chicago distribution dock material handling.'),
+       ('FA-1003', 'Thermal Environmental Test Chamber', 'QA Testing', '2026-04-01', 22000, 2000, 60, 'declining_balance', 600, '2026-10-31', 'active', 'Environmental burn-in chamber for Edge Gateway X4.')`
+    ).run());
+  }
+
+  const prCount = (await db.prepare('SELECT COUNT(*) as cnt FROM payroll_runs').get()) as { cnt: number };
+  if (prCount.cnt === 0) {
+    const emps = (await db.prepare('SELECT id, full_name, annual_salary FROM employees ORDER BY id ASC').all()) as Array<{
+      id: number;
+      full_name: string;
+      annual_salary: number;
+    }>;
+    const banks = (await db.prepare('SELECT id FROM bank_accounts ORDER BY id ASC').all()) as Array<{ id: number }>;
+    const bankId = banks[0]?.id ?? null;
+
+    if (emps.length > 0) {
+      const lines = emps.map((e) => {
+        const base = Math.round((e.annual_salary / 12) * 100) / 100;
+        const overtime = e.id === emps[0].id ? 450 : 0;
+        const gross = base + overtime;
+        const deductions = Math.round(gross * 0.22 * 100) / 100;
+        const net = Math.round((gross - deductions) * 100) / 100;
+        return { empId: e.id, name: e.full_name, base, overtime, deductions, net, gross };
+      });
+      const totalGross = Math.round(lines.reduce((s, l) => s + l.gross, 0) * 100) / 100;
+      const totalDed = Math.round(lines.reduce((s, l) => s + l.deductions, 0) * 100) / 100;
+      const totalNet = Math.round(lines.reduce((s, l) => s + l.net, 0) * 100) / 100;
+
+      const runId = Number(
+        (await db.prepare(
+          `INSERT INTO payroll_runs (ref, pay_period_start, pay_period_end, pay_date, employee_count, total_gross, total_deductions, total_net, status, bank_account_id, notes, created_by)
+           VALUES ('PAY2611-0001', '2026-11-01', '2026-11-30', '2026-11-30', ?, ?, ?, ?, 'approved', ?, 'November monthly salaried engineering & finance payroll.', ?)`
+        ).run(lines.length, totalGross, totalDed, totalNet, bankId, actorEmail)).lastInsertRowid
+      );
+      const insLine = db.prepare(
+        `INSERT INTO payroll_lines (payroll_run_id, employee_id, employee_name, base_salary, overtime_allowances, tax_deductions, net_pay)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const l of lines) {
+        (await insLine.run(runId, l.empId, l.name, l.base, l.overtime, l.deductions, l.net));
+      }
+    }
+  }
+
+  const milCount = (await db.prepare('SELECT COUNT(*) as cnt FROM mileage_claims').get()) as { cnt: number };
+  if (milCount.cnt === 0) {
+    const emps = (await db.prepare('SELECT id, full_name FROM employees ORDER BY id ASC').all()) as Array<{
+      id: number;
+      full_name: string;
+    }>;
+    const emp1 = emps[0];
+    (await db.prepare(
+      `INSERT INTO mileage_claims (ref, employee_id, employee_name, claim_date, origin, destination, distance_km, rate_per_km, total_amount, vehicle, project_ref, notes, status)
+       VALUES
+       ('MIL2611-0001', ?, ?, '2026-11-18', 'Chicago HQ', 'Northwind Plant Line-4 (Aurora, IL)', 142.0, 0.67, 95.14, 'Company Fleet Van #02', 'PJ2611-0001', 'Round-trip optical sensor calibration visit.', 'approved'),
+       ('MIL2611-0002', ?, ?, '2026-11-22', 'Chicago HQ', 'O''Hare Cargo Terminal', 58.0, 0.67, 38.86, 'Personal Sedan', 'PJ2611-0001', 'Urgent DHL spare power module pickup.', 'submitted')`
+    ).run(
+      emp1?.id ?? null,
+      emp1?.full_name ?? 'Marcus Chen',
+      emp1?.id ?? null,
+      emp1?.full_name ?? 'Marcus Chen'
+    ));
+  }
+
+  // Mark invoice-linked bank transactions reconciled and keep feed items unreconciled for the Bank Reconciliation workbench
+  (await db.prepare(
+    `UPDATE bank_transactions
+     SET reconciled = 1, reconciled_at = COALESCE(NULLIF(reconciled_at, ''), tx_date)
+     WHERE invoice_ref != '' AND reconciled = 0`
+  ).run());
+
+  // Ensure at least one realistic unreconciled bank feed deposit matching open invoice IN2611-0003 ($5,880) or partial IN2611-0002 ($3,412)
+  const unreconciledFeed = (await db
+    .prepare(`SELECT COUNT(*) as cnt FROM bank_transactions WHERE label LIKE '%Vespera Logistics%'`)
+    .get()) as { cnt: number };
+  if (unreconciledFeed.cnt === 0) {
+    const b1 = (await db.prepare(`SELECT id FROM bank_accounts ORDER BY id ASC LIMIT 1`).get()) as { id: number } | undefined;
+    if (b1) {
+      (await db.prepare(
+        `INSERT INTO bank_transactions (bank_account_id, tx_date, label, category, amount, direction, invoice_ref, reconciled, created_by)
+         VALUES (?, '2026-11-24', 'Incoming Wire — Vespera Logistics GmbH (Ref IN2611-0003)', 'Bank Feed', 5880.0, 'credit', '', 0, 'bank-feed')`
+      ).run(b1.id));
+    }
   }
 }
 
@@ -1734,6 +1905,10 @@ export async function initDatabase(db: DbClient): Promise<void> {
     try {
       const row = await db.prepare('SELECT id FROM system_settings WHERE id = 1').get();
       await db.prepare('SELECT invoice_kind FROM invoices LIMIT 1').get();
+      await db.prepare('SELECT reconciled FROM bank_transactions LIMIT 1').get();
+      await db.prepare('SELECT id FROM fixed_assets LIMIT 1').get();
+      await db.prepare('SELECT id FROM payroll_runs LIMIT 1').get();
+      await db.prepare('SELECT id FROM mileage_claims LIMIT 1').get();
       if (row) {
         d1IsolateSchemaReady = true;
         initializedDbs.add(db);
@@ -1759,12 +1934,17 @@ export async function initDatabase(db: DbClient): Promise<void> {
   await ensureColumn(db, 'sales_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'EXW'");
   await ensureColumn(db, 'purchase_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'FOB'");
   await ensureColumn(db, 'invoices', 'invoice_kind', "TEXT NOT NULL DEFAULT 'standard'");
+  await ensureColumn(db, 'bank_transactions', 'reconciled', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'bank_transactions', 'reconciled_at', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'bank_transactions', 'reconciled_invoice_id', 'INTEGER');
+  await ensureColumn(db, 'bank_transactions', 'gl_account_code', "TEXT NOT NULL DEFAULT ''");
 
   await ensureDefaults(db);
 
   const preExistingParties = (await db.prepare('SELECT COUNT(*) as cnt FROM third_parties').get()) as { cnt: number };
   if (preExistingParties.cnt > 0) {
     await seedExtendedBusinessData(db, 'system-upgrade');
+    await seedXeroAccountingData(db, 'system-upgrade');
   }
 
   if (db.dialect === 'd1') {
