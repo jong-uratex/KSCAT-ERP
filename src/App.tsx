@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import {
   Boxes,
   Building2,
@@ -19,22 +19,49 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
-import { AdminSecurityView } from './components/AdminSecurityView';
 import { AuthPortal } from './components/AuthPortal';
-import { BillingView } from './components/BillingView';
-import { CommerceView } from './components/CommerceView';
-import { DashboardView } from './components/DashboardView';
 import { GlobalSearchBar } from './components/GlobalSearchBar';
-import { HrView } from './components/HrView';
-import { InventoryView } from './components/InventoryView';
-import { ManufacturingView } from './components/ManufacturingView';
-import { PosView } from './components/PosView';
-import { ProjectsView } from './components/ProjectsView';
-import { SupportView } from './components/SupportView';
-import { ThirdPartiesView } from './components/ThirdPartiesView';
-import { UserProfileView } from './components/UserProfileView';
-import { WorkspaceToolsView } from './components/WorkspaceToolsView';
 import { apiRequest, can, setAuthToken, setUnauthorizedHandler } from './lib/api';
+
+const AdminSecurityView = lazy(() =>
+  import('./components/AdminSecurityView').then((m) => ({ default: m.AdminSecurityView }))
+);
+const BillingView = lazy(() =>
+  import('./components/BillingView').then((m) => ({ default: m.BillingView }))
+);
+const CommerceView = lazy(() =>
+  import('./components/CommerceView').then((m) => ({ default: m.CommerceView }))
+);
+const DashboardView = lazy(() =>
+  import('./components/DashboardView').then((m) => ({ default: m.DashboardView }))
+);
+const HrView = lazy(() =>
+  import('./components/HrView').then((m) => ({ default: m.HrView }))
+);
+const InventoryView = lazy(() =>
+  import('./components/InventoryView').then((m) => ({ default: m.InventoryView }))
+);
+const ManufacturingView = lazy(() =>
+  import('./components/ManufacturingView').then((m) => ({ default: m.ManufacturingView }))
+);
+const PosView = lazy(() =>
+  import('./components/PosView').then((m) => ({ default: m.PosView }))
+);
+const ProjectsView = lazy(() =>
+  import('./components/ProjectsView').then((m) => ({ default: m.ProjectsView }))
+);
+const SupportView = lazy(() =>
+  import('./components/SupportView').then((m) => ({ default: m.SupportView }))
+);
+const ThirdPartiesView = lazy(() =>
+  import('./components/ThirdPartiesView').then((m) => ({ default: m.ThirdPartiesView }))
+);
+const UserProfileView = lazy(() =>
+  import('./components/UserProfileView').then((m) => ({ default: m.UserProfileView }))
+);
+const WorkspaceToolsView = lazy(() =>
+  import('./components/WorkspaceToolsView').then((m) => ({ default: m.WorkspaceToolsView }))
+);
 import { setDefaultCurrency } from './lib/format';
 import type {
   EnabledModulesMap,
@@ -446,92 +473,100 @@ export default function App() {
 
         {/* Active Module Viewport */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1400px] w-full mx-auto">
-          {currentNav?.key === 'dashboard' && (
-            <DashboardView
-              onNavigate={(k) =>
-                setActiveModule((k === 'admin' ? 'settings' : k) as ModuleKey)
-              }
-            />
-          )}
-          {currentNav?.key === 'crm' && (
-            <ThirdPartiesView
-              permissions={permissions}
-              enabledModules={enabledModules}
-              focusHint={searchFocus?.moduleKey === 'crm' ? searchFocus : null}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'inventory' && (
-            <InventoryView
-              permissions={permissions}
-              focusHint={searchFocus?.moduleKey === 'inventory' ? searchFocus : null}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'manufacturing' && (
-            <ManufacturingView permissions={permissions} onNotify={notify} />
-          )}
-          {currentNav?.key === 'commerce' && (
-            <CommerceView
-              permissions={permissions}
-              enabledModules={enabledModules}
-              focusHint={searchFocus?.moduleKey === 'commerce' ? searchFocus : null}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'pos' && (
-            <PosView permissions={permissions} onNotify={notify} />
-          )}
-          {currentNav?.key === 'billing' && (
-            <BillingView
-              permissions={permissions}
-              enabledModules={enabledModules}
-              focusHint={searchFocus?.moduleKey === 'billing' ? searchFocus : null}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'support' && (
-            <SupportView
-              permissions={permissions}
-              focusHint={searchFocus?.moduleKey === 'support' ? searchFocus : null}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'projects' && (
-            <ProjectsView
-              permissions={permissions}
-              enabledModules={enabledModules}
-              focusHint={searchFocus?.moduleKey === 'projects' ? searchFocus : null}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'hr' && (
-            <HrView permissions={permissions} onNotify={notify} />
-          )}
-          {currentNav?.key === 'tools' && (
-            <WorkspaceToolsView
-              permissions={permissions}
-              enabledModules={enabledModules}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'profile' && (
-            <UserProfileView
-              currentUser={user}
-              onUserUpdated={refreshCurrentUser}
-              onNotify={notify}
-            />
-          )}
-          {currentNav?.key === 'settings' && can(permissions, 'admin', 'read') && (
-            <AdminSecurityView
-              currentUser={user}
-              permissions={permissions}
-              onUserUpdated={refreshCurrentUser}
-              onModulesChanged={refreshCurrentUser}
-              onSettingsChanged={refreshCurrentUser}
-              onNotify={notify}
-            />
-          )}
+          <Suspense
+            fallback={
+              <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-8 text-sm text-zinc-500">
+                Loading workspace module...
+              </div>
+            }
+          >
+            {currentNav?.key === 'dashboard' && (
+              <DashboardView
+                onNavigate={(k) =>
+                  setActiveModule((k === 'admin' ? 'settings' : k) as ModuleKey)
+                }
+              />
+            )}
+            {currentNav?.key === 'crm' && (
+              <ThirdPartiesView
+                permissions={permissions}
+                enabledModules={enabledModules}
+                focusHint={searchFocus?.moduleKey === 'crm' ? searchFocus : null}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'inventory' && (
+              <InventoryView
+                permissions={permissions}
+                focusHint={searchFocus?.moduleKey === 'inventory' ? searchFocus : null}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'manufacturing' && (
+              <ManufacturingView permissions={permissions} onNotify={notify} />
+            )}
+            {currentNav?.key === 'commerce' && (
+              <CommerceView
+                permissions={permissions}
+                enabledModules={enabledModules}
+                focusHint={searchFocus?.moduleKey === 'commerce' ? searchFocus : null}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'pos' && (
+              <PosView permissions={permissions} onNotify={notify} />
+            )}
+            {currentNav?.key === 'billing' && (
+              <BillingView
+                permissions={permissions}
+                enabledModules={enabledModules}
+                focusHint={searchFocus?.moduleKey === 'billing' ? searchFocus : null}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'support' && (
+              <SupportView
+                permissions={permissions}
+                focusHint={searchFocus?.moduleKey === 'support' ? searchFocus : null}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'projects' && (
+              <ProjectsView
+                permissions={permissions}
+                enabledModules={enabledModules}
+                focusHint={searchFocus?.moduleKey === 'projects' ? searchFocus : null}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'hr' && (
+              <HrView permissions={permissions} onNotify={notify} />
+            )}
+            {currentNav?.key === 'tools' && (
+              <WorkspaceToolsView
+                permissions={permissions}
+                enabledModules={enabledModules}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'profile' && (
+              <UserProfileView
+                currentUser={user}
+                onUserUpdated={refreshCurrentUser}
+                onNotify={notify}
+              />
+            )}
+            {currentNav?.key === 'settings' && can(permissions, 'admin', 'read') && (
+              <AdminSecurityView
+                currentUser={user}
+                permissions={permissions}
+                onUserUpdated={refreshCurrentUser}
+                onModulesChanged={refreshCurrentUser}
+                onSettingsChanged={refreshCurrentUser}
+                onNotify={notify}
+              />
+            )}
+          </Suspense>
         </main>
       </div>
     </div>

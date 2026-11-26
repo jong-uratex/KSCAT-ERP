@@ -16,6 +16,16 @@ export function setUnauthorizedHandler(cb: () => void): void {
   onUnauthorizedCallback = cb;
 }
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
+
+export function resolveApiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path) || !API_BASE_URL) {
+    return path;
+  }
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return `${API_BASE_URL}${normalizedPath}`;
+}
+
 export async function apiRequest<T>(
   path: string,
   options: {
@@ -31,11 +41,18 @@ export async function apiRequest<T>(
     headers.Authorization = `Bearer ${inMemoryToken}`;
   }
 
-  const res = await fetch(path, {
+  const res = await fetch(resolveApiUrl(path), {
     method: options.method ?? 'GET',
     headers,
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
   });
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (contentType.includes('text/html')) {
+    throw new Error(
+      'Backend API returned HTML instead of JSON. Configure API_ORIGIN in Cloudflare Pages or VITE_API_BASE_URL to point to your KSCAT-ERP server.'
+    );
+  }
 
   const data = await res.json().catch(() => ({}));
 
