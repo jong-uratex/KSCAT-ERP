@@ -5,3 +5,17 @@
   "compatibility_flags": ["nodejs_compat"],
   "pages_build_output_dir": "./dist"
 }
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kscat-erp",
+  "compatibility_date": "2025-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "pages_build_output_dir": "./dist",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kscat-erp-db",
+      "database_id": "ae215b57-5e34-4720-9968-6e6e13369b43"
+    }
+  ]
+}
