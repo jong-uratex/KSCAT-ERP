@@ -1,0 +1,6 @@
+{
+  "name": "Meridian ERP",
+  "description": "Enterprise Resource Planning and CRM suite with modular business operations, role-based access control, and multi-factor authentication.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
