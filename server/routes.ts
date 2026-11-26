@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
-import express, { type Request, type Response, type NextFunction } from 'express';
-import { db, getEnabledModulesMap, seedSampleBusinessData, writeAuditLog } from './db.ts';
+import type { AppEnv, DbClient } from './db_adapter.ts';
+import { getChallengeSigningSecret, getEnabledModulesMap, seedSampleBusinessData, writeAuditLog } from './db.ts';
 import {
   PERMISSION_CATALOG,
   hasPermission,
@@ -9,6 +9,7 @@ import {
   type PermissionModule,
 } from './rbac.ts';
 import { createExtraApiRouter } from './routes_extra.ts';
+import { WebRouter, type ApiRequest, type ApiResponse, type NextFunction } from './web_router.ts';
 import {
   buildOtpAuthUri,
   generateQrDataUrl,
@@ -77,7 +78,7 @@ interface SystemSettingsRow {
   updated_at: string;
 }
 
-export interface AuthenticatedRequest extends Request {
+export interface AuthenticatedRequest extends ApiRequest {
   authUser?: AuthUserRow;
   authPermissions?: PermissionMap;
   authSessionId?: number;
@@ -93,43 +94,12 @@ interface DocumentLineInput {
   taxRate: number;
 }
 
-function getClientIp(req: Request): string {
+function getClientIp(req: ApiRequest): string {
   const fwd = req.headers['x-forwarded-for'];
   if (typeof fwd === 'string' && fwd.trim()) {
     return fwd.split(',')[0].trim();
   }
   return req.ip || req.socket.remoteAddress || 'unknown';
-}
-
-function getSecurityPolicy(): SecurityPolicyRow {
-  return db.prepare('SELECT * FROM security_policy WHERE id = 1').get() as unknown as SecurityPolicyRow;
-}
-
-function getSystemSettings(): SystemSettingsRow {
-  return db.prepare('SELECT * FROM system_settings WHERE id = 1').get() as unknown as SystemSettingsRow;
-}
-
-function getUserWithRoleById(userId: number): AuthUserRow | undefined {
-  return db
-    .prepare(
-      `SELECT u.*, r.slug AS role_slug, r.name AS role_name, r.permissions_json, r.require_mfa AS role_require_mfa
-       FROM users u
-       JOIN roles r ON r.id = u.role_id
-       WHERE u.id = ?`
-    )
-    .get(userId) as unknown as AuthUserRow | undefined;
-}
-
-function getUserWithRoleByIdentifier(identifier: string): AuthUserRow | undefined {
-  const clean = identifier.trim().toLowerCase();
-  return db
-    .prepare(
-      `SELECT u.*, r.slug AS role_slug, r.name AS role_name, r.permissions_json, r.require_mfa AS role_require_mfa
-       FROM users u
-       JOIN roles r ON r.id = u.role_id
-       WHERE LOWER(u.email) = ? OR LOWER(u.username) = ?`
-    )
-    .get(clean, clean) as unknown as AuthUserRow | undefined;
 }
 
 function sanitizeUser(u: AuthUserRow) {
@@ -160,87 +130,6 @@ function parsePermissions(json: string): PermissionMap {
   } catch {
     return {};
   }
-}
-
-function createSessionForUser(user: AuthUserRow, req: Request): string {
-  const policy = getSecurityPolicy();
-  const { rawToken, tokenHash } = generateSessionToken();
-  const expiresAt = new Date(Date.now() + policy.session_ttl_hours * 3600 * 1000).toISOString();
-  const ua = String(req.headers['user-agent'] ?? '').slice(0, 200);
-  db.prepare(
-    `INSERT INTO sessions (token_hash, user_id, ip_address, user_agent, expires_at)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(tokenHash, user.id, getClientIp(req), ua, expiresAt);
-  db.prepare(`UPDATE users SET last_login_at = datetime('now') WHERE id = ?`).run(user.id);
-  return rawToken;
-}
-
-function authenticate(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Authentication required.' });
-    return;
-  }
-  const rawToken = authHeader.slice(7).trim();
-  if (!rawToken) {
-    res.status(401).json({ error: 'Invalid Bearer token.' });
-    return;
-  }
-  const tokenHash = hashToken(rawToken);
-  const sessionRow = db
-    .prepare(
-      `SELECT id, user_id, expires_at, revoked
-       FROM sessions
-       WHERE token_hash = ?`
-    )
-    .get(tokenHash) as unknown as
-    | { id: number; user_id: number; expires_at: string; revoked: number }
-    | undefined;
-
-  if (!sessionRow || sessionRow.revoked === 1 || new Date(sessionRow.expires_at).getTime() < Date.now()) {
-    res.status(401).json({ error: 'Session expired or revoked. Please sign in again.' });
-    return;
-  }
-
-  const user = getUserWithRoleById(sessionRow.user_id);
-  if (!user || user.is_active !== 1) {
-    res.status(401).json({ error: 'Account is inactive or unavailable.' });
-    return;
-  }
-  if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
-    res.status(403).json({ error: 'Account is temporarily locked.' });
-    return;
-  }
-
-  req.authUser = user;
-  req.authPermissions = parsePermissions(user.permissions_json);
-  req.authSessionId = sessionRow.id;
-  next();
-}
-
-function requirePermission(module: PermissionModule, action: PermissionAction) {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
-    if (!req.authUser || !req.authPermissions) {
-      res.status(401).json({ error: 'Authentication required.' });
-      return;
-    }
-    if (!hasPermission(req.authPermissions, module, action)) {
-      writeAuditLog({
-        userId: req.authUser.id,
-        userEmail: req.authUser.email,
-        action: 'PERMISSION_DENIED',
-        module,
-        details: `Denied ${action} on ${module} (role: ${req.authUser.role_name})`,
-        ipAddress: getClientIp(req),
-        severity: 'warning',
-      });
-      res.status(403).json({
-        error: `Access denied: your role (${req.authUser.role_name}) lacks "${module}.${action}" permission.`,
-      });
-      return;
-    }
-    next();
-  };
 }
 
 function computeLineTotals(lines: unknown[]): {
@@ -286,79 +175,197 @@ function computeLineTotals(lines: unknown[]): {
   };
 }
 
-function nextDocRef(table: string, prefix: string): string {
-  const ym = new Date().toISOString().slice(2, 7).replace('-', '');
-  const fullPrefix = `${prefix}${ym}-`;
-  const allowed = new Set(['third_parties', 'proposals', 'sales_orders', 'purchase_orders', 'invoices', 'projects', 'tasks']);
-  if (!allowed.has(table)) {
-    throw new Error('Invalid reference sequence table');
-  }
-  const row = db
-    .prepare(`SELECT ref FROM ${table} WHERE ref LIKE ? ORDER BY id DESC LIMIT 1`)
-    .get(`${fullPrefix}%`) as { ref: string } | undefined;
-  let seq = 1;
-  if (row?.ref) {
-    const num = Number(row.ref.split('-').pop());
-    if (Number.isFinite(num)) seq = num + 1;
-  }
-  return `${fullPrefix}${String(seq).padStart(4, '0')}`;
-}
+export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
+  const router = new WebRouter();
 
-function applyStockAdjustment(params: {
-  productId: number;
-  warehouseId: number;
-  delta: number;
-  movementType: 'in' | 'out' | 'transfer' | 'adjustment';
-  reason: string;
-  docRef: string;
-  actorEmail: string;
-}): void {
-  const prod = db.prepare('SELECT id, product_type FROM products WHERE id = ?').get(params.productId) as
-    | { id: number; product_type: string }
-    | undefined;
-  if (!prod || prod.product_type !== 'product') return;
-
-  const existing = db
-    .prepare('SELECT quantity FROM stock_levels WHERE product_id = ? AND warehouse_id = ?')
-    .get(params.productId, params.warehouseId) as { quantity: number } | undefined;
-
-  const currentQty = existing?.quantity ?? 0;
-  const nextQty = currentQty + params.delta;
-  if (nextQty < 0) {
-    throw new Error(`Insufficient stock in selected warehouse (available: ${currentQty}, requested change: ${params.delta}).`);
+  async function getSecurityPolicy(): Promise<SecurityPolicyRow> {
+    return (await db.prepare('SELECT * FROM security_policy WHERE id = 1').get()) as unknown as SecurityPolicyRow;
   }
 
-  db.prepare(
-    `INSERT INTO stock_levels (product_id, warehouse_id, quantity)
-     VALUES (?, ?, ?)
-     ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity`
-  ).run(params.productId, params.warehouseId, nextQty);
+  async function getSystemSettings(): Promise<SystemSettingsRow> {
+    return (await db.prepare('SELECT * FROM system_settings WHERE id = 1').get()) as unknown as SystemSettingsRow;
+  }
 
-  db.prepare(
-    `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_delta, reason, doc_ref, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    params.productId,
-    params.warehouseId,
-    params.movementType,
-    params.delta,
-    params.reason,
-    params.docRef,
-    params.actorEmail
-  );
-}
+  async function getUserWithRoleById(userId: number): Promise<AuthUserRow | undefined> {
+    return (await db
+      .prepare(
+        `SELECT u.*, r.slug AS role_slug, r.name AS role_name, r.permissions_json, r.require_mfa AS role_require_mfa
+         FROM users u
+         JOIN roles r ON r.id = u.role_id
+         WHERE u.id = ?`
+      )
+      .get(userId)) as unknown as AuthUserRow | undefined;
+  }
 
-export function createApiRouter(): express.Router {
-  const router = express.Router();
+  async function getUserWithRoleByIdentifier(identifier: string): Promise<AuthUserRow | undefined> {
+    const clean = identifier.trim().toLowerCase();
+    return (await db
+      .prepare(
+        `SELECT u.*, r.slug AS role_slug, r.name AS role_name, r.permissions_json, r.require_mfa AS role_require_mfa
+         FROM users u
+         JOIN roles r ON r.id = u.role_id
+         WHERE LOWER(u.email) = ? OR LOWER(u.username) = ?`
+      )
+      .get(clean, clean)) as unknown as AuthUserRow | undefined;
+  }
+
+  async function createSessionForUser(user: AuthUserRow, req: ApiRequest): Promise<string> {
+    const policy = await getSecurityPolicy();
+    const { rawToken, tokenHash } = generateSessionToken();
+    const expiresAt = new Date(Date.now() + policy.session_ttl_hours * 3600 * 1000).toISOString();
+    const ua = String(req.headers['user-agent'] ?? '').slice(0, 200);
+    await db
+      .prepare(
+        `INSERT INTO sessions (token_hash, user_id, ip_address, user_agent, expires_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(tokenHash, user.id, getClientIp(req), ua, expiresAt);
+    await db.prepare(`UPDATE users SET last_login_at = datetime('now') WHERE id = ?`).run(user.id);
+    return rawToken;
+  }
+
+  async function authenticate(req: AuthenticatedRequest, res: ApiResponse, next: NextFunction): Promise<void> {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    const rawToken = authHeader.slice(7).trim();
+    if (!rawToken) {
+      res.status(401).json({ error: 'Invalid Bearer token.' });
+      return;
+    }
+    const tokenHash = hashToken(rawToken);
+    const sessionRow = (await db
+      .prepare(
+        `SELECT id, user_id, expires_at, revoked
+         FROM sessions
+         WHERE token_hash = ?`
+      )
+      .get(tokenHash)) as unknown as
+      | { id: number; user_id: number; expires_at: string; revoked: number }
+      | undefined;
+
+    if (!sessionRow || sessionRow.revoked === 1 || new Date(sessionRow.expires_at).getTime() < Date.now()) {
+      res.status(401).json({ error: 'Session expired or revoked. Please sign in again.' });
+      return;
+    }
+
+    const user = await getUserWithRoleById(sessionRow.user_id);
+    if (!user || user.is_active !== 1) {
+      res.status(401).json({ error: 'Account is inactive or unavailable.' });
+      return;
+    }
+    if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
+      res.status(403).json({ error: 'Account is temporarily locked.' });
+      return;
+    }
+
+    req.authUser = user;
+    req.authPermissions = parsePermissions(user.permissions_json);
+    req.authSessionId = sessionRow.id;
+    await next();
+  }
+
+  function requirePermission(module: PermissionModule, action: PermissionAction) {
+    return async (req: AuthenticatedRequest, res: ApiResponse, next: NextFunction): Promise<void> => {
+      if (!req.authUser || !req.authPermissions) {
+        res.status(401).json({ error: 'Authentication required.' });
+        return;
+      }
+      if (!hasPermission(req.authPermissions, module, action)) {
+        await writeAuditLog(db, {
+          userId: req.authUser.id,
+          userEmail: req.authUser.email,
+          action: 'PERMISSION_DENIED',
+          module,
+          details: `Denied ${action} on ${module} (role: ${req.authUser.role_name})`,
+          ipAddress: getClientIp(req),
+          severity: 'warning',
+        });
+        res.status(403).json({
+          error: `Access denied: your role (${req.authUser.role_name}) lacks "${module}.${action}" permission.`,
+        });
+        return;
+      }
+      await next();
+    };
+  }
+
+  async function nextDocRef(table: string, prefix: string): Promise<string> {
+    const ym = new Date().toISOString().slice(2, 7).replace('-', '');
+    const fullPrefix = `${prefix}${ym}-`;
+    const allowed = new Set(['third_parties', 'proposals', 'sales_orders', 'purchase_orders', 'invoices', 'projects', 'tasks']);
+    if (!allowed.has(table)) {
+      throw new Error('Invalid reference sequence table');
+    }
+    const row = (await db
+      .prepare(`SELECT ref FROM ${table} WHERE ref LIKE ? ORDER BY id DESC LIMIT 1`)
+      .get(`${fullPrefix}%`)) as { ref: string } | undefined;
+    let seq = 1;
+    if (row?.ref) {
+      const num = Number(row.ref.split('-').pop());
+      if (Number.isFinite(num)) seq = num + 1;
+    }
+    return `${fullPrefix}${String(seq).padStart(4, '0')}`;
+  }
+
+  async function applyStockAdjustment(params: {
+    productId: number;
+    warehouseId: number;
+    delta: number;
+    movementType: 'in' | 'out' | 'transfer' | 'adjustment';
+    reason: string;
+    docRef: string;
+    actorEmail: string;
+  }): Promise<void> {
+    const prod = (await db.prepare('SELECT id, product_type FROM products WHERE id = ?').get(params.productId)) as
+      | { id: number; product_type: string }
+      | undefined;
+    if (!prod || prod.product_type !== 'product') return;
+
+    const existing = (await db
+      .prepare('SELECT quantity FROM stock_levels WHERE product_id = ? AND warehouse_id = ?')
+      .get(params.productId, params.warehouseId)) as { quantity: number } | undefined;
+
+    const currentQty = existing?.quantity ?? 0;
+    const nextQty = currentQty + params.delta;
+    if (nextQty < 0) {
+      throw new Error(`Insufficient stock in selected warehouse (available: ${currentQty}, requested change: ${params.delta}).`);
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO stock_levels (product_id, warehouse_id, quantity)
+         VALUES (?, ?, ?)
+         ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity`
+      )
+      .run(params.productId, params.warehouseId, nextQty);
+
+    await db
+      .prepare(
+        `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_delta, reason, doc_ref, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        params.productId,
+        params.warehouseId,
+        params.movementType,
+        params.delta,
+        params.reason,
+        params.docRef,
+        params.actorEmail
+      );
+  }
 
   // ========================
   // AUTH & MFA ROUTES
   // ========================
 
-  router.get('/auth/status', (_req, res) => {
-    const countRow = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
-    const policy = getSecurityPolicy();
-    const envPasscodeSet = Boolean(process.env.ADMIN_BOOT_PASSCODE && process.env.ADMIN_BOOT_PASSCODE.trim().length > 0);
+  router.get('/auth/status', async (_req, res) => {
+    const countRow = (await db.prepare('SELECT COUNT(*) as cnt FROM users').get()) as { cnt: number };
+    const policy = (await getSecurityPolicy());
+    const envPasscodeSet = Boolean(env.ADMIN_BOOT_PASSCODE && env.ADMIN_BOOT_PASSCODE.trim().length > 0);
     res.json({
       needsBootstrap: countRow.cnt === 0,
       hasEnvBootPasscode: envPasscodeSet,
@@ -366,15 +373,15 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/auth/bootstrap', (req, res) => {
-    const countRow = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
+  router.post('/auth/bootstrap', async (req, res) => {
+    const countRow = (await db.prepare('SELECT COUNT(*) as cnt FROM users').get()) as { cnt: number };
     if (countRow.cnt > 0) {
       res.status(409).json({ error: 'Workspace has already been initialized. Please sign in.' });
       return;
     }
 
     const { fullName, username, email, password, bootPasscode, enrollMfaNow, seedSampleData } = req.body ?? {};
-    const envPasscode = (process.env.ADMIN_BOOT_PASSCODE ?? '').trim();
+    const envPasscode = (env.ADMIN_BOOT_PASSCODE ?? '').trim();
     if (envPasscode) {
       const provided = String(bootPasscode ?? '');
       const a = Buffer.from(provided, 'utf8');
@@ -385,7 +392,7 @@ export function createApiRouter(): express.Router {
       }
     }
 
-    const policy = getSecurityPolicy();
+    const policy = (await getSecurityPolicy());
     const cleanEmail = String(email ?? '').trim().toLowerCase();
     const cleanUsername = String(username ?? '').trim().toLowerCase();
     const cleanName = String(fullName ?? '').trim();
@@ -400,7 +407,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const superRole = db.prepare("SELECT id FROM roles WHERE slug = 'super_admin'").get() as { id: number } | undefined;
+    const superRole = (await db.prepare("SELECT id FROM roles WHERE slug = 'super_admin'").get()) as { id: number } | undefined;
     if (!superRole) {
       res.status(500).json({ error: 'System role definitions missing.' });
       return;
@@ -409,23 +416,23 @@ export function createApiRouter(): express.Router {
     // If admin opted not to enroll MFA right at bootstrap, keep super_admin require_mfa configurable in Security settings
     const requireMfaNow = Boolean(enrollMfaNow);
     if (!requireMfaNow) {
-      db.prepare("UPDATE roles SET require_mfa = 0 WHERE slug = 'super_admin'").run();
+      (await db.prepare("UPDATE roles SET require_mfa = 0 WHERE slug = 'super_admin'").run());
     }
 
     const pwHash = hashPassword(rawPass);
-    const info = db
+    const info = (await db
       .prepare(
         `INSERT INTO users (username, email, full_name, password_hash, role_id, is_active, mfa_enabled)
          VALUES (?, ?, ?, ?, ?, 1, 0)`
       )
-      .run(cleanUsername, cleanEmail, cleanName, pwHash, superRole.id);
+      .run(cleanUsername, cleanEmail, cleanName, pwHash, superRole.id));
 
     const newUserId = Number(info.lastInsertRowid);
     if (seedSampleData !== false) {
-      seedSampleBusinessData(cleanEmail);
+      (await seedSampleBusinessData(db, cleanEmail));
     }
 
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: newUserId,
       userEmail: cleanEmail,
       action: 'WORKSPACE_BOOTSTRAP',
@@ -434,11 +441,12 @@ export function createApiRouter(): express.Router {
       details: `Super Admin claimed workspace${seedSampleData !== false ? ' with sample ERP data' : ''}.`,
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
 
-    const user = getUserWithRoleById(newUserId)!;
+    const user = (await getUserWithRoleById(newUserId))!;
     if (requireMfaNow) {
-      const enrollToken = signChallengeToken(user.id, 'mfa_enroll', 600);
+      const secret = await getChallengeSigningSecret(db, env);
+      const enrollToken = signChallengeToken(user.id, 'mfa_enroll', 600, secret);
       res.json({
         status: 'mfa_enrollment_required',
         enrollToken,
@@ -447,19 +455,19 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const token = createSessionForUser(user, req);
+    const token = (await createSessionForUser(user, req));
     res.json({
       status: 'authenticated',
       token,
       user: sanitizeUser(user),
       permissions: parsePermissions(user.permissions_json),
       policy,
-      enabledModules: getEnabledModulesMap(),
-      systemSettings: getSystemSettings(),
+      enabledModules: (await getEnabledModulesMap(db)),
+      systemSettings: (await getSystemSettings()),
     });
   });
 
-  router.post('/auth/login', (req, res) => {
+  router.post('/auth/login', async (req, res) => {
     const { identifier, password } = req.body ?? {};
     const idStr = String(identifier ?? '').trim();
     const passStr = String(password ?? '');
@@ -468,17 +476,17 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const policy = getSecurityPolicy();
-    const user = getUserWithRoleByIdentifier(idStr);
+    const policy = (await getSecurityPolicy());
+    const user = (await getUserWithRoleByIdentifier(idStr));
     if (!user) {
-      writeAuditLog({
+      (await writeAuditLog(db, {
         userEmail: idStr.toLowerCase(),
         action: 'LOGIN_FAILED',
         module: 'admin',
         details: 'Unknown user identifier',
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.status(401).json({ error: 'Invalid credentials.' });
       return;
     }
@@ -501,12 +509,12 @@ export function createApiRouter(): express.Router {
       if (nextAttempts >= policy.max_failed_attempts) {
         lockedUntil = new Date(Date.now() + policy.lockout_minutes * 60 * 1000).toISOString();
       }
-      db.prepare('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?').run(
+      (await db.prepare('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?').run(
         nextAttempts,
         lockedUntil,
         user.id
-      );
-      writeAuditLog({
+      ));
+      (await writeAuditLog(db, {
         userId: user.id,
         userEmail: user.email,
         action: lockedUntil ? 'ACCOUNT_LOCKED' : 'LOGIN_FAILED',
@@ -514,7 +522,7 @@ export function createApiRouter(): express.Router {
         details: `Failed login attempt ${nextAttempts}/${policy.max_failed_attempts}`,
         ipAddress: getClientIp(req),
         severity: lockedUntil ? 'critical' : 'warning',
-      });
+      }));
       res.status(401).json({
         error: lockedUntil
           ? `Too many failed attempts. Account locked for ${policy.lockout_minutes} minutes.`
@@ -523,13 +531,14 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?').run(user.id);
+    (await db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?').run(user.id));
 
     const mfaRequired =
       user.mfa_enabled === 1 || user.role_require_mfa === 1 || policy.enforce_mfa_global === 1;
 
     if (mfaRequired && user.mfa_enabled === 1 && user.mfa_secret) {
-      const challengeToken = signChallengeToken(user.id, 'mfa_verify', 300);
+      const secret = await getChallengeSigningSecret(db, env);
+      const challengeToken = signChallengeToken(user.id, 'mfa_verify', 300, secret);
       res.json({
         status: 'mfa_required',
         challengeToken,
@@ -539,7 +548,8 @@ export function createApiRouter(): express.Router {
     }
 
     if (mfaRequired && user.mfa_enabled === 0) {
-      const enrollToken = signChallengeToken(user.id, 'mfa_enroll', 600);
+      const secret = await getChallengeSigningSecret(db, env);
+      const enrollToken = signChallengeToken(user.id, 'mfa_enroll', 600, secret);
       res.json({
         status: 'mfa_enrollment_required',
         enrollToken,
@@ -548,8 +558,8 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const token = createSessionForUser(user, req);
-    writeAuditLog({
+    const token = (await createSessionForUser(user, req));
+    (await writeAuditLog(db, {
       userId: user.id,
       userEmail: user.email,
       action: 'LOGIN_SUCCESS',
@@ -557,7 +567,7 @@ export function createApiRouter(): express.Router {
       details: `Signed in as ${user.role_name}`,
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
 
     res.json({
       status: 'authenticated',
@@ -565,20 +575,21 @@ export function createApiRouter(): express.Router {
       user: sanitizeUser(user),
       permissions: parsePermissions(user.permissions_json),
       policy,
-      enabledModules: getEnabledModulesMap(),
-      systemSettings: getSystemSettings(),
+      enabledModules: (await getEnabledModulesMap(db)),
+      systemSettings: (await getSystemSettings()),
     });
   });
 
-  router.post('/auth/mfa/verify', (req, res) => {
+  router.post('/auth/mfa/verify', async (req, res) => {
     const { challengeToken, code, isRecoveryCode } = req.body ?? {};
-    const payload = verifyChallengeToken(String(challengeToken ?? ''), 'mfa_verify');
+    const secret = await getChallengeSigningSecret(db, env);
+    const payload = verifyChallengeToken(String(challengeToken ?? ''), 'mfa_verify', secret);
     if (!payload) {
       res.status(401).json({ error: 'MFA challenge expired or invalid. Please sign in again.' });
       return;
     }
 
-    const user = getUserWithRoleById(payload.sub);
+    const user = (await getUserWithRoleById(payload.sub));
     if (!user || user.is_active !== 1 || !user.mfa_secret) {
       res.status(401).json({ error: 'MFA verification unavailable.' });
       return;
@@ -593,7 +604,7 @@ export function createApiRouter(): express.Router {
       }
       const matchIdx = verifyRecoveryCode(String(code ?? ''), hashes);
       if (matchIdx === -1) {
-        writeAuditLog({
+        (await writeAuditLog(db, {
           userId: user.id,
           userEmail: user.email,
           action: 'MFA_RECOVERY_FAILED',
@@ -601,13 +612,13 @@ export function createApiRouter(): express.Router {
           details: 'Invalid recovery code attempt',
           ipAddress: getClientIp(req),
           severity: 'warning',
-        });
+        }));
         res.status(401).json({ error: 'Invalid or already used recovery code.' });
         return;
       }
       hashes.splice(matchIdx, 1);
-      db.prepare('UPDATE users SET recovery_codes_json = ? WHERE id = ?').run(JSON.stringify(hashes), user.id);
-      writeAuditLog({
+      (await db.prepare('UPDATE users SET recovery_codes_json = ? WHERE id = ?').run(JSON.stringify(hashes), user.id));
+      (await writeAuditLog(db, {
         userId: user.id,
         userEmail: user.email,
         action: 'MFA_RECOVERY_USED',
@@ -615,11 +626,11 @@ export function createApiRouter(): express.Router {
         details: `Used single-use recovery code (${hashes.length} remaining)`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
     } else {
       const check = verifyTotpCode(user.mfa_secret, String(code ?? ''), user.mfa_last_step);
       if (!check.valid) {
-        writeAuditLog({
+        (await writeAuditLog(db, {
           userId: user.id,
           userEmail: user.email,
           action: 'MFA_FAILED',
@@ -627,16 +638,16 @@ export function createApiRouter(): express.Router {
           details: 'Invalid TOTP verification code',
           ipAddress: getClientIp(req),
           severity: 'warning',
-        });
+        }));
         res.status(401).json({ error: 'Invalid 6-digit authenticator code.' });
         return;
       }
-      db.prepare('UPDATE users SET mfa_last_step = ? WHERE id = ?').run(check.step, user.id);
+      (await db.prepare('UPDATE users SET mfa_last_step = ? WHERE id = ?').run(check.step, user.id));
     }
 
-    const token = createSessionForUser(user, req);
-    const policy = getSecurityPolicy();
-    writeAuditLog({
+    const token = (await createSessionForUser(user, req));
+    const policy = (await getSecurityPolicy());
+    (await writeAuditLog(db, {
       userId: user.id,
       userEmail: user.email,
       action: 'LOGIN_MFA_SUCCESS',
@@ -644,7 +655,7 @@ export function createApiRouter(): express.Router {
       details: `MFA verified sign-in (${user.role_name})`,
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
 
     res.json({
       status: 'authenticated',
@@ -652,43 +663,44 @@ export function createApiRouter(): express.Router {
       user: sanitizeUser(user),
       permissions: parsePermissions(user.permissions_json),
       policy,
-      enabledModules: getEnabledModulesMap(),
-      systemSettings: getSystemSettings(),
+      enabledModules: (await getEnabledModulesMap(db)),
+      systemSettings: (await getSystemSettings()),
     });
   });
 
-  function resolveEnrollmentTarget(req: AuthenticatedRequest): AuthUserRow | null {
+  async function resolveEnrollmentTarget(req: AuthenticatedRequest): Promise<AuthUserRow | null> {
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const rawToken = authHeader.slice(7).trim();
       const tokenHash = hashToken(rawToken);
-      const sess = db
+      const sess = (await db
         .prepare('SELECT user_id, expires_at, revoked FROM sessions WHERE token_hash = ?')
-        .get(tokenHash) as unknown as { user_id: number; expires_at: string; revoked: number } | undefined;
+        .get(tokenHash)) as unknown as { user_id: number; expires_at: string; revoked: number } | undefined;
       if (sess && sess.revoked === 0 && new Date(sess.expires_at).getTime() > Date.now()) {
-        return getUserWithRoleById(sess.user_id) ?? null;
+        return (await getUserWithRoleById(sess.user_id)) ?? null;
       }
     }
     const enrollToken = String((req.body as Record<string, unknown>)?.enrollToken ?? '');
     if (enrollToken) {
-      const payload = verifyChallengeToken(enrollToken, 'mfa_enroll');
+      const secret = await getChallengeSigningSecret(db, env);
+      const payload = verifyChallengeToken(enrollToken, 'mfa_enroll', secret);
       if (payload) {
-        return getUserWithRoleById(payload.sub) ?? null;
+        return (await getUserWithRoleById(payload.sub)) ?? null;
       }
     }
     return null;
   }
 
   router.post('/auth/mfa/enroll-start', async (req: AuthenticatedRequest, res) => {
-    const user = resolveEnrollmentTarget(req);
+    const user = (await resolveEnrollmentTarget(req));
     if (!user || user.is_active !== 1) {
       res.status(401).json({ error: 'Authorization required to begin MFA enrollment.' });
       return;
     }
 
     const pendingSecret = generateTotpSecret();
-    db.prepare('UPDATE users SET mfa_pending_secret = ? WHERE id = ?').run(pendingSecret, user.id);
-    const settings = getSystemSettings();
+    (await db.prepare('UPDATE users SET mfa_pending_secret = ? WHERE id = ?').run(pendingSecret, user.id));
+    const settings = (await getSystemSettings());
     const otpAuthUri = buildOtpAuthUri(pendingSecret, user.email, settings?.app_name || 'KSCAT-ERP');
     const qrDataUrl = await generateQrDataUrl(otpAuthUri);
     res.json({
@@ -698,8 +710,8 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/auth/mfa/enroll-confirm', (req: AuthenticatedRequest, res) => {
-    const user = resolveEnrollmentTarget(req);
+  router.post('/auth/mfa/enroll-confirm', async (req: AuthenticatedRequest, res) => {
+    const user = (await resolveEnrollmentTarget(req));
     if (!user || user.is_active !== 1) {
       res.status(401).json({ error: 'Authorization required to confirm MFA enrollment.' });
       return;
@@ -717,7 +729,7 @@ export function createApiRouter(): express.Router {
     }
 
     const { plainCodes, hashedCodes } = generateRecoveryCodes(8);
-    db.prepare(
+    (await db.prepare(
       `UPDATE users
        SET mfa_enabled = 1,
            mfa_secret = mfa_pending_secret,
@@ -725,9 +737,9 @@ export function createApiRouter(): express.Router {
            mfa_last_step = ?,
            recovery_codes_json = ?
        WHERE id = ?`
-    ).run(check.step, JSON.stringify(hashedCodes), user.id);
+    ).run(check.step, JSON.stringify(hashedCodes), user.id));
 
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: user.id,
       userEmail: user.email,
       action: 'MFA_ENROLLED',
@@ -735,12 +747,12 @@ export function createApiRouter(): express.Router {
       details: 'TOTP Multi-Factor Authentication enabled with 8 recovery codes',
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
 
-    const refreshed = getUserWithRoleById(user.id)!;
+    const refreshed = (await getUserWithRoleById(user.id))!;
     if (enrollToken) {
-      const token = createSessionForUser(refreshed, req);
-      const policy = getSecurityPolicy();
+      const token = (await createSessionForUser(refreshed, req));
+      const policy = (await getSecurityPolicy());
       res.json({
         status: 'authenticated',
         token,
@@ -748,8 +760,8 @@ export function createApiRouter(): express.Router {
         permissions: parsePermissions(refreshed.permissions_json),
         policy,
         recoveryCodes: plainCodes,
-        enabledModules: getEnabledModulesMap(),
-        systemSettings: getSystemSettings(),
+        enabledModules: (await getEnabledModulesMap(db)),
+        systemSettings: (await getSystemSettings()),
       });
       return;
     }
@@ -761,9 +773,9 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/auth/mfa/disable', authenticate, (req: AuthenticatedRequest, res) => {
+  router.post('/auth/mfa/disable', authenticate, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
-    const policy = getSecurityPolicy();
+    const policy = (await getSecurityPolicy());
     if (policy.enforce_mfa_global === 1 || user.role_require_mfa === 1) {
       res.status(403).json({
         error: `MFA cannot be disabled because your role (${user.role_name}) or organization policy requires it.`,
@@ -784,11 +796,11 @@ export function createApiRouter(): express.Router {
       }
     }
 
-    db.prepare(
+    (await db.prepare(
       `UPDATE users SET mfa_enabled = 0, mfa_secret = NULL, mfa_pending_secret = NULL, recovery_codes_json = '[]' WHERE id = ?`
-    ).run(user.id);
+    ).run(user.id));
 
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: user.id,
       userEmail: user.email,
       action: 'MFA_DISABLED',
@@ -796,12 +808,12 @@ export function createApiRouter(): express.Router {
       details: 'User disabled TOTP Multi-Factor Authentication',
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
 
     res.json({ mfaEnabled: false });
   });
 
-  router.post('/auth/mfa/regenerate-recovery', authenticate, (req: AuthenticatedRequest, res) => {
+  router.post('/auth/mfa/regenerate-recovery', authenticate, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
     if (user.mfa_enabled !== 1) {
       res.status(400).json({ error: 'MFA must be enabled before generating recovery codes.' });
@@ -813,8 +825,8 @@ export function createApiRouter(): express.Router {
       return;
     }
     const { plainCodes, hashedCodes } = generateRecoveryCodes(8);
-    db.prepare('UPDATE users SET recovery_codes_json = ? WHERE id = ?').run(JSON.stringify(hashedCodes), user.id);
-    writeAuditLog({
+    (await db.prepare('UPDATE users SET recovery_codes_json = ? WHERE id = ?').run(JSON.stringify(hashedCodes), user.id));
+    (await writeAuditLog(db, {
       userId: user.id,
       userEmail: user.email,
       action: 'MFA_RECOVERY_REGENERATED',
@@ -822,21 +834,21 @@ export function createApiRouter(): express.Router {
       details: 'Regenerated 8 single-use recovery codes',
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
     res.json({ recoveryCodes: plainCodes });
   });
 
-  router.get('/auth/me', authenticate, (req: AuthenticatedRequest, res) => {
+  router.get('/auth/me', authenticate, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
-    const policy = getSecurityPolicy();
-    const sessions = db
+    const policy = (await getSecurityPolicy());
+    const sessions = (await db
       .prepare(
         `SELECT id, ip_address, user_agent, created_at, expires_at
          FROM sessions
          WHERE user_id = ? AND revoked = 0 AND expires_at > datetime('now')
          ORDER BY created_at DESC`
       )
-      .all(user.id) as unknown as {
+      .all(user.id)) as unknown as {
       id: number;
       ip_address: string;
       user_agent: string;
@@ -855,8 +867,8 @@ export function createApiRouter(): express.Router {
       user: sanitizeUser(user),
       permissions: req.authPermissions,
       policy,
-      enabledModules: getEnabledModulesMap(),
-      systemSettings: getSystemSettings(),
+      enabledModules: (await getEnabledModulesMap(db)),
+      systemSettings: (await getSystemSettings()),
       remainingRecoveryCodes,
       currentSessionId: req.authSessionId,
       sessions: sessions.map((s) => ({
@@ -870,7 +882,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.put('/auth/profile', authenticate, (req: AuthenticatedRequest, res) => {
+  router.put('/auth/profile', authenticate, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
     const { fullName, username, email, phone, jobTitle, department, timezone } = req.body ?? {};
     const cleanName = String(fullName ?? '').trim();
@@ -883,7 +895,7 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      db.prepare(
+      (await db.prepare(
         `UPDATE users
          SET full_name = ?, username = ?, email = ?, phone = ?, job_title = ?, department = ?, timezone = ?
          WHERE id = ?`
@@ -896,9 +908,9 @@ export function createApiRouter(): express.Router {
         String(department ?? '').trim(),
         String(timezone ?? 'Asia/Manila').trim() || 'Asia/Manila',
         user.id
-      );
+      ));
 
-      writeAuditLog({
+      (await writeAuditLog(db, {
         userId: user.id,
         userEmail: cleanEmail,
         action: 'UPDATE_PROFILE',
@@ -907,18 +919,18 @@ export function createApiRouter(): express.Router {
         details: `Updated personal user profile (${cleanName})`,
         ipAddress: getClientIp(req),
         severity: 'info',
-      });
+      }));
 
-      const updated = getUserWithRoleById(user.id)!;
+      const updated = (await getUserWithRoleById(user.id))!;
       res.json({ user: sanitizeUser(updated) });
     } catch {
       res.status(409).json({ error: 'Username or email address is already in use.' });
     }
   });
 
-  router.post('/auth/change-password', authenticate, (req: AuthenticatedRequest, res) => {
+  router.post('/auth/change-password', authenticate, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
-    const policy = getSecurityPolicy();
+    const policy = (await getSecurityPolicy());
     const { currentPassword, newPassword } = req.body ?? {};
     if (!verifyPassword(String(currentPassword ?? ''), user.password_hash)) {
       res.status(401).json({ error: 'Current password is incorrect.' });
@@ -929,8 +941,8 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: `New password must be at least ${policy.min_password_length} characters.` });
       return;
     }
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(nextPass), user.id);
-    writeAuditLog({
+    (await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(nextPass), user.id));
+    (await writeAuditLog(db, {
       userId: user.id,
       userEmail: user.email,
       action: 'CHANGE_PASSWORD',
@@ -939,15 +951,15 @@ export function createApiRouter(): express.Router {
       details: 'User changed account password',
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.post('/auth/logout', authenticate, (req: AuthenticatedRequest, res) => {
+  router.post('/auth/logout', authenticate, async (req: AuthenticatedRequest, res) => {
     if (req.authSessionId) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(req.authSessionId);
+      (await db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(req.authSessionId));
     }
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: req.authUser?.id,
       userEmail: req.authUser?.email ?? 'unknown',
       action: 'LOGOUT',
@@ -955,17 +967,17 @@ export function createApiRouter(): express.Router {
       details: 'User signed out',
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.delete('/auth/sessions/:id', authenticate, (req: AuthenticatedRequest, res) => {
+  router.delete('/auth/sessions/:id', authenticate, async (req: AuthenticatedRequest, res) => {
     const sessionId = Number(req.params.id);
     if (!Number.isFinite(sessionId)) {
       res.status(400).json({ error: 'Invalid session ID.' });
       return;
     }
-    const target = db.prepare('SELECT id, user_id FROM sessions WHERE id = ?').get(sessionId) as
+    const target = (await db.prepare('SELECT id, user_id FROM sessions WHERE id = ?').get(sessionId)) as
       | { id: number; user_id: number }
       | undefined;
     if (!target) {
@@ -977,8 +989,8 @@ export function createApiRouter(): express.Router {
       res.status(403).json({ error: 'Cannot revoke another user session.' });
       return;
     }
-    db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(sessionId);
-    writeAuditLog({
+    (await db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(sessionId));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'SESSION_REVOKED',
@@ -987,7 +999,7 @@ export function createApiRouter(): express.Router {
       details: `Revoked session #${sessionId}`,
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
     res.json({ ok: true });
   });
 
@@ -995,8 +1007,8 @@ export function createApiRouter(): express.Router {
   // DASHBOARD
   // ========================
 
-  router.get('/dashboard', authenticate, requirePermission('dashboard', 'read'), (_req, res) => {
-    const kpiInvoices = db
+  router.get('/dashboard', authenticate, requirePermission('dashboard', 'read'), async (_req, res) => {
+    const kpiInvoices = (await db
       .prepare(
         `SELECT
            COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND status != 'cancelled' THEN total_ttc ELSE 0 END), 0) AS total_billed,
@@ -1004,20 +1016,20 @@ export function createApiRouter(): express.Router {
            COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status IN ('validated', 'partial') THEN total_ttc - amount_paid ELSE 0 END), 0) AS open_payables
          FROM invoices`
       )
-      .get() as { total_billed: number; open_receivables: number; open_payables: number };
+      .get()) as { total_billed: number; open_receivables: number; open_payables: number };
 
-    const proposalStats = db
+    const proposalStats = (await db
       .prepare(
         `SELECT COUNT(*) AS count, COALESCE(SUM(total_ttc), 0) AS total
          FROM proposals WHERE status IN ('draft', 'validated')`
       )
-      .get() as { count: number; total: number };
+      .get()) as { count: number; total: number };
 
-    const bankTotal = db
+    const bankTotal = (await db
       .prepare("SELECT COALESCE(SUM(balance), 0) AS cash_balance FROM bank_accounts WHERE status = 'active'")
-      .get() as { cash_balance: number };
+      .get()) as { cash_balance: number };
 
-    const lowStock = db
+    const lowStock = (await db
       .prepare(
         `SELECT p.id, p.ref, p.name, p.min_stock, COALESCE(SUM(sl.quantity), 0) AS total_stock
          FROM products p
@@ -1028,9 +1040,9 @@ export function createApiRouter(): express.Router {
          ORDER BY (p.min_stock - total_stock) DESC
          LIMIT 6`
       )
-      .all();
+      .all());
 
-    const openProposals = db
+    const openProposals = (await db
       .prepare(
         `SELECT p.id, p.ref, p.title, p.total_ttc, p.status, p.valid_until, tp.name AS customer_name
          FROM proposals p
@@ -1038,9 +1050,9 @@ export function createApiRouter(): express.Router {
          WHERE p.status IN ('draft', 'validated', 'signed')
          ORDER BY p.id DESC LIMIT 5`
       )
-      .all();
+      .all());
 
-    const pendingInvoices = db
+    const pendingInvoices = (await db
       .prepare(
         `SELECT i.id, i.ref, i.invoice_type, i.total_ttc, i.amount_paid, i.due_date, i.status, tp.name AS party_name
          FROM invoices i
@@ -1048,9 +1060,9 @@ export function createApiRouter(): express.Router {
          WHERE i.status IN ('validated', 'partial')
          ORDER BY i.due_date ASC LIMIT 6`
       )
-      .all();
+      .all());
 
-    const activeProjects = db
+    const activeProjects = (await db
       .prepare(
         `SELECT pr.id, pr.ref, pr.title, pr.progress, pr.due_date, pr.status, tp.name AS customer_name
          FROM projects pr
@@ -1058,17 +1070,17 @@ export function createApiRouter(): express.Router {
          WHERE pr.status IN ('active', 'on_hold')
          ORDER BY pr.due_date ASC LIMIT 5`
       )
-      .all();
+      .all());
 
-    const recentLogs = db
+    const recentLogs = (await db
       .prepare(
         `SELECT id, user_email, action, module, entity_ref, details, severity, created_at
          FROM audit_logs
          ORDER BY id DESC LIMIT 8`
       )
-      .all();
+      .all());
 
-    const txMonthly = db
+    const txMonthly = (await db
       .prepare(
         `SELECT substr(tx_date, 1, 7) AS month,
                 COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE 0 END), 0) AS inflow,
@@ -1078,7 +1090,7 @@ export function createApiRouter(): express.Router {
          ORDER BY month ASC
          LIMIT 6`
       )
-      .all();
+      .all());
 
     res.json({
       kpis: {
@@ -1102,34 +1114,34 @@ export function createApiRouter(): express.Router {
   // THIRD PARTIES & CONTACTS (CRM)
   // ========================
 
-  router.get('/third-parties', authenticate, requirePermission('crm', 'read'), (_req, res) => {
-    const parties = db.prepare('SELECT * FROM third_parties ORDER BY id DESC').all();
-    const contacts = db
+  router.get('/third-parties', authenticate, requirePermission('crm', 'read'), async (_req, res) => {
+    const parties = (await db.prepare('SELECT * FROM third_parties ORDER BY id DESC').all());
+    const contacts = (await db
       .prepare(
         `SELECT c.*, tp.name AS company_name, tp.ref AS company_ref
          FROM contacts c
          JOIN third_parties tp ON tp.id = c.third_party_id
          ORDER BY c.is_primary DESC, c.id DESC`
       )
-      .all();
+      .all());
     res.json({ thirdParties: parties, contacts });
   });
 
-  router.get('/third-parties/:id', authenticate, requirePermission('crm', 'read'), (req, res) => {
+  router.get('/third-parties/:id', authenticate, requirePermission('crm', 'read'), async (req, res) => {
     const id = Number(req.params.id);
-    const party = db.prepare('SELECT * FROM third_parties WHERE id = ?').get(id);
+    const party = (await db.prepare('SELECT * FROM third_parties WHERE id = ?').get(id));
     if (!party) {
       res.status(404).json({ error: 'Third party not found.' });
       return;
     }
-    const contacts = db.prepare('SELECT * FROM contacts WHERE third_party_id = ?').all(id);
-    const proposals = db.prepare('SELECT * FROM proposals WHERE third_party_id = ? ORDER BY id DESC').all(id);
-    const invoices = db.prepare('SELECT * FROM invoices WHERE third_party_id = ? ORDER BY id DESC').all(id);
-    const projects = db.prepare('SELECT * FROM projects WHERE third_party_id = ? ORDER BY id DESC').all(id);
+    const contacts = (await db.prepare('SELECT * FROM contacts WHERE third_party_id = ?').all(id));
+    const proposals = (await db.prepare('SELECT * FROM proposals WHERE third_party_id = ? ORDER BY id DESC').all(id));
+    const invoices = (await db.prepare('SELECT * FROM invoices WHERE third_party_id = ? ORDER BY id DESC').all(id));
+    const projects = (await db.prepare('SELECT * FROM projects WHERE third_party_id = ? ORDER BY id DESC').all(id));
     res.json({ party, contacts, proposals, invoices, projects });
   });
 
-  router.post('/third-parties', authenticate, requirePermission('crm', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/third-parties', authenticate, requirePermission('crm', 'write'), async (req: AuthenticatedRequest, res) => {
     const {
       name,
       partyType = 'customer',
@@ -1161,8 +1173,8 @@ export function createApiRouter(): express.Router {
       supplier: 'SU',
       customer_supplier: 'CS',
     };
-    const ref = nextDocRef('third_parties', prefixMap[partyType]);
-    const info = db
+    const ref = (await nextDocRef('third_parties', prefixMap[partyType]));
+    const info = (await db
       .prepare(
         `INSERT INTO third_parties (ref, name, party_type, email, phone, website, address, city, country, tax_id, payment_terms, credit_limit, status, notes, social_json)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
@@ -1182,8 +1194,8 @@ export function createApiRouter(): express.Router {
         Number(creditLimit) || 0,
         String(notes).trim(),
         typeof socialJson === 'string' ? socialJson : JSON.stringify(socialJson ?? {})
-      );
-    writeAuditLog({
+      ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'CREATE_THIRD_PARTY',
@@ -1191,13 +1203,13 @@ export function createApiRouter(): express.Router {
       entityRef: ref,
       details: `Created ${partyType}: ${cleanName}`,
       ipAddress: getClientIp(req),
-    });
-    res.status(201).json(db.prepare('SELECT * FROM third_parties WHERE id = ?').get(info.lastInsertRowid));
+    }));
+    res.status(201).json((await db.prepare('SELECT * FROM third_parties WHERE id = ?').get(info.lastInsertRowid)));
   });
 
-  router.put('/third-parties/:id', authenticate, requirePermission('crm', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/third-parties/:id', authenticate, requirePermission('crm', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM third_parties WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT * FROM third_parties WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Third party not found.' });
       return;
@@ -1218,7 +1230,7 @@ export function createApiRouter(): express.Router {
       notes,
       socialJson,
     } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE third_parties
        SET name = COALESCE(?, name),
            party_type = COALESCE(?, party_type),
@@ -1251,8 +1263,8 @@ export function createApiRouter(): express.Router {
       notes !== undefined ? String(notes).trim() : null,
       socialJson !== undefined ? (typeof socialJson === 'string' ? socialJson : JSON.stringify(socialJson ?? {})) : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_THIRD_PARTY',
@@ -1260,13 +1272,13 @@ export function createApiRouter(): express.Router {
       entityRef: existing.ref,
       details: `Updated third party ${existing.ref}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM third_parties WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM third_parties WHERE id = ?').get(id)));
   });
 
-  router.delete('/third-parties/:id', authenticate, requirePermission('crm', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/third-parties/:id', authenticate, requirePermission('crm', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, name FROM third_parties WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, name FROM third_parties WHERE id = ?').get(id)) as
       | { ref: string; name: string }
       | undefined;
     if (!existing) {
@@ -1274,8 +1286,8 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      db.prepare('DELETE FROM third_parties WHERE id = ?').run(id);
-      writeAuditLog({
+      (await db.prepare('DELETE FROM third_parties WHERE id = ?').run(id));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_THIRD_PARTY',
@@ -1284,20 +1296,20 @@ export function createApiRouter(): express.Router {
         details: `Deleted ${existing.name}`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch {
       res.status(409).json({ error: 'Cannot delete third party with linked proposals, orders, or invoices.' });
     }
   });
 
-  router.post('/contacts', authenticate, requirePermission('crm', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/contacts', authenticate, requirePermission('crm', 'write'), async (req: AuthenticatedRequest, res) => {
     const { thirdPartyId, firstName, lastName, jobTitle = '', email = '', phone = '', isPrimary = false } = req.body ?? {};
     if (!thirdPartyId || !String(firstName ?? '').trim() || !String(lastName ?? '').trim()) {
       res.status(400).json({ error: 'Company, first name, and last name are required.' });
       return;
     }
-    const info = db
+    const info = (await db
       .prepare(
         `INSERT INTO contacts (third_party_id, first_name, last_name, job_title, email, phone, is_primary)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -1310,21 +1322,21 @@ export function createApiRouter(): express.Router {
         String(email).trim(),
         String(phone).trim(),
         isPrimary ? 1 : 0
-      );
-    writeAuditLog({
+      ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'CREATE_CONTACT',
       module: 'crm',
       details: `Added contact ${firstName} ${lastName}`,
       ipAddress: getClientIp(req),
-    });
-    res.status(201).json(db.prepare('SELECT * FROM contacts WHERE id = ?').get(info.lastInsertRowid));
+    }));
+    res.status(201).json((await db.prepare('SELECT * FROM contacts WHERE id = ?').get(info.lastInsertRowid)));
   });
 
-  router.put('/contacts/:id', authenticate, requirePermission('crm', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/contacts/:id', authenticate, requirePermission('crm', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM contacts WHERE id = ?').get(id)) as
       | { id: number; first_name: string; last_name: string }
       | undefined;
     if (!existing) {
@@ -1332,7 +1344,7 @@ export function createApiRouter(): express.Router {
       return;
     }
     const { thirdPartyId, firstName, lastName, jobTitle, email, phone, isPrimary } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE contacts
        SET third_party_id = COALESCE(?, third_party_id),
            first_name = COALESCE(?, first_name),
@@ -1351,8 +1363,8 @@ export function createApiRouter(): express.Router {
       phone !== undefined ? String(phone).trim() : null,
       isPrimary !== undefined ? (isPrimary ? 1 : 0) : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_CONTACT',
@@ -1360,21 +1372,21 @@ export function createApiRouter(): express.Router {
       entityRef: `CNT-${id}`,
       details: `Updated contact ${firstName ?? existing.first_name} ${lastName ?? existing.last_name}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM contacts WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM contacts WHERE id = ?').get(id)));
   });
 
-  router.delete('/contacts/:id', authenticate, requirePermission('crm', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/contacts/:id', authenticate, requirePermission('crm', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db
+    const existing = (await db
       .prepare('SELECT first_name, last_name, email FROM contacts WHERE id = ?')
-      .get(id) as { first_name: string; last_name: string; email: string } | undefined;
+      .get(id)) as { first_name: string; last_name: string; email: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Contact not found.' });
       return;
     }
-    db.prepare('DELETE FROM contacts WHERE id = ?').run(id);
-    writeAuditLog({
+    (await db.prepare('DELETE FROM contacts WHERE id = ?').run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_CONTACT',
@@ -1383,7 +1395,7 @@ export function createApiRouter(): express.Router {
       details: `Deleted contact ${existing.first_name} ${existing.last_name} (${existing.email || 'no email'})`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
@@ -1391,8 +1403,8 @@ export function createApiRouter(): express.Router {
   // PRODUCTS, WAREHOUSES & STOCK
   // ========================
 
-  router.get('/products', authenticate, requirePermission('products', 'read'), (_req, res) => {
-    const products = db
+  router.get('/products', authenticate, requirePermission('products', 'read'), async (_req, res) => {
+    const products = (await db
       .prepare(
         `SELECT p.*, COALESCE(SUM(sl.quantity), 0) AS total_stock
          FROM products p
@@ -1400,16 +1412,16 @@ export function createApiRouter(): express.Router {
          GROUP BY p.id
          ORDER BY p.id DESC`
       )
-      .all();
-    const stockLevels = db
+      .all());
+    const stockLevels = (await db
       .prepare(
         `SELECT sl.*, w.ref AS warehouse_ref, w.name AS warehouse_name
          FROM stock_levels sl
          JOIN warehouses w ON w.id = sl.warehouse_id`
       )
-      .all();
-    const warehouses = db.prepare('SELECT * FROM warehouses ORDER BY id ASC').all();
-    const movements = db
+      .all());
+    const warehouses = (await db.prepare('SELECT * FROM warehouses ORDER BY id ASC').all());
+    const movements = (await db
       .prepare(
         `SELECT sm.*, p.ref AS product_ref, p.name AS product_name, w.name AS warehouse_name
          FROM stock_movements sm
@@ -1418,11 +1430,11 @@ export function createApiRouter(): express.Router {
          ORDER BY sm.id DESC
          LIMIT 60`
       )
-      .all();
+      .all());
     res.json({ products, stockLevels, warehouses, movements });
   });
 
-  router.post('/products', authenticate, requirePermission('products', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/products', authenticate, requirePermission('products', 'write'), async (req: AuthenticatedRequest, res) => {
     const {
       ref,
       name,
@@ -1444,8 +1456,8 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      db.exec('BEGIN');
-      const info = db
+      (await db.exec('BEGIN'));
+      const info = (await db
         .prepare(
           `INSERT INTO products (ref, name, product_type, category, description, cost_price, sell_price, tax_rate, min_stock, barcode)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -1461,10 +1473,10 @@ export function createApiRouter(): express.Router {
           Number(taxRate) || 0,
           Number(minStock) || 0,
           String(barcode).trim()
-        );
+        ));
       const productId = Number(info.lastInsertRowid);
       if (productType !== 'service' && Number(initialStock) > 0 && warehouseId) {
-        applyStockAdjustment({
+        (await applyStockAdjustment({
           productId,
           warehouseId: Number(warehouseId),
           delta: Number(initialStock),
@@ -1472,10 +1484,10 @@ export function createApiRouter(): express.Router {
           reason: 'Initial catalog stock',
           docRef: cleanRef,
           actorEmail: req.authUser!.email,
-        });
+        }));
       }
-      db.exec('COMMIT');
-      writeAuditLog({
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_PRODUCT',
@@ -1483,23 +1495,23 @@ export function createApiRouter(): express.Router {
         entityRef: cleanRef,
         details: `Created ${productType}: ${cleanName}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM products WHERE id = ?').get(productId));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM products WHERE id = ?').get(productId)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to create product.' });
     }
   });
 
-  router.put('/products/:id', authenticate, requirePermission('products', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/products/:id', authenticate, requirePermission('products', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref FROM products WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT ref FROM products WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Product not found.' });
       return;
     }
     const { name, productType, category, description, costPrice, sellPrice, taxRate, minStock, barcode } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE products
        SET name = COALESCE(?, name),
            product_type = COALESCE(?, product_type),
@@ -1522,8 +1534,8 @@ export function createApiRouter(): express.Router {
       minStock !== undefined ? Number(minStock) : null,
       barcode !== undefined ? String(barcode).trim() : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_PRODUCT',
@@ -1531,13 +1543,13 @@ export function createApiRouter(): express.Router {
       entityRef: existing.ref,
       details: `Updated product ${existing.ref}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM products WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM products WHERE id = ?').get(id)));
   });
 
-  router.delete('/products/:id', authenticate, requirePermission('products', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/products/:id', authenticate, requirePermission('products', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, name FROM products WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, name FROM products WHERE id = ?').get(id)) as
       | { ref: string; name: string }
       | undefined;
     if (!existing) {
@@ -1545,8 +1557,8 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      db.prepare('DELETE FROM products WHERE id = ?').run(id);
-      writeAuditLog({
+      (await db.prepare('DELETE FROM products WHERE id = ?').run(id));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_PRODUCT',
@@ -1555,14 +1567,14 @@ export function createApiRouter(): express.Router {
         details: `Deleted product ${existing.name}`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch {
       res.status(409).json({ error: 'Cannot delete product referenced by active BOMs or manufacturing orders.' });
     }
   });
 
-  router.post('/warehouses', authenticate, requirePermission('products', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/warehouses', authenticate, requirePermission('products', 'write'), async (req: AuthenticatedRequest, res) => {
     const { ref, name, location = '' } = req.body ?? {};
     const cleanRef = String(ref ?? '').trim().toUpperCase();
     const cleanName = String(name ?? '').trim();
@@ -1571,10 +1583,10 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      const info = db
+      const info = (await db
         .prepare(`INSERT INTO warehouses (ref, name, location, status) VALUES (?, ?, ?, 'active')`)
-        .run(cleanRef, cleanName, String(location).trim());
-      writeAuditLog({
+        .run(cleanRef, cleanName, String(location).trim()));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_WAREHOUSE',
@@ -1582,22 +1594,22 @@ export function createApiRouter(): express.Router {
         entityRef: cleanRef,
         details: `Created warehouse ${cleanName}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM warehouses WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM warehouses WHERE id = ?').get(info.lastInsertRowid)));
     } catch {
       res.status(400).json({ error: 'Warehouse ref already exists.' });
     }
   });
 
-  router.put('/warehouses/:id', authenticate, requirePermission('products', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/warehouses/:id', authenticate, requirePermission('products', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref FROM warehouses WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT ref FROM warehouses WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Warehouse not found.' });
       return;
     }
     const { name, location, status } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE warehouses
        SET name = COALESCE(?, name),
            location = COALESCE(?, location),
@@ -1608,8 +1620,8 @@ export function createApiRouter(): express.Router {
       location !== undefined ? String(location).trim() : null,
       status === 'active' || status === 'inactive' ? status : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_WAREHOUSE',
@@ -1617,27 +1629,27 @@ export function createApiRouter(): express.Router {
       entityRef: existing.ref,
       details: `Updated warehouse ${existing.ref}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM warehouses WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM warehouses WHERE id = ?').get(id)));
   });
 
-  router.delete('/warehouses/:id', authenticate, requirePermission('products', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/warehouses/:id', authenticate, requirePermission('products', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, name FROM warehouses WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, name FROM warehouses WHERE id = ?').get(id)) as
       | { ref: string; name: string }
       | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Warehouse not found.' });
       return;
     }
-    const stockSum = (db.prepare('SELECT COALESCE(SUM(quantity), 0) AS qty FROM stock_levels WHERE warehouse_id = ?').get(id) as { qty: number }).qty;
+    const stockSum = ((await db.prepare('SELECT COALESCE(SUM(quantity), 0) AS qty FROM stock_levels WHERE warehouse_id = ?').get(id)) as { qty: number }).qty;
     if (stockSum > 0) {
       res.status(409).json({ error: `Transfer or clear ${stockSum} unit(s) of stock before deleting this warehouse.` });
       return;
     }
     try {
-      db.prepare('DELETE FROM warehouses WHERE id = ?').run(id);
-      writeAuditLog({
+      (await db.prepare('DELETE FROM warehouses WHERE id = ?').run(id));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_WAREHOUSE',
@@ -1646,14 +1658,14 @@ export function createApiRouter(): express.Router {
         details: `Deleted warehouse ${existing.name}`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch {
       res.status(409).json({ error: 'Cannot delete warehouse referenced by existing orders, shipments, or manufacturing orders.' });
     }
   });
 
-  router.post('/stock-movements', authenticate, requirePermission('products', 'adjust_stock'), (req: AuthenticatedRequest, res) => {
+  router.post('/stock-movements', authenticate, requirePermission('products', 'adjust_stock'), async (req: AuthenticatedRequest, res) => {
     const { productId, warehouseId, targetWarehouseId, movementType, quantity, reason = '' } = req.body ?? {};
     const qty = Math.abs(Math.floor(Number(quantity)));
     if (!productId || !warehouseId || !Number.isFinite(qty) || qty <= 0) {
@@ -1662,12 +1674,12 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      db.exec('BEGIN');
+      (await db.exec('BEGIN'));
       if (movementType === 'transfer') {
         if (!targetWarehouseId || Number(targetWarehouseId) === Number(warehouseId)) {
           throw new Error('Select a different destination warehouse for stock transfer.');
         }
-        applyStockAdjustment({
+        (await applyStockAdjustment({
           productId: Number(productId),
           warehouseId: Number(warehouseId),
           delta: -qty,
@@ -1675,8 +1687,8 @@ export function createApiRouter(): express.Router {
           reason: String(reason).trim() || `Transfer to warehouse #${targetWarehouseId}`,
           docRef: `TRF-${Date.now().toString().slice(-6)}`,
           actorEmail: req.authUser!.email,
-        });
-        applyStockAdjustment({
+        }));
+        (await applyStockAdjustment({
           productId: Number(productId),
           warehouseId: Number(targetWarehouseId),
           delta: qty,
@@ -1684,10 +1696,10 @@ export function createApiRouter(): express.Router {
           reason: String(reason).trim() || `Transfer from warehouse #${warehouseId}`,
           docRef: `TRF-${Date.now().toString().slice(-6)}`,
           actorEmail: req.authUser!.email,
-        });
+        }));
       } else if (movementType === 'in' || movementType === 'out' || movementType === 'adjustment') {
         const delta = movementType === 'out' ? -qty : qty;
-        applyStockAdjustment({
+        (await applyStockAdjustment({
           productId: Number(productId),
           warehouseId: Number(warehouseId),
           delta,
@@ -1695,12 +1707,12 @@ export function createApiRouter(): express.Router {
           reason: String(reason).trim() || 'Manual stock adjustment',
           docRef: `ADJ-${Date.now().toString().slice(-6)}`,
           actorEmail: req.authUser!.email,
-        });
+        }));
       } else {
         throw new Error('Invalid movement type.');
       }
-      db.exec('COMMIT');
-      writeAuditLog({
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'STOCK_MOVEMENT',
@@ -1708,17 +1720,17 @@ export function createApiRouter(): express.Router {
         entityRef: `PRD-${productId}`,
         details: `${movementType} qty ${qty} at warehouse #${warehouseId}`,
         ipAddress: getClientIp(req),
-      });
+      }));
       res.status(201).json({ ok: true });
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(400).json({ error: err instanceof Error ? err.message : 'Stock adjustment failed.' });
     }
   });
 
-  router.put('/stock-movements/:id', authenticate, requirePermission('products', 'adjust_stock'), (req: AuthenticatedRequest, res) => {
+  router.put('/stock-movements/:id', authenticate, requirePermission('products', 'adjust_stock'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT id, doc_ref FROM stock_movements WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT id, doc_ref FROM stock_movements WHERE id = ?').get(id)) as
       | { id: number; doc_ref: string }
       | undefined;
     if (!existing) {
@@ -1726,7 +1738,7 @@ export function createApiRouter(): express.Router {
       return;
     }
     const { reason, docRef } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE stock_movements
        SET reason = COALESCE(?, reason),
            doc_ref = COALESCE(?, doc_ref)
@@ -1735,8 +1747,8 @@ export function createApiRouter(): express.Router {
       reason !== undefined ? String(reason).trim() : null,
       docRef !== undefined ? String(docRef).trim() : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_STOCK_MOVEMENT',
@@ -1744,27 +1756,27 @@ export function createApiRouter(): express.Router {
       entityRef: existing.doc_ref || `MOV-${id}`,
       details: `Updated stock movement #${id} note/reference`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM stock_movements WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM stock_movements WHERE id = ?').get(id)));
   });
 
   // ========================
   // PROPOSALS & SALES ORDERS (COMMERCE)
   // ========================
 
-  router.get('/proposals', authenticate, requirePermission('sales', 'read'), (_req, res) => {
-    const rows = db
+  router.get('/proposals', authenticate, requirePermission('sales', 'read'), async (_req, res) => {
+    const rows = (await db
       .prepare(
         `SELECT p.*, tp.name AS customer_name, tp.ref AS customer_ref
          FROM proposals p
          JOIN third_parties tp ON tp.id = p.third_party_id
          ORDER BY p.id DESC`
       )
-      .all();
+      .all());
     res.json({ proposals: rows });
   });
 
-  router.post('/proposals', authenticate, requirePermission('sales', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/proposals', authenticate, requirePermission('sales', 'write'), async (req: AuthenticatedRequest, res) => {
     const { thirdPartyId, title, issueDate, validUntil, lines, notes = '' } = req.body ?? {};
     if (!thirdPartyId || !String(title ?? '').trim()) {
       res.status(400).json({ error: 'Customer and proposal title are required.' });
@@ -1772,10 +1784,10 @@ export function createApiRouter(): express.Router {
     }
     try {
       const totals = computeLineTotals(lines);
-      const ref = nextDocRef('proposals', 'PR');
+      const ref = (await nextDocRef('proposals', 'PR'));
       const today = new Date().toISOString().slice(0, 10);
       const defaultValid = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO proposals (ref, third_party_id, title, issue_date, valid_until, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, created_by)
            VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`
@@ -1792,8 +1804,8 @@ export function createApiRouter(): express.Router {
           totals.totalTtc,
           String(notes).trim(),
           req.authUser!.email
-        );
-      writeAuditLog({
+        ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_PROPOSAL',
@@ -1801,16 +1813,16 @@ export function createApiRouter(): express.Router {
         entityRef: ref,
         details: `Created proposal ${ref} ($${totals.totalTtc.toFixed(2)})`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM proposals WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM proposals WHERE id = ?').get(info.lastInsertRowid)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid proposal payload.' });
     }
   });
 
-  router.put('/proposals/:id', authenticate, requirePermission('sales', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/proposals/:id', authenticate, requirePermission('sales', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM proposals WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM proposals WHERE id = ?').get(id)) as
       | { id: number; ref: string; status: string }
       | undefined;
     if (!existing) {
@@ -1821,7 +1833,7 @@ export function createApiRouter(): express.Router {
     try {
       const totals = Array.isArray(lines) && lines.length > 0 ? computeLineTotals(lines) : null;
       const allowedStatus = new Set(['draft', 'validated', 'signed', 'declined', 'billed']);
-      db.prepare(
+      (await db.prepare(
         `UPDATE proposals
          SET third_party_id = COALESCE(?, third_party_id),
              title = COALESCE(?, title),
@@ -1846,8 +1858,8 @@ export function createApiRouter(): express.Router {
         totals ? totals.totalTtc : null,
         notes !== undefined ? String(notes).trim() : null,
         id
-      );
-      writeAuditLog({
+      ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'UPDATE_PROPOSAL',
@@ -1855,14 +1867,14 @@ export function createApiRouter(): express.Router {
         entityRef: existing.ref,
         details: `Updated proposal ${existing.ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM proposals WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM proposals WHERE id = ?').get(id)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid proposal update.' });
     }
   });
 
-  router.post('/proposals/:id/status', authenticate, requirePermission('sales', 'validate'), (req: AuthenticatedRequest, res) => {
+  router.post('/proposals/:id/status', authenticate, requirePermission('sales', 'validate'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     const { status } = req.body ?? {};
     const allowed = new Set(['draft', 'validated', 'signed', 'declined', 'billed']);
@@ -1870,13 +1882,13 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'Invalid proposal status.' });
       return;
     }
-    const existing = db.prepare('SELECT ref FROM proposals WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT ref FROM proposals WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Proposal not found.' });
       return;
     }
-    db.prepare('UPDATE proposals SET status = ? WHERE id = ?').run(status, id);
-    writeAuditLog({
+    (await db.prepare('UPDATE proposals SET status = ? WHERE id = ?').run(status, id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'PROPOSAL_STATUS',
@@ -1884,32 +1896,32 @@ export function createApiRouter(): express.Router {
       entityRef: existing.ref,
       details: `Transitioned ${existing.ref} -> ${status}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM proposals WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM proposals WHERE id = ?').get(id)));
   });
 
-  router.post('/proposals/:id/convert-order', authenticate, requirePermission('sales', 'validate'), (req: AuthenticatedRequest, res) => {
+  router.post('/proposals/:id/convert-order', authenticate, requirePermission('sales', 'validate'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     const { warehouseId } = req.body ?? {};
-    const prop = db.prepare('SELECT * FROM proposals WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const prop = (await db.prepare('SELECT * FROM proposals WHERE id = ?').get(id)) as Record<string, unknown> | undefined;
     if (!prop) {
       res.status(404).json({ error: 'Proposal not found.' });
       return;
     }
     const wh = warehouseId
       ? Number(warehouseId)
-      : (db.prepare('SELECT id FROM warehouses ORDER BY id ASC LIMIT 1').get() as { id: number } | undefined)?.id;
+      : ((await db.prepare('SELECT id FROM warehouses ORDER BY id ASC LIMIT 1').get()) as { id: number } | undefined)?.id;
     if (!wh) {
       res.status(400).json({ error: 'At least one warehouse is required.' });
       return;
     }
-    const soRef = nextDocRef('sales_orders', 'SO');
+    const soRef = (await nextDocRef('sales_orders', 'SO'));
     const today = new Date().toISOString().slice(0, 10);
     const delivery = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
 
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO sales_orders (ref, third_party_id, proposal_ref, order_date, delivery_date, warehouse_id, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, created_by)
            VALUES (?, ?, ?, ?, ?, ?, 'validated', ?, ?, ?, ?, ?, ?)`
@@ -1927,10 +1939,10 @@ export function createApiRouter(): express.Router {
           prop.total_ttc as number,
           `Converted from proposal ${prop.ref}`,
           req.authUser!.email
-        );
-      db.prepare("UPDATE proposals SET status = 'signed' WHERE id = ?").run(id);
-      db.exec('COMMIT');
-      writeAuditLog({
+        ));
+      (await db.prepare("UPDATE proposals SET status = 'signed' WHERE id = ?").run(id));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CONVERT_PROPOSAL_TO_ORDER',
@@ -1938,23 +1950,23 @@ export function createApiRouter(): express.Router {
         entityRef: soRef,
         details: `Converted ${prop.ref} -> Sales Order ${soRef}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(info.lastInsertRowid)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Conversion failed.' });
     }
   });
 
-  router.delete('/proposals/:id', authenticate, requirePermission('sales', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/proposals/:id', authenticate, requirePermission('sales', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref FROM proposals WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT ref FROM proposals WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Proposal not found.' });
       return;
     }
-    db.prepare('DELETE FROM proposals WHERE id = ?').run(id);
-    writeAuditLog({
+    (await db.prepare('DELETE FROM proposals WHERE id = ?').run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_PROPOSAL',
@@ -1963,12 +1975,12 @@ export function createApiRouter(): express.Router {
       details: `Deleted proposal ${existing.ref}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.get('/sales-orders', authenticate, requirePermission('sales', 'read'), (_req, res) => {
-    const rows = db
+  router.get('/sales-orders', authenticate, requirePermission('sales', 'read'), async (_req, res) => {
+    const rows = (await db
       .prepare(
         `SELECT so.*, tp.name AS customer_name, w.name AS warehouse_name
          FROM sales_orders so
@@ -1976,11 +1988,11 @@ export function createApiRouter(): express.Router {
          JOIN warehouses w ON w.id = so.warehouse_id
          ORDER BY so.id DESC`
       )
-      .all();
+      .all());
     res.json({ salesOrders: rows });
   });
 
-  router.post('/sales-orders', authenticate, requirePermission('sales', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/sales-orders', authenticate, requirePermission('sales', 'write'), async (req: AuthenticatedRequest, res) => {
     const { thirdPartyId, warehouseId, orderDate, deliveryDate, incoterm = 'EXW', lines, notes = '' } = req.body ?? {};
     if (!thirdPartyId || !warehouseId) {
       res.status(400).json({ error: 'Customer and fulfillment warehouse are required.' });
@@ -1988,10 +2000,10 @@ export function createApiRouter(): express.Router {
     }
     try {
       const totals = computeLineTotals(lines);
-      const ref = nextDocRef('sales_orders', 'SO');
+      const ref = (await nextDocRef('sales_orders', 'SO'));
       const today = new Date().toISOString().slice(0, 10);
       const delivery = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO sales_orders (ref, third_party_id, proposal_ref, order_date, delivery_date, warehouse_id, incoterm, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, created_by)
            VALUES (?, ?, '', ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`
@@ -2009,8 +2021,8 @@ export function createApiRouter(): express.Router {
           totals.totalTtc,
           String(notes).trim(),
           req.authUser!.email
-        );
-      writeAuditLog({
+        ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_SALES_ORDER',
@@ -2018,16 +2030,16 @@ export function createApiRouter(): express.Router {
         entityRef: ref,
         details: `Created sales order ${ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(info.lastInsertRowid)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid sales order payload.' });
     }
   });
 
-  router.put('/sales-orders/:id', authenticate, requirePermission('sales', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/sales-orders/:id', authenticate, requirePermission('sales', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id)) as
       | { id: number; ref: string; status: string }
       | undefined;
     if (!existing) {
@@ -2038,7 +2050,7 @@ export function createApiRouter(): express.Router {
     const lockedFinancials = existing.status === 'shipped' || existing.status === 'billed';
     try {
       const totals = !lockedFinancials && Array.isArray(lines) && lines.length > 0 ? computeLineTotals(lines) : null;
-      db.prepare(
+      (await db.prepare(
         `UPDATE sales_orders
          SET third_party_id = COALESCE(?, third_party_id),
              warehouse_id = COALESCE(?, warehouse_id),
@@ -2063,8 +2075,8 @@ export function createApiRouter(): express.Router {
         totals ? totals.totalTtc : null,
         notes !== undefined ? String(notes).trim() : null,
         id
-      );
-      writeAuditLog({
+      ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'UPDATE_SALES_ORDER',
@@ -2072,16 +2084,16 @@ export function createApiRouter(): express.Router {
         entityRef: existing.ref,
         details: `Updated sales order ${existing.ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid sales order update.' });
     }
   });
 
-  router.delete('/sales-orders/:id', authenticate, requirePermission('sales', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/sales-orders/:id', authenticate, requirePermission('sales', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, status FROM sales_orders WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, status FROM sales_orders WHERE id = ?').get(id)) as
       | { ref: string; status: string }
       | undefined;
     if (!existing) {
@@ -2093,8 +2105,8 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      db.prepare('DELETE FROM sales_orders WHERE id = ?').run(id);
-      writeAuditLog({
+      (await db.prepare('DELETE FROM sales_orders WHERE id = ?').run(id));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_SALES_ORDER',
@@ -2103,17 +2115,17 @@ export function createApiRouter(): express.Router {
         details: `Deleted sales order ${existing.ref}`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch {
       res.status(409).json({ error: 'Delete linked shipments before deleting this sales order.' });
     }
   });
 
-  router.post('/sales-orders/:id/status', authenticate, requirePermission('sales', 'validate'), (req: AuthenticatedRequest, res) => {
+  router.post('/sales-orders/:id/status', authenticate, requirePermission('sales', 'validate'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     const { status } = req.body ?? {};
-    const order = db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id) as
+    const order = (await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id)) as
       | { id: number; ref: string; status: string; warehouse_id: number; lines_json: string }
       | undefined;
     if (!order) {
@@ -2126,13 +2138,13 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
       if (status === 'shipped' && order.status !== 'shipped' && order.status !== 'billed') {
         const lines = JSON.parse(order.lines_json) as DocumentLineInput[];
         for (const line of lines) {
           if (line.productId) {
-            applyStockAdjustment({
+            (await applyStockAdjustment({
               productId: line.productId,
               warehouseId: order.warehouse_id,
               delta: -Math.round(line.qty),
@@ -2140,13 +2152,13 @@ export function createApiRouter(): express.Router {
               reason: `Dispatched sales order ${order.ref}`,
               docRef: order.ref,
               actorEmail: req.authUser!.email,
-            });
+            }));
           }
         }
       }
-      db.prepare('UPDATE sales_orders SET status = ? WHERE id = ?').run(status, id);
-      db.exec('COMMIT');
-      writeAuditLog({
+      (await db.prepare('UPDATE sales_orders SET status = ? WHERE id = ?').run(status, id));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'SALES_ORDER_STATUS',
@@ -2154,10 +2166,10 @@ export function createApiRouter(): express.Router {
         entityRef: order.ref,
         details: `Sales order ${order.ref} -> ${status}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to update sales order.' });
     }
   });
@@ -2166,20 +2178,20 @@ export function createApiRouter(): express.Router {
     '/sales-orders/:id/convert-invoice',
     authenticate,
     requirePermission('billing', 'write'),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const id = Number(req.params.id);
-      const order = db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+      const order = (await db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(id)) as Record<string, unknown> | undefined;
       if (!order) {
         res.status(404).json({ error: 'Sales order not found.' });
         return;
       }
-      const invRef = nextDocRef('invoices', 'IN');
+      const invRef = (await nextDocRef('invoices', 'IN'));
       const today = new Date().toISOString().slice(0, 10);
       const due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
 
-      db.exec('BEGIN');
+      (await db.exec('BEGIN'));
       try {
-        const info = db
+        const info = (await db
           .prepare(
             `INSERT INTO invoices (ref, invoice_type, third_party_id, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
              VALUES (?, 'customer', ?, ?, ?, ?, 'validated', ?, ?, ?, ?, 0, ?, ?)`
@@ -2196,10 +2208,10 @@ export function createApiRouter(): express.Router {
             order.total_ttc as number,
             `Generated from Sales Order ${order.ref}`,
             req.authUser!.email
-          );
-        db.prepare("UPDATE sales_orders SET status = 'billed' WHERE id = ?").run(id);
-        db.exec('COMMIT');
-        writeAuditLog({
+          ));
+        (await db.prepare("UPDATE sales_orders SET status = 'billed' WHERE id = ?").run(id));
+        (await db.exec('COMMIT'));
+        (await writeAuditLog(db, {
           userId: req.authUser!.id,
           userEmail: req.authUser!.email,
           action: 'CONVERT_ORDER_TO_INVOICE',
@@ -2207,10 +2219,10 @@ export function createApiRouter(): express.Router {
           entityRef: invRef,
           details: `Created customer invoice ${invRef} from ${order.ref}`,
           ipAddress: getClientIp(req),
-        });
-        res.status(201).json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid));
+        }));
+        res.status(201).json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid)));
       } catch (err) {
-        db.exec('ROLLBACK');
+        (await db.exec('ROLLBACK'));
         res.status(500).json({ error: err instanceof Error ? err.message : 'Invoice conversion failed.' });
       }
     }
@@ -2220,8 +2232,8 @@ export function createApiRouter(): express.Router {
   // PURCHASE ORDERS
   // ========================
 
-  router.get('/purchase-orders', authenticate, requirePermission('purchasing', 'read'), (_req, res) => {
-    const rows = db
+  router.get('/purchase-orders', authenticate, requirePermission('purchasing', 'read'), async (_req, res) => {
+    const rows = (await db
       .prepare(
         `SELECT po.*, tp.name AS supplier_name, w.name AS warehouse_name
          FROM purchase_orders po
@@ -2229,11 +2241,11 @@ export function createApiRouter(): express.Router {
          JOIN warehouses w ON w.id = po.warehouse_id
          ORDER BY po.id DESC`
       )
-      .all();
+      .all());
     res.json({ purchaseOrders: rows });
   });
 
-  router.post('/purchase-orders', authenticate, requirePermission('purchasing', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/purchase-orders', authenticate, requirePermission('purchasing', 'write'), async (req: AuthenticatedRequest, res) => {
     const { thirdPartyId, warehouseId, orderDate, expectedDate, incoterm = 'FOB', lines, notes = '' } = req.body ?? {};
     if (!thirdPartyId || !warehouseId) {
       res.status(400).json({ error: 'Supplier and receiving warehouse are required.' });
@@ -2241,10 +2253,10 @@ export function createApiRouter(): express.Router {
     }
     try {
       const totals = computeLineTotals(lines);
-      const ref = nextDocRef('purchase_orders', 'PO');
+      const ref = (await nextDocRef('purchase_orders', 'PO'));
       const today = new Date().toISOString().slice(0, 10);
       const expected = new Date(Date.now() + 10 * 86400000).toISOString().slice(0, 10);
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO purchase_orders (ref, third_party_id, order_date, expected_date, warehouse_id, incoterm, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, created_by)
            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`
@@ -2262,8 +2274,8 @@ export function createApiRouter(): express.Router {
           totals.totalTtc,
           String(notes).trim(),
           req.authUser!.email
-        );
-      writeAuditLog({
+        ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_PURCHASE_ORDER',
@@ -2271,16 +2283,16 @@ export function createApiRouter(): express.Router {
         entityRef: ref,
         details: `Created purchase order ${ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(info.lastInsertRowid)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid purchase order payload.' });
     }
   });
 
-  router.put('/purchase-orders/:id', authenticate, requirePermission('purchasing', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/purchase-orders/:id', authenticate, requirePermission('purchasing', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id)) as
       | { id: number; ref: string; status: string }
       | undefined;
     if (!existing) {
@@ -2291,7 +2303,7 @@ export function createApiRouter(): express.Router {
     const lockedFinancials = existing.status === 'received' || existing.status === 'billed';
     try {
       const totals = !lockedFinancials && Array.isArray(lines) && lines.length > 0 ? computeLineTotals(lines) : null;
-      db.prepare(
+      (await db.prepare(
         `UPDATE purchase_orders
          SET third_party_id = COALESCE(?, third_party_id),
              warehouse_id = COALESCE(?, warehouse_id),
@@ -2316,8 +2328,8 @@ export function createApiRouter(): express.Router {
         totals ? totals.totalTtc : null,
         notes !== undefined ? String(notes).trim() : null,
         id
-      );
-      writeAuditLog({
+      ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'UPDATE_PURCHASE_ORDER',
@@ -2325,16 +2337,16 @@ export function createApiRouter(): express.Router {
         entityRef: existing.ref,
         details: `Updated purchase order ${existing.ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid purchase order update.' });
     }
   });
 
-  router.delete('/purchase-orders/:id', authenticate, requirePermission('purchasing', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/purchase-orders/:id', authenticate, requirePermission('purchasing', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, status FROM purchase_orders WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, status FROM purchase_orders WHERE id = ?').get(id)) as
       | { ref: string; status: string }
       | undefined;
     if (!existing) {
@@ -2345,8 +2357,8 @@ export function createApiRouter(): express.Router {
       res.status(409).json({ error: 'Received or billed purchase orders cannot be deleted.' });
       return;
     }
-    db.prepare('DELETE FROM purchase_orders WHERE id = ?').run(id);
-    writeAuditLog({
+    (await db.prepare('DELETE FROM purchase_orders WHERE id = ?').run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_PURCHASE_ORDER',
@@ -2355,14 +2367,14 @@ export function createApiRouter(): express.Router {
       details: `Deleted purchase order ${existing.ref}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.post('/purchase-orders/:id/status', authenticate, requirePermission('purchasing', 'validate'), (req: AuthenticatedRequest, res) => {
+  router.post('/purchase-orders/:id/status', authenticate, requirePermission('purchasing', 'validate'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     const { status } = req.body ?? {};
-    const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as
+    const po = (await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id)) as
       | { id: number; ref: string; status: string; warehouse_id: number; lines_json: string }
       | undefined;
     if (!po) {
@@ -2374,13 +2386,13 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'Invalid purchase order status.' });
       return;
     }
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
       if (status === 'received' && po.status !== 'received' && po.status !== 'billed') {
         const lines = JSON.parse(po.lines_json) as DocumentLineInput[];
         for (const line of lines) {
           if (line.productId) {
-            applyStockAdjustment({
+            (await applyStockAdjustment({
               productId: line.productId,
               warehouseId: po.warehouse_id,
               delta: Math.round(line.qty),
@@ -2388,13 +2400,13 @@ export function createApiRouter(): express.Router {
               reason: `Received purchase order ${po.ref}`,
               docRef: po.ref,
               actorEmail: req.authUser!.email,
-            });
+            }));
           }
         }
       }
-      db.prepare('UPDATE purchase_orders SET status = ? WHERE id = ?').run(status, id);
-      db.exec('COMMIT');
-      writeAuditLog({
+      (await db.prepare('UPDATE purchase_orders SET status = ? WHERE id = ?').run(status, id));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'PURCHASE_ORDER_STATUS',
@@ -2402,10 +2414,10 @@ export function createApiRouter(): express.Router {
         entityRef: po.ref,
         details: `Purchase order ${po.ref} -> ${status}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to update purchase order.' });
     }
   });
@@ -2414,20 +2426,20 @@ export function createApiRouter(): express.Router {
     '/purchase-orders/:id/convert-bill',
     authenticate,
     requirePermission('billing', 'write'),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const id = Number(req.params.id);
-      const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+      const po = (await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id)) as Record<string, unknown> | undefined;
       if (!po) {
         res.status(404).json({ error: 'Purchase order not found.' });
         return;
       }
-      const invRef = nextDocRef('invoices', 'SI');
+      const invRef = (await nextDocRef('invoices', 'SI'));
       const today = new Date().toISOString().slice(0, 10);
       const due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
 
-      db.exec('BEGIN');
+      (await db.exec('BEGIN'));
       try {
-        const info = db
+        const info = (await db
           .prepare(
             `INSERT INTO invoices (ref, invoice_type, third_party_id, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
              VALUES (?, 'supplier', ?, ?, ?, ?, 'validated', ?, ?, ?, ?, 0, ?, ?)`
@@ -2444,10 +2456,10 @@ export function createApiRouter(): express.Router {
             po.total_ttc as number,
             `Supplier bill from Purchase Order ${po.ref}`,
             req.authUser!.email
-          );
-        db.prepare("UPDATE purchase_orders SET status = 'billed' WHERE id = ?").run(id);
-        db.exec('COMMIT');
-        writeAuditLog({
+          ));
+        (await db.prepare("UPDATE purchase_orders SET status = 'billed' WHERE id = ?").run(id));
+        (await db.exec('COMMIT'));
+        (await writeAuditLog(db, {
           userId: req.authUser!.id,
           userEmail: req.authUser!.email,
           action: 'CONVERT_PO_TO_BILL',
@@ -2455,10 +2467,10 @@ export function createApiRouter(): express.Router {
           entityRef: invRef,
           details: `Created supplier bill ${invRef} from ${po.ref}`,
           ipAddress: getClientIp(req),
-        });
-        res.status(201).json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid));
+        }));
+        res.status(201).json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid)));
       } catch (err) {
-        db.exec('ROLLBACK');
+        (await db.exec('ROLLBACK'));
         res.status(500).json({ error: err instanceof Error ? err.message : 'Bill conversion failed.' });
       }
     }
@@ -2468,19 +2480,19 @@ export function createApiRouter(): express.Router {
   // BILLING & BANK TREASURY
   // ========================
 
-  router.get('/invoices', authenticate, requirePermission('billing', 'read'), (_req, res) => {
-    const rows = db
+  router.get('/invoices', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
+    const rows = (await db
       .prepare(
         `SELECT i.*, tp.name AS party_name, tp.ref AS party_ref
          FROM invoices i
          JOIN third_parties tp ON tp.id = i.third_party_id
          ORDER BY i.id DESC`
       )
-      .all();
+      .all());
     res.json({ invoices: rows });
   });
 
-  router.post('/invoices', authenticate, requirePermission('billing', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/invoices', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedRequest, res) => {
     const { invoiceType = 'customer', invoiceKind = 'standard', thirdPartyId, issueDate, dueDate, lines, notes = '' } = req.body ?? {};
     if (!thirdPartyId) {
       res.status(400).json({ error: 'Third party is required.' });
@@ -2491,10 +2503,10 @@ export function createApiRouter(): express.Router {
     try {
       const totals = computeLineTotals(lines);
       const prefix = cleanKind === 'credit_note' ? (cleanType === 'supplier' ? 'SC' : 'CR') : cleanType === 'supplier' ? 'SI' : 'IN';
-      const ref = nextDocRef('invoices', prefix);
+      const ref = (await nextDocRef('invoices', prefix));
       const today = new Date().toISOString().slice(0, 10);
       const due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO invoices (ref, invoice_type, invoice_kind, third_party_id, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
            VALUES (?, ?, ?, ?, '', ?, ?, 'draft', ?, ?, ?, ?, 0, ?, ?)`
@@ -2512,8 +2524,8 @@ export function createApiRouter(): express.Router {
           totals.totalTtc,
           String(notes).trim(),
           req.authUser!.email
-        );
-      writeAuditLog({
+        ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: cleanKind === 'credit_note' ? 'CREATE_CREDIT_NOTE' : 'CREATE_INVOICE',
@@ -2521,16 +2533,16 @@ export function createApiRouter(): express.Router {
         entityRef: ref,
         details: `Created ${cleanType} ${cleanKind.replace('_', ' ')} ${ref} ($${totals.totalTtc.toFixed(2)})`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid invoice payload.' });
     }
   });
 
-  router.put('/invoices/:id', authenticate, requirePermission('billing', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/invoices/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM invoices WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)) as
       | { id: number; ref: string; status: string }
       | undefined;
     if (!existing) {
@@ -2542,7 +2554,7 @@ export function createApiRouter(): express.Router {
     try {
       const totals = isDraft && Array.isArray(lines) && lines.length > 0 ? computeLineTotals(lines) : null;
       const allowedStatus = new Set(['draft', 'validated', 'cancelled']);
-      db.prepare(
+      (await db.prepare(
         `UPDATE invoices
          SET third_party_id = COALESCE(?, third_party_id),
              issue_date = COALESCE(?, issue_date),
@@ -2565,8 +2577,8 @@ export function createApiRouter(): express.Router {
         notes !== undefined ? String(notes).trim() : null,
         existing.status !== 'paid' && existing.status !== 'partial' && status && allowedStatus.has(status) ? status : null,
         id
-      );
-      writeAuditLog({
+      ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'UPDATE_INVOICE',
@@ -2574,16 +2586,16 @@ export function createApiRouter(): express.Router {
         entityRef: existing.ref,
         details: `Updated invoice ${existing.ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)));
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid invoice update.' });
     }
   });
 
-  router.post('/invoices/:id/validate', authenticate, requirePermission('billing', 'validate'), (req: AuthenticatedRequest, res) => {
+  router.post('/invoices/:id/validate', authenticate, requirePermission('billing', 'validate'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const inv = db.prepare('SELECT * FROM invoices WHERE id = ?').get(id) as { ref: string; status: string } | undefined;
+    const inv = (await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)) as { ref: string; status: string } | undefined;
     if (!inv) {
       res.status(404).json({ error: 'Invoice not found.' });
       return;
@@ -2592,8 +2604,8 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'Only draft invoices can be validated.' });
       return;
     }
-    db.prepare("UPDATE invoices SET status = 'validated' WHERE id = ?").run(id);
-    writeAuditLog({
+    (await db.prepare("UPDATE invoices SET status = 'validated' WHERE id = ?").run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'VALIDATE_INVOICE',
@@ -2601,11 +2613,11 @@ export function createApiRouter(): express.Router {
       entityRef: inv.ref,
       details: `Validated invoice ${inv.ref}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)));
   });
 
-  router.post('/invoices/:id/payments', authenticate, requirePermission('billing', 'record_payment'), (req: AuthenticatedRequest, res) => {
+  router.post('/invoices/:id/payments', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     const { bankAccountId, amount, paymentDate, label } = req.body ?? {};
     const payAmount = Number(amount);
@@ -2613,14 +2625,14 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'Bank account and positive payment amount are required.' });
       return;
     }
-    const inv = db
+    const inv = (await db
       .prepare(
         `SELECT i.*, tp.name AS party_name
          FROM invoices i
          JOIN third_parties tp ON tp.id = i.third_party_id
          WHERE i.id = ?`
       )
-      .get(id) as
+      .get(id)) as
       | {
           id: number;
           ref: string;
@@ -2654,11 +2666,11 @@ export function createApiRouter(): express.Router {
       String(label ?? '').trim() ||
       `${inv.invoice_type === 'customer' ? 'Payment' : 'Bill Settlement'} ${inv.ref} — ${inv.party_name}`;
 
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
-      db.prepare('UPDATE invoices SET amount_paid = ?, status = ? WHERE id = ?').run(nextPaid, nextStatus, id);
-      db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(balanceDelta, Number(bankAccountId));
-      db.prepare(
+      (await db.prepare('UPDATE invoices SET amount_paid = ?, status = ? WHERE id = ?').run(nextPaid, nextStatus, id));
+      (await db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(balanceDelta, Number(bankAccountId)));
+      (await db.prepare(
         `INSERT INTO bank_transactions (bank_account_id, tx_date, label, category, amount, direction, invoice_ref, created_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
@@ -2670,9 +2682,9 @@ export function createApiRouter(): express.Router {
         direction,
         inv.ref,
         req.authUser!.email
-      );
-      db.exec('COMMIT');
-      writeAuditLog({
+      ));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'RECORD_PAYMENT',
@@ -2680,17 +2692,17 @@ export function createApiRouter(): express.Router {
         entityRef: inv.ref,
         details: `Recorded $${payAmount.toFixed(2)} (${nextStatus}) on ${inv.ref}`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Payment recording failed.' });
     }
   });
 
-  router.delete('/invoices/:id', authenticate, requirePermission('billing', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/invoices/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const inv = db.prepare('SELECT ref, status FROM invoices WHERE id = ?').get(id) as
+    const inv = (await db.prepare('SELECT ref, status FROM invoices WHERE id = ?').get(id)) as
       | { ref: string; status: string }
       | undefined;
     if (!inv) {
@@ -2701,8 +2713,8 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'Paid or partially paid invoices cannot be deleted.' });
       return;
     }
-    db.prepare('DELETE FROM invoices WHERE id = ?').run(id);
-    writeAuditLog({
+    (await db.prepare('DELETE FROM invoices WHERE id = ?').run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_INVOICE',
@@ -2711,13 +2723,13 @@ export function createApiRouter(): express.Router {
       details: `Deleted invoice ${inv.ref}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.get('/bank-accounts', authenticate, requirePermission('billing', 'read'), (_req, res) => {
-    const accounts = db.prepare('SELECT * FROM bank_accounts ORDER BY id ASC').all();
-    const transactions = db
+  router.get('/bank-accounts', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
+    const accounts = (await db.prepare('SELECT * FROM bank_accounts ORDER BY id ASC').all());
+    const transactions = (await db
       .prepare(
         `SELECT bt.*, ba.name AS account_name, ba.ref AS account_ref
          FROM bank_transactions bt
@@ -2725,11 +2737,11 @@ export function createApiRouter(): express.Router {
          ORDER BY bt.tx_date DESC, bt.id DESC
          LIMIT 100`
       )
-      .all();
+      .all());
     res.json({ accounts, transactions });
   });
 
-  router.post('/bank-accounts', authenticate, requirePermission('billing', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/bank-accounts', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedRequest, res) => {
     const { ref, name, bankName = '', accountNumber = '', accountType = 'checking', initialBalance = 0 } = req.body ?? {};
     const cleanRef = String(ref ?? '').trim().toUpperCase();
     const cleanName = String(name ?? '').trim();
@@ -2738,7 +2750,7 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO bank_accounts (ref, name, bank_name, account_number, currency, balance, account_type, status)
            VALUES (?, ?, ?, ?, 'USD', ?, ?, 'active')`
@@ -2750,8 +2762,8 @@ export function createApiRouter(): express.Router {
           String(accountNumber).trim(),
           Number(initialBalance) || 0,
           ['checking', 'savings', 'cash'].includes(accountType) ? accountType : 'checking'
-        );
-      writeAuditLog({
+        ));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_BANK_ACCOUNT',
@@ -2759,22 +2771,22 @@ export function createApiRouter(): express.Router {
         entityRef: cleanRef,
         details: `Added treasury account ${cleanName}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM bank_accounts WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM bank_accounts WHERE id = ?').get(info.lastInsertRowid)));
     } catch {
       res.status(400).json({ error: 'Bank account ref already exists.' });
     }
   });
 
-  router.put('/bank-accounts/:id', authenticate, requirePermission('billing', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/bank-accounts/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref FROM bank_accounts WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT ref FROM bank_accounts WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Bank account not found.' });
       return;
     }
     const { name, bankName, accountNumber, accountType, status } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE bank_accounts
        SET name = COALESCE(?, name),
            bank_name = COALESCE(?, bank_name),
@@ -2789,8 +2801,8 @@ export function createApiRouter(): express.Router {
       ['checking', 'savings', 'cash'].includes(accountType) ? accountType : null,
       status === 'active' || status === 'closed' ? status : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_BANK_ACCOUNT',
@@ -2798,27 +2810,27 @@ export function createApiRouter(): express.Router {
       entityRef: existing.ref,
       details: `Updated bank account ${existing.ref}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM bank_accounts WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM bank_accounts WHERE id = ?').get(id)));
   });
 
-  router.delete('/bank-accounts/:id', authenticate, requirePermission('billing', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/bank-accounts/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, name FROM bank_accounts WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, name FROM bank_accounts WHERE id = ?').get(id)) as
       | { ref: string; name: string }
       | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Bank account not found.' });
       return;
     }
-    const txCnt = (db.prepare('SELECT COUNT(*) AS cnt FROM bank_transactions WHERE bank_account_id = ?').get(id) as { cnt: number }).cnt;
+    const txCnt = ((await db.prepare('SELECT COUNT(*) AS cnt FROM bank_transactions WHERE bank_account_id = ?').get(id)) as { cnt: number }).cnt;
     if (txCnt > 0) {
       res.status(409).json({ error: `Remove or settle ${txCnt} ledger transaction(s) before deleting this bank account.` });
       return;
     }
     try {
-      db.prepare('DELETE FROM bank_accounts WHERE id = ?').run(id);
-      writeAuditLog({
+      (await db.prepare('DELETE FROM bank_accounts WHERE id = ?').run(id));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_BANK_ACCOUNT',
@@ -2827,14 +2839,14 @@ export function createApiRouter(): express.Router {
         details: `Deleted bank account ${existing.name}`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch {
       res.status(409).json({ error: 'Cannot delete bank account referenced by SEPA batches.' });
     }
   });
 
-  router.post('/bank-transactions', authenticate, requirePermission('billing', 'record_payment'), (req: AuthenticatedRequest, res) => {
+  router.post('/bank-transactions', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedRequest, res) => {
     const { bankAccountId, txDate, label, category = 'Operations', amount, direction } = req.body ?? {};
     const amt = Number(amount);
     if (!bankAccountId || !String(label ?? '').trim() || !Number.isFinite(amt) || amt <= 0) {
@@ -2843,10 +2855,10 @@ export function createApiRouter(): express.Router {
     }
     const dir = direction === 'debit' ? 'debit' : 'credit';
     const delta = dir === 'credit' ? amt : -amt;
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
-      db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(delta, Number(bankAccountId));
-      const info = db
+      (await db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(delta, Number(bankAccountId)));
+      const info = (await db
         .prepare(
           `INSERT INTO bank_transactions (bank_account_id, tx_date, label, category, amount, direction, invoice_ref, created_by)
            VALUES (?, ?, ?, ?, ?, ?, '', ?)`
@@ -2859,26 +2871,26 @@ export function createApiRouter(): express.Router {
           amt,
           dir,
           req.authUser!.email
-        );
-      db.exec('COMMIT');
-      writeAuditLog({
+        ));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'BANK_TRANSACTION',
         module: 'billing',
         details: `${dir.toUpperCase()} $${amt.toFixed(2)}: ${label}`,
         ipAddress: getClientIp(req),
-      });
-      res.status(201).json(db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(info.lastInsertRowid));
+      }));
+      res.status(201).json((await db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(info.lastInsertRowid)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Transaction failed.' });
     }
   });
 
-  router.put('/bank-transactions/:id', authenticate, requirePermission('billing', 'record_payment'), (req: AuthenticatedRequest, res) => {
+  router.put('/bank-transactions/:id', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id)) as
       | { id: number; bank_account_id: number; amount: number; direction: 'credit' | 'debit'; label: string }
       | undefined;
     if (!existing) {
@@ -2897,12 +2909,12 @@ export function createApiRouter(): express.Router {
     const newImpact = nextDir === 'credit' ? nextAmt : -nextAmt;
     const balanceDelta = newImpact - oldImpact;
 
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
       if (Math.abs(balanceDelta) > 0.0001) {
-        db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(balanceDelta, existing.bank_account_id);
+        (await db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(balanceDelta, existing.bank_account_id));
       }
-      db.prepare(
+      (await db.prepare(
         `UPDATE bank_transactions
          SET tx_date = COALESCE(?, tx_date),
              label = COALESCE(?, label),
@@ -2917,9 +2929,9 @@ export function createApiRouter(): express.Router {
         nextAmt,
         nextDir,
         id
-      );
-      db.exec('COMMIT');
-      writeAuditLog({
+      ));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'UPDATE_BANK_TRANSACTION',
@@ -2927,17 +2939,17 @@ export function createApiRouter(): express.Router {
         entityRef: `TX-${id}`,
         details: `Updated ledger transaction #${id} (${nextDir.toUpperCase()} $${nextAmt.toFixed(2)})`,
         ipAddress: getClientIp(req),
-      });
-      res.json(db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id));
+      }));
+      res.json((await db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id)));
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to update transaction.' });
     }
   });
 
-  router.delete('/bank-transactions/:id', authenticate, requirePermission('billing', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/bank-transactions/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id)) as
       | { id: number; bank_account_id: number; amount: number; direction: 'credit' | 'debit'; label: string }
       | undefined;
     if (!existing) {
@@ -2945,12 +2957,12 @@ export function createApiRouter(): express.Router {
       return;
     }
     const reverseDelta = existing.direction === 'credit' ? -existing.amount : existing.amount;
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
-      db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(reverseDelta, existing.bank_account_id);
-      db.prepare('DELETE FROM bank_transactions WHERE id = ?').run(id);
-      db.exec('COMMIT');
-      writeAuditLog({
+      (await db.prepare('UPDATE bank_accounts SET balance = balance + ? WHERE id = ?').run(reverseDelta, existing.bank_account_id));
+      (await db.prepare('DELETE FROM bank_transactions WHERE id = ?').run(id));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_BANK_TRANSACTION',
@@ -2959,10 +2971,10 @@ export function createApiRouter(): express.Router {
         details: `Deleted ledger transaction "${existing.label}" ($${existing.amount.toFixed(2)})`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to delete transaction.' });
     }
   });
@@ -2971,29 +2983,29 @@ export function createApiRouter(): express.Router {
   // PROJECTS & TASKS
   // ========================
 
-  router.get('/projects', authenticate, requirePermission('projects', 'read'), (_req, res) => {
-    const projects = db
+  router.get('/projects', authenticate, requirePermission('projects', 'read'), async (_req, res) => {
+    const projects = (await db
       .prepare(
         `SELECT pr.*, tp.name AS customer_name
          FROM projects pr
          LEFT JOIN third_parties tp ON tp.id = pr.third_party_id
          ORDER BY pr.id DESC`
       )
-      .all();
-    const tasks = db.prepare('SELECT * FROM tasks ORDER BY id DESC').all();
+      .all());
+    const tasks = (await db.prepare('SELECT * FROM tasks ORDER BY id DESC').all());
     res.json({ projects, tasks });
   });
 
-  router.post('/projects', authenticate, requirePermission('projects', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/projects', authenticate, requirePermission('projects', 'write'), async (req: AuthenticatedRequest, res) => {
     const { title, thirdPartyId = null, startDate, dueDate, budgetAmount = 0, description = '' } = req.body ?? {};
     if (!String(title ?? '').trim()) {
       res.status(400).json({ error: 'Project title is required.' });
       return;
     }
-    const ref = nextDocRef('projects', 'PJ');
+    const ref = (await nextDocRef('projects', 'PJ'));
     const today = new Date().toISOString().slice(0, 10);
     const due = new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10);
-    const info = db
+    const info = (await db
       .prepare(
         `INSERT INTO projects (ref, title, third_party_id, start_date, due_date, budget_amount, status, progress, description, created_by)
          VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?)`
@@ -3007,8 +3019,8 @@ export function createApiRouter(): express.Router {
         Number(budgetAmount) || 0,
         String(description).trim(),
         req.authUser!.email
-      );
-    writeAuditLog({
+      ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'CREATE_PROJECT',
@@ -3016,19 +3028,19 @@ export function createApiRouter(): express.Router {
       entityRef: ref,
       details: `Created project ${title}`,
       ipAddress: getClientIp(req),
-    });
-    res.status(201).json(db.prepare('SELECT * FROM projects WHERE id = ?').get(info.lastInsertRowid));
+    }));
+    res.status(201).json((await db.prepare('SELECT * FROM projects WHERE id = ?').get(info.lastInsertRowid)));
   });
 
-  router.put('/projects/:id', authenticate, requirePermission('projects', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/projects/:id', authenticate, requirePermission('projects', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref FROM projects WHERE id = ?').get(id) as { ref: string } | undefined;
+    const existing = (await db.prepare('SELECT ref FROM projects WHERE id = ?').get(id)) as { ref: string } | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Project not found.' });
       return;
     }
     const { title, thirdPartyId, startDate, dueDate, budgetAmount, status, description } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE projects
        SET title = COALESCE(?, title),
            third_party_id = ?,
@@ -3044,15 +3056,15 @@ export function createApiRouter(): express.Router {
         ? null
         : thirdPartyId !== undefined
           ? Number(thirdPartyId)
-          : (db.prepare('SELECT third_party_id FROM projects WHERE id = ?').get(id) as { third_party_id: number | null }).third_party_id,
+          : ((await db.prepare('SELECT third_party_id FROM projects WHERE id = ?').get(id)) as { third_party_id: number | null }).third_party_id,
       startDate ? String(startDate) : null,
       dueDate ? String(dueDate) : null,
       budgetAmount !== undefined ? Number(budgetAmount) : null,
       ['draft', 'active', 'on_hold', 'completed'].includes(status) ? status : null,
       description !== undefined ? String(description).trim() : null,
       id
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_PROJECT',
@@ -3060,25 +3072,25 @@ export function createApiRouter(): express.Router {
       entityRef: existing.ref,
       details: `Updated project ${existing.ref}`,
       ipAddress: getClientIp(req),
-    });
-    res.json(db.prepare('SELECT * FROM projects WHERE id = ?').get(id));
+    }));
+    res.json((await db.prepare('SELECT * FROM projects WHERE id = ?').get(id)));
   });
 
-  router.delete('/projects/:id', authenticate, requirePermission('projects', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/projects/:id', authenticate, requirePermission('projects', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT ref, title FROM projects WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT ref, title FROM projects WHERE id = ?').get(id)) as
       | { ref: string; title: string }
       | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Project not found.' });
       return;
     }
-    db.exec('BEGIN');
+    (await db.exec('BEGIN'));
     try {
-      db.prepare('UPDATE timesheets SET project_id = NULL WHERE project_id = ?').run(id);
-      db.prepare('DELETE FROM projects WHERE id = ?').run(id);
-      db.exec('COMMIT');
-      writeAuditLog({
+      (await db.prepare('UPDATE timesheets SET project_id = NULL WHERE project_id = ?').run(id));
+      (await db.prepare('DELETE FROM projects WHERE id = ?').run(id));
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DELETE_PROJECT',
@@ -3087,23 +3099,23 @@ export function createApiRouter(): express.Router {
         details: `Deleted project ${existing.title}`,
         ipAddress: getClientIp(req),
         severity: 'warning',
-      });
+      }));
       res.json({ ok: true });
     } catch (err) {
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to delete project.' });
     }
   });
 
-  router.post('/projects/:id/tasks', authenticate, requirePermission('projects', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/projects/:id/tasks', authenticate, requirePermission('projects', 'write'), async (req: AuthenticatedRequest, res) => {
     const projectId = Number(req.params.id);
     const { title, assigneeName = '', priority = 'medium', estimatedHours = 8, dueDate = '' } = req.body ?? {};
     if (!String(title ?? '').trim()) {
       res.status(400).json({ error: 'Task title is required.' });
       return;
     }
-    const ref = nextDocRef('tasks', 'TK');
-    const info = db
+    const ref = (await nextDocRef('tasks', 'TK'));
+    const info = (await db
       .prepare(
         `INSERT INTO tasks (project_id, ref, title, assignee_name, priority, status, estimated_hours, logged_hours, progress, due_date)
          VALUES (?, ?, ?, ?, ?, 'todo', ?, 0, 0, ?)`
@@ -3116,17 +3128,17 @@ export function createApiRouter(): express.Router {
         ['low', 'medium', 'high'].includes(priority) ? priority : 'medium',
         Number(estimatedHours) || 0,
         String(dueDate).trim()
-      );
-    res.status(201).json(db.prepare('SELECT * FROM tasks WHERE id = ?').get(info.lastInsertRowid));
+      ));
+    res.status(201).json((await db.prepare('SELECT * FROM tasks WHERE id = ?').get(info.lastInsertRowid)));
   });
 
-  router.put('/tasks/:id', authenticate, (req: AuthenticatedRequest, res) => {
+  router.put('/tasks/:id', authenticate, async (req: AuthenticatedRequest, res) => {
     if (!hasPermission(req.authPermissions, 'projects', 'write') && !hasPermission(req.authPermissions, 'projects', 'log_time')) {
       res.status(403).json({ error: 'Permission required to update tasks or log time.' });
       return;
     }
     const id = Number(req.params.id);
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as
+    const task = (await db.prepare('SELECT * FROM tasks WHERE id = ?').get(id)) as
       | { id: number; project_id: number; logged_hours: number; progress: number; status: string }
       | undefined;
     if (!task) {
@@ -3139,7 +3151,7 @@ export function createApiRouter(): express.Router {
       progress !== undefined ? Math.min(100, Math.max(0, Math.round(Number(progress)))) : task.progress;
     const nextStatus = status ?? (nextProgress === 100 ? 'done' : task.status);
 
-    db.prepare(
+    (await db.prepare(
       `UPDATE tasks
        SET title = COALESCE(?, title),
            assignee_name = COALESCE(?, assignee_name),
@@ -3160,32 +3172,32 @@ export function createApiRouter(): express.Router {
       nextProgress,
       nextHours,
       id
-    );
+    ));
 
     // Recompute parent project progress automatically
-    const avgRow = db
+    const avgRow = (await db
       .prepare('SELECT COALESCE(AVG(progress), 0) AS avg_prog FROM tasks WHERE project_id = ?')
-      .get(task.project_id) as { avg_prog: number };
-    db.prepare('UPDATE projects SET progress = ? WHERE id = ?').run(Math.round(avgRow.avg_prog), task.project_id);
+      .get(task.project_id)) as { avg_prog: number };
+    (await db.prepare('UPDATE projects SET progress = ? WHERE id = ?').run(Math.round(avgRow.avg_prog), task.project_id));
 
-    res.json(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id));
+    res.json((await db.prepare('SELECT * FROM tasks WHERE id = ?').get(id)));
   });
 
-  router.delete('/tasks/:id', authenticate, requirePermission('projects', 'delete'), (req: AuthenticatedRequest, res) => {
+  router.delete('/tasks/:id', authenticate, requirePermission('projects', 'delete'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const task = db.prepare('SELECT id, ref, title, project_id FROM tasks WHERE id = ?').get(id) as
+    const task = (await db.prepare('SELECT id, ref, title, project_id FROM tasks WHERE id = ?').get(id)) as
       | { id: number; ref: string; title: string; project_id: number }
       | undefined;
     if (!task) {
       res.status(404).json({ error: 'Task not found.' });
       return;
     }
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
-    const avgRow = db
+    (await db.prepare('DELETE FROM tasks WHERE id = ?').run(id));
+    const avgRow = (await db
       .prepare('SELECT COALESCE(AVG(progress), 0) AS avg_prog FROM tasks WHERE project_id = ?')
-      .get(task.project_id) as { avg_prog: number };
-    db.prepare('UPDATE projects SET progress = ? WHERE id = ?').run(Math.round(avgRow.avg_prog), task.project_id);
-    writeAuditLog({
+      .get(task.project_id)) as { avg_prog: number };
+    (await db.prepare('UPDATE projects SET progress = ? WHERE id = ?').run(Math.round(avgRow.avg_prog), task.project_id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_TASK',
@@ -3194,7 +3206,7 @@ export function createApiRouter(): express.Router {
       details: `Deleted task ${task.title}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
@@ -3202,18 +3214,18 @@ export function createApiRouter(): express.Router {
   // ADMINISTRATION, RBAC & AUDIT
   // ========================
 
-  router.get('/admin/permission-catalog', authenticate, requirePermission('admin', 'read'), (_req, res) => {
+  router.get('/admin/permission-catalog', authenticate, requirePermission('admin', 'read'), async (_req, res) => {
     res.json({ catalog: PERMISSION_CATALOG });
   });
 
-  router.get('/admin/roles', authenticate, requirePermission('admin', 'read'), (_req, res) => {
-    const roles = db
+  router.get('/admin/roles', authenticate, requirePermission('admin', 'read'), async (_req, res) => {
+    const roles = (await db
       .prepare(
         `SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) AS user_count
          FROM roles r
          ORDER BY r.is_system DESC, r.id ASC`
       )
-      .all() as unknown as Array<Record<string, unknown>>;
+      .all()) as unknown as Array<Record<string, unknown>>;
 
     res.json({
       roles: roles.map((r) => ({
@@ -3230,7 +3242,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/admin/roles', authenticate, requirePermission('admin', 'manage_roles'), (req: AuthenticatedRequest, res) => {
+  router.post('/admin/roles', authenticate, requirePermission('admin', 'manage_roles'), async (req: AuthenticatedRequest, res) => {
     const { name, description = '', permissions = {}, requireMfa = false } = req.body ?? {};
     const cleanName = String(name ?? '').trim();
     if (!cleanName) {
@@ -3246,13 +3258,13 @@ export function createApiRouter(): express.Router {
       return;
     }
     try {
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO roles (slug, name, description, permissions_json, require_mfa, is_system)
            VALUES (?, ?, ?, ?, ?, 0)`
         )
-        .run(slug, cleanName, String(description).trim(), JSON.stringify(permissions), requireMfa ? 1 : 0);
-      writeAuditLog({
+        .run(slug, cleanName, String(description).trim(), JSON.stringify(permissions), requireMfa ? 1 : 0));
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_ROLE',
@@ -3260,16 +3272,16 @@ export function createApiRouter(): express.Router {
         entityRef: slug,
         details: `Created RBAC role ${cleanName}`,
         ipAddress: getClientIp(req),
-      });
+      }));
       res.status(201).json({ id: Number(info.lastInsertRowid), slug, name: cleanName });
     } catch {
       res.status(400).json({ error: 'A role with a similar slug already exists.' });
     }
   });
 
-  router.put('/admin/roles/:id', authenticate, requirePermission('admin', 'manage_roles'), (req: AuthenticatedRequest, res) => {
+  router.put('/admin/roles/:id', authenticate, requirePermission('admin', 'manage_roles'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM roles WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM roles WHERE id = ?').get(id)) as
       | { id: number; slug: string; name: string; is_system: number }
       | undefined;
     if (!existing) {
@@ -3287,7 +3299,7 @@ export function createApiRouter(): express.Router {
       };
     }
 
-    db.prepare(
+    (await db.prepare(
       `UPDATE roles
        SET name = COALESCE(?, name),
            description = COALESCE(?, description),
@@ -3300,9 +3312,9 @@ export function createApiRouter(): express.Router {
       nextPermissions ? JSON.stringify(nextPermissions) : null,
       requireMfa !== undefined ? (requireMfa ? 1 : 0) : null,
       id
-    );
+    ));
 
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_ROLE_PERMISSIONS',
@@ -3311,13 +3323,13 @@ export function createApiRouter(): express.Router {
       details: `Updated permissions/MFA policy for role ${existing.name}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.delete('/admin/roles/:id', authenticate, requirePermission('admin', 'manage_roles'), (req: AuthenticatedRequest, res) => {
+  router.delete('/admin/roles/:id', authenticate, requirePermission('admin', 'manage_roles'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM roles WHERE id = ?').get(id) as
+    const existing = (await db.prepare('SELECT * FROM roles WHERE id = ?').get(id)) as
       | { id: number; slug: string; name: string; is_system: number }
       | undefined;
     if (!existing) {
@@ -3328,13 +3340,13 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'System Super Admin role cannot be deleted.' });
       return;
     }
-    const assigned = db.prepare('SELECT COUNT(*) AS cnt FROM users WHERE role_id = ?').get(id) as { cnt: number };
+    const assigned = (await db.prepare('SELECT COUNT(*) AS cnt FROM users WHERE role_id = ?').get(id)) as { cnt: number };
     if (assigned.cnt > 0) {
       res.status(409).json({ error: `Reassign ${assigned.cnt} user(s) before deleting this role.` });
       return;
     }
-    db.prepare('DELETE FROM roles WHERE id = ?').run(id);
-    writeAuditLog({
+    (await db.prepare('DELETE FROM roles WHERE id = ?').run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_ROLE',
@@ -3343,25 +3355,25 @@ export function createApiRouter(): express.Router {
       details: `Deleted role ${existing.name}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.get('/admin/users', authenticate, requirePermission('admin', 'read'), (_req, res) => {
-    const rows = db
+  router.get('/admin/users', authenticate, requirePermission('admin', 'read'), async (_req, res) => {
+    const rows = (await db
       .prepare(
         `SELECT u.*, r.slug AS role_slug, r.name AS role_name, r.permissions_json, r.require_mfa AS role_require_mfa
          FROM users u
          JOIN roles r ON r.id = u.role_id
          ORDER BY u.id ASC`
       )
-      .all() as unknown as AuthUserRow[];
+      .all()) as unknown as AuthUserRow[];
     res.json({ users: rows.map(sanitizeUser) });
   });
 
-  router.post('/admin/users', authenticate, requirePermission('admin', 'write'), (req: AuthenticatedRequest, res) => {
+  router.post('/admin/users', authenticate, requirePermission('admin', 'write'), async (req: AuthenticatedRequest, res) => {
     const { fullName, username, email, password, roleId } = req.body ?? {};
-    const policy = getSecurityPolicy();
+    const policy = (await getSecurityPolicy());
     const cleanName = String(fullName ?? '').trim();
     const cleanUsername = String(username ?? '').trim().toLowerCase();
     const cleanEmail = String(email ?? '').trim().toLowerCase();
@@ -3375,7 +3387,7 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: `Password must be at least ${policy.min_password_length} characters.` });
       return;
     }
-    const role = db.prepare('SELECT id, name FROM roles WHERE id = ?').get(Number(roleId)) as
+    const role = (await db.prepare('SELECT id, name FROM roles WHERE id = ?').get(Number(roleId))) as
       | { id: number; name: string }
       | undefined;
     if (!role) {
@@ -3384,14 +3396,14 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      const info = db
+      const info = (await db
         .prepare(
           `INSERT INTO users (username, email, full_name, password_hash, role_id, is_active, mfa_enabled)
            VALUES (?, ?, ?, ?, ?, 1, 0)`
         )
-        .run(cleanUsername, cleanEmail, cleanName, hashPassword(rawPass), role.id);
+        .run(cleanUsername, cleanEmail, cleanName, hashPassword(rawPass), role.id));
 
-      writeAuditLog({
+      (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'CREATE_USER',
@@ -3399,25 +3411,25 @@ export function createApiRouter(): express.Router {
         entityRef: cleanUsername,
         details: `Created user ${cleanEmail} with role ${role.name}`,
         ipAddress: getClientIp(req),
-      });
+      }));
 
-      const created = getUserWithRoleById(Number(info.lastInsertRowid))!;
+      const created = (await getUserWithRoleById(Number(info.lastInsertRowid)))!;
       res.status(201).json({ user: sanitizeUser(created) });
     } catch {
       res.status(409).json({ error: 'Username or email address already exists.' });
     }
   });
 
-  router.put('/admin/users/:id', authenticate, requirePermission('admin', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/admin/users/:id', authenticate, requirePermission('admin', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const target = getUserWithRoleById(id);
+    const target = (await getUserWithRoleById(id));
     if (!target) {
       res.status(404).json({ error: 'User not found.' });
       return;
     }
 
     const { fullName, email, username, roleId, isActive, newPassword, unlockAccount, resetMfa } = req.body ?? {};
-    const policy = getSecurityPolicy();
+    const policy = (await getSecurityPolicy());
 
     if (id === req.authUser!.id && isActive === false) {
       res.status(400).json({ error: 'You cannot deactivate your own active account.' });
@@ -3434,21 +3446,21 @@ export function createApiRouter(): express.Router {
         res.status(400).json({ error: `Password must be at least ${policy.min_password_length} characters.` });
         return;
       }
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(String(newPassword)), id);
+      (await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(String(newPassword)), id));
     }
 
     if (unlockAccount) {
-      db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?').run(id);
+      (await db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?').run(id));
     }
 
     if (resetMfa) {
-      db.prepare(
+      (await db.prepare(
         `UPDATE users SET mfa_enabled = 0, mfa_secret = NULL, mfa_pending_secret = NULL, recovery_codes_json = '[]' WHERE id = ?`
-      ).run(id);
+      ).run(id));
     }
 
     try {
-      db.prepare(
+      (await db.prepare(
         `UPDATE users
          SET full_name = COALESCE(?, full_name),
              email = COALESCE(?, email),
@@ -3463,17 +3475,17 @@ export function createApiRouter(): express.Router {
         roleId ? Number(roleId) : null,
         isActive !== undefined ? (isActive ? 1 : 0) : null,
         id
-      );
+      ));
     } catch {
       res.status(409).json({ error: 'Username or email address already exists.' });
       return;
     }
 
     if (isActive === false) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE user_id = ?').run(id);
+      (await db.prepare('UPDATE sessions SET revoked = 1 WHERE user_id = ?').run(id));
     }
 
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: resetMfa ? 'ADMIN_RESET_MFA' : unlockAccount ? 'ADMIN_UNLOCK_USER' : 'UPDATE_USER',
@@ -3482,14 +3494,14 @@ export function createApiRouter(): express.Router {
       details: `Updated user ${target.email}`,
       ipAddress: getClientIp(req),
       severity: resetMfa || isActive === false ? 'warning' : 'info',
-    });
+    }));
 
-    res.json({ user: sanitizeUser(getUserWithRoleById(id)!) });
+    res.json({ user: sanitizeUser((await getUserWithRoleById(id))!) });
   });
 
-  router.delete('/admin/users/:id', authenticate, requirePermission('admin', 'write'), (req: AuthenticatedRequest, res) => {
+  router.delete('/admin/users/:id', authenticate, requirePermission('admin', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const target = getUserWithRoleById(id);
+    const target = (await getUserWithRoleById(id));
     if (!target) {
       res.status(404).json({ error: 'User not found.' });
       return;
@@ -3499,14 +3511,14 @@ export function createApiRouter(): express.Router {
       return;
     }
     if (target.role_slug === 'super_admin') {
-      const superAdmins = (db.prepare(`SELECT COUNT(*) AS cnt FROM users u JOIN roles r ON r.id = u.role_id WHERE r.slug = 'super_admin'`).get() as { cnt: number }).cnt;
+      const superAdmins = ((await db.prepare(`SELECT COUNT(*) AS cnt FROM users u JOIN roles r ON r.id = u.role_id WHERE r.slug = 'super_admin'`).get()) as { cnt: number }).cnt;
       if (superAdmins <= 1) {
         res.status(409).json({ error: 'Cannot delete the last Super Admin user.' });
         return;
       }
     }
-    db.prepare('DELETE FROM users WHERE id = ?').run(id);
-    writeAuditLog({
+    (await db.prepare('DELETE FROM users WHERE id = ?').run(id));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_USER',
@@ -3515,17 +3527,17 @@ export function createApiRouter(): express.Router {
       details: `Deleted user ${target.email}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
+    }));
     res.json({ ok: true });
   });
 
-  router.get('/admin/policy', authenticate, requirePermission('admin', 'read'), (_req, res) => {
-    res.json({ policy: getSecurityPolicy() });
+  router.get('/admin/policy', authenticate, requirePermission('admin', 'read'), async (_req, res) => {
+    res.json({ policy: (await getSecurityPolicy()) });
   });
 
-  router.put('/admin/policy', authenticate, requirePermission('admin', 'manage_roles'), (req: AuthenticatedRequest, res) => {
+  router.put('/admin/policy', authenticate, requirePermission('admin', 'manage_roles'), async (req: AuthenticatedRequest, res) => {
     const { maxFailedAttempts, lockoutMinutes, sessionTtlHours, enforceMfaGlobal, minPasswordLength } = req.body ?? {};
-    db.prepare(
+    (await db.prepare(
       `UPDATE security_policy
        SET max_failed_attempts = COALESCE(?, max_failed_attempts),
            lockout_minutes = COALESCE(?, lockout_minutes),
@@ -3540,8 +3552,8 @@ export function createApiRouter(): express.Router {
       sessionTtlHours !== undefined ? Math.min(168, Math.max(1, Number(sessionTtlHours))) : null,
       enforceMfaGlobal !== undefined ? (enforceMfaGlobal ? 1 : 0) : null,
       minPasswordLength !== undefined ? Math.min(32, Math.max(8, Number(minPasswordLength))) : null
-    );
-    writeAuditLog({
+    ));
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_SECURITY_POLICY',
@@ -3549,15 +3561,15 @@ export function createApiRouter(): express.Router {
       details: 'Updated organization authentication & MFA policy',
       ipAddress: getClientIp(req),
       severity: 'warning',
-    });
-    res.json({ policy: getSecurityPolicy() });
+    }));
+    res.json({ policy: (await getSecurityPolicy()) });
   });
 
-  router.get('/admin/settings', authenticate, requirePermission('admin', 'read'), (_req, res) => {
-    res.json({ settings: getSystemSettings() });
+  router.get('/admin/settings', authenticate, requirePermission('admin', 'read'), async (_req, res) => {
+    res.json({ settings: (await getSystemSettings()) });
   });
 
-  router.put('/admin/settings', authenticate, requirePermission('admin', 'write'), (req: AuthenticatedRequest, res) => {
+  router.put('/admin/settings', authenticate, requirePermission('admin', 'write'), async (req: AuthenticatedRequest, res) => {
     const {
       appName,
       companyName,
@@ -3579,7 +3591,7 @@ export function createApiRouter(): express.Router {
     const taxRate = Number(defaultTaxRate);
     const fiscalStart = Number(fiscalYearStart);
 
-    db.prepare(
+    (await db.prepare(
       `UPDATE system_settings
        SET app_name = ?,
            company_name = ?,
@@ -3608,9 +3620,9 @@ export function createApiRouter(): express.Router {
       String(defaultIncoterm ?? 'FOB').trim() || 'FOB',
       Number.isFinite(fiscalStart) ? Math.min(12, Math.max(1, fiscalStart)) : 1,
       String(dateFormat ?? 'MMM d, yyyy').trim() || 'MMM d, yyyy'
-    );
+    ));
 
-    writeAuditLog({
+    (await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_SYSTEM_SETTINGS',
@@ -3619,9 +3631,9 @@ export function createApiRouter(): express.Router {
       details: `Updated system settings (${cleanCompany}, currency: ${cleanCurrency})`,
       ipAddress: getClientIp(req),
       severity: 'info',
-    });
+    }));
 
-    res.json({ settings: getSystemSettings() });
+    res.json({ settings: (await getSystemSettings()) });
   });
 
   function buildAuditFilterClause(query: Record<string, unknown>) {
@@ -3667,13 +3679,13 @@ export function createApiRouter(): express.Router {
     return { whereClause, params, orderDir, limit };
   }
 
-  router.get('/admin/audit-logs', authenticate, requirePermission('audit', 'read'), (req, res) => {
+  router.get('/admin/audit-logs', authenticate, requirePermission('audit', 'read'), async (req, res) => {
     const { whereClause, params, orderDir, limit } = buildAuditFilterClause(req.query as Record<string, unknown>);
-    const logs = db
+    const logs = (await db
       .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY created_at ${orderDir}, id ${orderDir} LIMIT ?`)
-      .all(...params, limit);
+      .all(...params, limit));
 
-    const summary = db
+    const summary = (await db
       .prepare(
         `SELECT
            COUNT(*) AS total,
@@ -3683,7 +3695,7 @@ export function createApiRouter(): express.Router {
            COALESCE(SUM(CASE WHEN severity IN ('warning', 'critical') THEN 1 ELSE 0 END), 0) AS alert_count
          FROM audit_logs`
       )
-      .get() as {
+      .get()) as {
       total: number;
       auth_count: number;
       permission_count: number;
@@ -3694,11 +3706,11 @@ export function createApiRouter(): express.Router {
     res.json({ logs, summary });
   });
 
-  router.get('/admin/audit-logs/export', authenticate, requirePermission('audit', 'export'), (req: AuthenticatedRequest, res) => {
+  router.get('/admin/audit-logs/export', authenticate, requirePermission('audit', 'export'), async (req: AuthenticatedRequest, res) => {
     const { whereClause, params, orderDir } = buildAuditFilterClause(req.query as Record<string, unknown>);
-    const logs = db
+    const logs = (await db
       .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY created_at ${orderDir}, id ${orderDir} LIMIT 1000`)
-      .all(...params) as unknown as Array<Record<string, unknown>>;
+      .all(...params)) as unknown as Array<Record<string, unknown>>;
 
     const sanitizeCsvCell = (val: unknown): string => {
       let s = String(val ?? '');
@@ -3718,7 +3730,7 @@ export function createApiRouter(): express.Router {
     );
     const csv = [header, ...rows].join('\n');
 
-    writeAuditLog({
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'EXPORT_AUDIT_LOGS',
@@ -3732,7 +3744,7 @@ export function createApiRouter(): express.Router {
   });
 
   router.use(
-    createExtraApiRouter({
+    createExtraApiRouter(db, env, {
       authenticate,
       requirePermission,
       getClientIp,

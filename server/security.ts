@@ -47,8 +47,10 @@ export interface ChallengePayload {
 export function signChallengeToken(
   userId: number,
   purpose: 'mfa_verify' | 'mfa_enroll',
-  ttlSeconds = 300
+  ttlSeconds = 300,
+  signingSecret?: string
 ): string {
+  const key = signingSecret || EPHEMERAL_SIGNING_KEY;
   const payload: ChallengePayload = {
     sub: userId,
     purpose,
@@ -57,7 +59,7 @@ export function signChallengeToken(
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto
-    .createHmac('sha256', EPHEMERAL_SIGNING_KEY)
+    .createHmac('sha256', key)
     .update(encoded)
     .digest('base64url');
   return `${encoded}.${sig}`;
@@ -65,7 +67,8 @@ export function signChallengeToken(
 
 export function verifyChallengeToken(
   token: string,
-  expectedPurpose: 'mfa_verify' | 'mfa_enroll'
+  expectedPurpose: 'mfa_verify' | 'mfa_enroll',
+  signingSecret?: string
 ): ChallengePayload | null {
   if (!token || typeof token !== 'string') return null;
   const parts = token.split('.');
@@ -73,8 +76,9 @@ export function verifyChallengeToken(
   const [encoded, sig] = parts;
   if (!encoded || !sig) return null;
 
+  const key = signingSecret || EPHEMERAL_SIGNING_KEY;
   const expectedSig = crypto
-    .createHmac('sha256', EPHEMERAL_SIGNING_KEY)
+    .createHmac('sha256', key)
     .update(encoded)
     .digest('base64url');
 
@@ -188,7 +192,8 @@ export function buildOtpAuthUri(secret: string, email: string, issuer = 'KSCAT-E
 }
 
 export async function generateQrDataUrl(otpAuthUri: string): Promise<string> {
-  return QRCode.toDataURL(otpAuthUri, {
+  const svg = await QRCode.toString(otpAuthUri, {
+    type: 'svg',
     width: 220,
     margin: 2,
     color: {
@@ -196,6 +201,7 @@ export async function generateQrDataUrl(otpAuthUri: string): Promise<string> {
       light: '#FFFFFF',
     },
   });
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
 export function generateRecoveryCodes(count = 8): {

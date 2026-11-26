@@ -3,12 +3,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
+import { initDatabase } from './server/db.ts';
+import { createNodeSqliteDatabase } from './server/node_db.ts';
 import { createApiRouter } from './server/routes.ts';
 
 async function startServer() {
   const app = express();
   const port = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';
+
+  const nodeDb = createNodeSqliteDatabase();
+  await initDatabase(nodeDb);
+  const apiRouter = createApiRouter(nodeDb, process.env);
 
   const allowedOrigins = new Set(
     (process.env.ALLOWED_ORIGINS || '')
@@ -41,7 +47,36 @@ async function startServer() {
     next();
   });
 
-  app.use('/api', createApiRouter());
+  app.use('/api', async (req, res, next) => {
+    try {
+      const protocol = req.protocol || 'http';
+      const host = req.get('host') || `127.0.0.1:${port}`;
+      const fullUrl = new URL(req.originalUrl, `${protocol}://${host}`);
+      const headers = new Headers();
+      for (const [key, val] of Object.entries(req.headers)) {
+        if (typeof val === 'string') {
+          headers.set(key, val);
+        } else if (Array.isArray(val)) {
+          headers.set(key, val.join(', '));
+        }
+      }
+      const webReq = new Request(fullUrl.toString(), {
+        method: req.method,
+        headers,
+      });
+      const apiRes = await apiRouter.handle(webReq, {
+        clientIp: req.ip || req.socket.remoteAddress || 'unknown',
+        preParsedBody: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
+      });
+      res.status(apiRes.status);
+      apiRes.headers.forEach((value, key) => {
+        res.setHeader(key, value);
+      });
+      res.send(await apiRes.text());
+    } catch (err) {
+      next(err);
+    }
+  });
 
   if (!isProd) {
     const vite = await createViteServer({

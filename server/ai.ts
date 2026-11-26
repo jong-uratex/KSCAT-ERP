@@ -1,8 +1,8 @@
 import { GoogleGenAI } from '@google/genai';
-import { db } from './db.ts';
+import type { AppEnv, DbClient } from './db_adapter.ts';
 
-function createClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+function createClient(env: AppEnv): GoogleGenAI {
+  const apiKey = env.GEMINI_API_KEY;
   if (!apiKey || !apiKey.trim()) {
     throw new Error('GEMINI_API_KEY is not configured in server environment secrets.');
   }
@@ -16,8 +16,8 @@ function createClient(): GoogleGenAI {
   });
 }
 
-function gatherLiveErpSummary(): string {
-  const inv = db
+async function gatherLiveErpSummary(db: DbClient): Promise<string> {
+  const inv = (await db
     .prepare(
       `SELECT
          COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND status != 'cancelled' THEN total_ttc ELSE 0 END), 0) AS billed,
@@ -25,9 +25,9 @@ function gatherLiveErpSummary(): string {
          COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status IN ('validated', 'partial') THEN total_ttc - amount_paid ELSE 0 END), 0) AS payables
        FROM invoices`
     )
-    .get() as { billed: number; receivables: number; payables: number };
+    .get()) as { billed: number; receivables: number; payables: number };
 
-  const lowStock = db
+  const lowStock = (await db
     .prepare(
       `SELECT p.ref, p.name, p.min_stock, COALESCE(SUM(sl.quantity), 0) AS qty
        FROM products p LEFT JOIN stock_levels sl ON sl.product_id = p.id
@@ -35,23 +35,23 @@ function gatherLiveErpSummary(): string {
        GROUP BY p.id
        HAVING qty < p.min_stock`
     )
-    .all() as Array<{ ref: string; name: string; min_stock: number; qty: number }>;
+    .all()) as Array<{ ref: string; name: string; min_stock: number; qty: number }>;
 
-  const openOpps = db
+  const openOpps = (await db
     .prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS val FROM opportunities WHERE stage NOT IN ('won', 'lost')`)
-    .get() as { cnt: number; val: number };
+    .get()) as { cnt: number; val: number };
 
-  const openTickets = db
+  const openTickets = (await db
     .prepare(`SELECT COUNT(*) AS cnt FROM tickets WHERE status != 'closed'`)
-    .get() as { cnt: number };
+    .get()) as { cnt: number };
 
-  const openMo = db
+  const openMo = (await db
     .prepare(`SELECT COUNT(*) AS cnt FROM manufacturing_orders WHERE status IN ('draft', 'validated', 'in_progress')`)
-    .get() as { cnt: number };
+    .get()) as { cnt: number };
 
-  const bankCash = db
+  const bankCash = (await db
     .prepare(`SELECT COALESCE(SUM(balance), 0) AS bal FROM bank_accounts WHERE status = 'active'`)
-    .get() as { bal: number };
+    .get()) as { bal: number };
 
   return JSON.stringify({
     cashBalanceUsd: bankCash.bal,
@@ -65,18 +65,22 @@ function gatherLiveErpSummary(): string {
   });
 }
 
-export async function runErpAiAssist(params: {
-  taskType: 'executive_brief' | 'ticket_reply' | 'proposal_scope' | 'email_campaign' | 'custom_qa';
-  prompt: string;
-  contextRef?: string;
-}): Promise<{ text: string; model: string }> {
-  const ai = createClient();
+export async function runErpAiAssist(
+  db: DbClient,
+  env: AppEnv,
+  params: {
+    taskType: 'executive_brief' | 'ticket_reply' | 'proposal_scope' | 'email_campaign' | 'custom_qa';
+    prompt: string;
+    contextRef?: string;
+  }
+): Promise<{ text: string; model: string }> {
+  const ai = createClient(env);
   const model = 'gemini-4-hydrogen';
-  const erpSnapshot = gatherLiveErpSummary();
+  const erpSnapshot = await gatherLiveErpSummary(db);
 
   let extraContext = '';
   if (params.taskType === 'ticket_reply' && params.contextRef) {
-    const ticket = db
+    const ticket = await db
       .prepare('SELECT ref, subject, category, severity, message FROM tickets WHERE ref = ? OR id = ?')
       .get(params.contextRef, Number(params.contextRef) || -1);
     if (ticket) {

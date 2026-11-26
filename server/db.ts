@@ -1,13 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import crypto from 'node:crypto';
+import type { AppEnv, DbClient } from './db_adapter.ts';
 import { DEFAULT_ROLES } from './rbac.ts';
-
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_PATH = path.join(DATA_DIR, 'meridian.db');
-
-export const db = new DatabaseSync(DB_PATH);
 
 export interface OptionalModuleDefinition {
   module_key: string;
@@ -39,8 +32,7 @@ export const DEFAULT_OPTIONAL_MODULES: Array<Omit<OptionalModuleDefinition, 'ena
   { module_key: 'admin', name: 'Security, RBAC & Audit', category: 'Administration', description: 'Core access control, MFA, optional modules, integrations, and audit log.', enabled: true, locked: 1 },
 ];
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
+export const SCHEMA_SQL = `
   PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS roles (
@@ -762,85 +754,71 @@ db.exec(`
     date_format TEXT NOT NULL DEFAULT 'MMM d, yyyy',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
-`);
+`;
 
-function ensureColumn(table: string, column: string, definition: string): void {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+async function ensureColumn(db: DbClient, table: string, column: string, definition: string): Promise<void> {
+  const cols = (await db.prepare(`PRAGMA table_info(${table})`).all()) as Array<{ name: string }>;
   if (!cols.some((c) => c.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    (await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`));
   }
 }
 
-// Safe additive migrations for existing databases
-ensureColumn('users', 'phone', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('users', 'job_title', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('users', 'department', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('users', 'timezone', "TEXT NOT NULL DEFAULT 'Asia/Manila'");
-ensureColumn('third_parties', 'social_json', "TEXT NOT NULL DEFAULT '{}'");
-ensureColumn('products', 'barcode', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('proposals', 'signed_by', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('proposals', 'signed_at', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('proposals', 'signature_name', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('sales_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'EXW'");
-ensureColumn('purchase_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'FOB'");
-ensureColumn('invoices', 'invoice_kind', "TEXT NOT NULL DEFAULT 'standard'");
-
-export function ensureDefaults(): void {
-  const roleCountRow = db.prepare('SELECT COUNT(*) as cnt FROM roles').get() as { cnt: number };
+export async function ensureDefaults(db: DbClient): Promise<void> {
+  const roleCountRow = (await db.prepare('SELECT COUNT(*) as cnt FROM roles').get()) as { cnt: number };
   if (roleCountRow.cnt === 0) {
     const insertRole = db.prepare(
       `INSERT INTO roles (slug, name, description, permissions_json, require_mfa, is_system)
        VALUES (?, ?, ?, ?, ?, ?)`
     );
     for (const r of DEFAULT_ROLES) {
-      insertRole.run(
+      (await insertRole.run(
         r.slug,
         r.name,
         r.description,
         JSON.stringify(r.permissions),
         r.requireMfa ? 1 : 0,
         r.isSystem ? 1 : 0
-      );
+      ));
     }
   } else {
     // Keep super_admin aligned with newly introduced permission modules
     const superDef = DEFAULT_ROLES.find((r) => r.slug === 'super_admin');
     if (superDef) {
-      const existingSuper = db
+      const existingSuper = (await db
         .prepare("SELECT id, permissions_json FROM roles WHERE slug = 'super_admin'")
-        .get() as { id: number; permissions_json: string } | undefined;
+        .get()) as { id: number; permissions_json: string } | undefined;
       if (existingSuper) {
         try {
           const parsed = JSON.parse(existingSuper.permissions_json) as Record<string, string[]>;
           if (!parsed.manufacturing || !parsed.pos || !parsed.hr || !parsed.tools || !parsed.support) {
-            db.prepare('UPDATE roles SET permissions_json = ? WHERE id = ?').run(
+            (await db.prepare('UPDATE roles SET permissions_json = ? WHERE id = ?').run(
               JSON.stringify(superDef.permissions),
               existingSuper.id
-            );
+            ));
           }
         } catch {
-          db.prepare('UPDATE roles SET permissions_json = ? WHERE id = ?').run(
+          (await db.prepare('UPDATE roles SET permissions_json = ? WHERE id = ?').run(
             JSON.stringify(superDef.permissions),
             existingSuper.id
-          );
+          ));
         }
       }
     }
   }
 
-  const policyRow = db.prepare('SELECT id FROM security_policy WHERE id = 1').get();
+  const policyRow = (await db.prepare('SELECT id FROM security_policy WHERE id = 1').get());
   if (!policyRow) {
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO security_policy (id, max_failed_attempts, lockout_minutes, session_ttl_hours, enforce_mfa_global, min_password_length)
        VALUES (1, 5, 15, 12, 0, 10)`
-    ).run();
+    ).run());
   }
 
-  const sysSettingsRow = db.prepare('SELECT id FROM system_settings WHERE id = 1').get();
+  const sysSettingsRow = (await db.prepare('SELECT id FROM system_settings WHERE id = 1').get());
   if (!sysSettingsRow) {
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO system_settings (id, app_name, company_name) VALUES (1, 'KSCAT-ERP', 'KS Cross Asia Technologies Inc.')`
-    ).run();
+    ).run());
   }
 
   const insertMod = db.prepare(
@@ -848,27 +826,27 @@ export function ensureDefaults(): void {
      VALUES (?, ?, ?, ?, ?, ?)`
   );
   for (const m of DEFAULT_OPTIONAL_MODULES) {
-    insertMod.run(m.module_key, m.name, m.category, m.description, m.enabled ? 1 : 0, m.locked);
+    (await insertMod.run(m.module_key, m.name, m.category, m.description, m.enabled ? 1 : 0, m.locked));
   }
 
-  const acctCount = db.prepare('SELECT COUNT(*) as cnt FROM accounting_accounts').get() as { cnt: number };
+  const acctCount = (await db.prepare('SELECT COUNT(*) as cnt FROM accounting_accounts').get()) as { cnt: number };
   if (acctCount.cnt === 0) {
     const insAcct = db.prepare(
       `INSERT INTO accounting_accounts (code, label, account_class, balance) VALUES (?, ?, ?, ?)`
     );
-    insAcct.run('1010', 'Operating Cash & Checking', 'asset', 366370.8);
-    insAcct.run('1200', 'Accounts Receivable', 'asset', 9292.0);
-    insAcct.run('1400', 'Merchandise Inventory', 'asset', 26840.0);
-    insAcct.run('2000', 'Accounts Payable', 'liability', 8448.0);
-    insAcct.run('2200', 'VAT / Sales Tax Payable', 'liability', 2196.8);
-    insAcct.run('2500', 'Long-Term Debt & Loans', 'liability', 42000.0);
-    insAcct.run('3000', 'Retained Earnings & Capital', 'equity', 330000.0);
-    insAcct.run('4000', 'Hardware & Product Sales', 'revenue', 18024.0);
-    insAcct.run('4100', 'SaaS & Commissioning Services', 'revenue', 8260.0);
-    insAcct.run('4500', 'Foundation Donations & Grants', 'revenue', 3500.0);
-    insAcct.run('5000', 'Cost of Goods Sold', 'expense', 7040.0);
-    insAcct.run('6100', 'Facilities & Warehouse Lease', 'expense', 6800.0);
-    insAcct.run('6200', 'Payroll & Benefits', 'expense', 14500.0);
+    (await insAcct.run('1010', 'Operating Cash & Checking', 'asset', 366370.8));
+    (await insAcct.run('1200', 'Accounts Receivable', 'asset', 9292.0));
+    (await insAcct.run('1400', 'Merchandise Inventory', 'asset', 26840.0));
+    (await insAcct.run('2000', 'Accounts Payable', 'liability', 8448.0));
+    (await insAcct.run('2200', 'VAT / Sales Tax Payable', 'liability', 2196.8));
+    (await insAcct.run('2500', 'Long-Term Debt & Loans', 'liability', 42000.0));
+    (await insAcct.run('3000', 'Retained Earnings & Capital', 'equity', 330000.0));
+    (await insAcct.run('4000', 'Hardware & Product Sales', 'revenue', 18024.0));
+    (await insAcct.run('4100', 'SaaS & Commissioning Services', 'revenue', 8260.0));
+    (await insAcct.run('4500', 'Foundation Donations & Grants', 'revenue', 3500.0));
+    (await insAcct.run('5000', 'Cost of Goods Sold', 'expense', 7040.0));
+    (await insAcct.run('6100', 'Facilities & Warehouse Lease', 'expense', 6800.0));
+    (await insAcct.run('6200', 'Payroll & Benefits', 'expense', 14500.0));
   }
 
   const defaultIntegrations: Record<string, Record<string, unknown>> = {
@@ -913,12 +891,12 @@ export function ensureDefaults(): void {
 
   const insInt = db.prepare(`INSERT OR IGNORE INTO integrations_config (config_key, config_json) VALUES (?, ?)`);
   for (const [k, v] of Object.entries(defaultIntegrations)) {
-    insInt.run(k, JSON.stringify(v));
+    (await insInt.run(k, JSON.stringify(v)));
   }
 }
 
-export function getEnabledModulesMap(): Record<string, boolean> {
-  const rows = db.prepare('SELECT module_key, enabled FROM modules_config').all() as Array<{
+export async function getEnabledModulesMap(db: DbClient): Promise<Record<string, boolean>> {
+  const rows = (await db.prepare('SELECT module_key, enabled FROM modules_config').all()) as Array<{
     module_key: string;
     enabled: number;
   }>;
@@ -929,32 +907,32 @@ export function getEnabledModulesMap(): Record<string, boolean> {
   return map;
 }
 
-export function seedExtendedBusinessData(actorEmail: string): void {
-  const oppCount = db.prepare('SELECT COUNT(*) as cnt FROM opportunities').get() as { cnt: number };
+export async function seedExtendedBusinessData(db: DbClient, actorEmail: string): Promise<void> {
+  const oppCount = (await db.prepare('SELECT COUNT(*) as cnt FROM opportunities').get()) as { cnt: number };
   if (oppCount.cnt > 0) return;
 
-  const parties = db.prepare('SELECT id, name, party_type FROM third_parties ORDER BY id ASC').all() as Array<{
+  const parties = (await db.prepare('SELECT id, name, party_type FROM third_parties ORDER BY id ASC').all()) as Array<{
     id: number;
     name: string;
     party_type: string;
   }>;
-  const products = db.prepare('SELECT id, ref, name, sell_price FROM products ORDER BY id ASC').all() as Array<{
+  const products = (await db.prepare('SELECT id, ref, name, sell_price FROM products ORDER BY id ASC').all()) as Array<{
     id: number;
     ref: string;
     name: string;
     sell_price: number;
   }>;
-  const warehouses = db.prepare('SELECT id, name FROM warehouses ORDER BY id ASC').all() as Array<{
+  const warehouses = (await db.prepare('SELECT id, name FROM warehouses ORDER BY id ASC').all()) as Array<{
     id: number;
     name: string;
   }>;
-  const salesOrders = db.prepare('SELECT id, ref, warehouse_id FROM sales_orders ORDER BY id ASC').all() as Array<{
+  const salesOrders = (await db.prepare('SELECT id, ref, warehouse_id FROM sales_orders ORDER BY id ASC').all()) as Array<{
     id: number;
     ref: string;
     warehouse_id: number;
   }>;
-  const banks = db.prepare('SELECT id FROM bank_accounts ORDER BY id ASC').all() as Array<{ id: number }>;
-  const projects = db.prepare('SELECT id FROM projects ORDER BY id ASC').all() as Array<{ id: number }>;
+  const banks = (await db.prepare('SELECT id FROM bank_accounts ORDER BY id ASC').all()) as Array<{ id: number }>;
+  const projects = (await db.prepare('SELECT id FROM projects ORDER BY id ASC').all()) as Array<{ id: number }>;
 
   if (parties.length === 0 || products.length === 0 || warehouses.length === 0) return;
 
@@ -971,60 +949,60 @@ export function seedExtendedBusinessData(actorEmail: string): void {
   const b1 = banks[0]?.id ?? 1;
   const pj1 = projects[0]?.id ?? null;
 
-  db.exec('BEGIN');
+  (await db.exec('BEGIN'));
   try {
     // Barcodes on existing products
-    db.prepare(`UPDATE products SET barcode = '3760024810014' WHERE id = ? AND barcode = ''`).run(pr1);
-    db.prepare(`UPDATE products SET barcode = '3760024810021' WHERE id = ? AND barcode = ''`).run(pr2);
-    db.prepare(`UPDATE products SET barcode = '3760024810038' WHERE id = ? AND barcode = ''`).run(pr3);
-    db.prepare(`UPDATE products SET barcode = '3760024810045' WHERE id = ? AND barcode = ''`).run(pr4);
+    (await db.prepare(`UPDATE products SET barcode = '3760024810014' WHERE id = ? AND barcode = ''`).run(pr1));
+    (await db.prepare(`UPDATE products SET barcode = '3760024810021' WHERE id = ? AND barcode = ''`).run(pr2));
+    (await db.prepare(`UPDATE products SET barcode = '3760024810038' WHERE id = ? AND barcode = ''`).run(pr3));
+    (await db.prepare(`UPDATE products SET barcode = '3760024810045' WHERE id = ? AND barcode = ''`).run(pr4));
 
     // Members & Partnerships
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO members (ref, full_name, organization, member_type, email, phone, subscription_fee, start_date, expiry_date, status, notes)
        VALUES
        ('MEM2611-0001', 'Elena Vance', 'Open Industrial Alliance', 'Foundation Patron', 'e.vance@oia-foundation.example', '+1 (312) 555-0181', 450, '2026-01-15', '2027-01-15', 'active', 'Annual sustaining patron member.'),
        ('MEM2611-0002', 'Tomasz Kowalczyk', 'Northwind Manufacturing Co.', 'Corporate', 't.kowalczyk@northwind-mfg.example', '+1 (312) 555-0192', 250, '2026-03-01', '2027-03-01', 'active', 'Corporate technical council delegate.')`
-    ).run();
+    ).run());
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO partnerships (ref, third_party_id, partner_tier, commission_pct, start_date, end_date, status, notes)
        VALUES
        ('PTN2611-0001', ?, 'Gold', 12.5, '2026-01-01', '2027-12-31', 'active', 'DACH regional value-added reseller agreement.'),
        ('PTN2611-0002', ?, 'Silver', 8.0, '2026-06-01', '2027-06-01', 'active', 'Cold-chain telemetry referral partnership.')`
-    ).run(p2, p3);
+    ).run(p2, p3));
 
     // Lots & Variants
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO product_lots (product_id, warehouse_id, lot_number, serial_number, quantity, manufacture_date, expiry_date, status)
        VALUES
        (?, ?, 'LOT-GW26-A1', 'SN-X4-88201..88242', 42, '2026-09-10', '', 'available'),
        (?, ?, 'LOT-TP26-C9', 'SN-PT-4410..4432', 22, '2026-10-05', '2028-10-05', 'available')`
-    ).run(pr1, w1, pr4, w1);
+    ).run(pr1, w1, pr4, w1));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO product_variants (product_id, sku_suffix, attribute_name, attribute_value, price_delta, stock_qty, barcode)
        VALUES
        (?, 'LTE-EU', 'Modem Region', 'EU Multi-Band LTE', 35, 12, '3760024810019'),
        (?, 'POE-24V', 'Power Input', '24V PoE+ Industrial', 20, 18, '3760024810028')`
-    ).run(pr1, pr2);
+    ).run(pr1, pr2));
 
     // Workstations, BOMs & Manufacturing Orders
     const ws1 = Number(
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO workstations (ref, name, location, hourly_cost, capacity_per_day, status)
          VALUES ('WS-ASM-01', 'Electronics Final Assembly Bay A', 'Chicago Plant Floor 2', 85, 8, 'operational')`
-      ).run().lastInsertRowid
+      ).run()).lastInsertRowid
     );
     const ws2 = Number(
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO workstations (ref, name, location, hourly_cost, capacity_per_day, status)
          VALUES ('WS-CAL-02', 'Sensor Calibration & Burn-In Rig', 'Chicago QA Lab', 72, 10, 'operational')`
-      ).run().lastInsertRowid
+      ).run()).lastInsertRowid
     );
 
     const bom1 = Number(
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO boms (ref, product_id, workstation_id, label, output_qty, components_json, estimated_minutes, status)
          VALUES ('BOM-X4-STD', ?, ?, 'Standard Edge Gateway X4 Assembly', 1, ?, 45, 'active')`
       ).run(
@@ -1034,79 +1012,79 @@ export function seedExtendedBusinessData(actorEmail: string): void {
           { productId: pr2, ref: 'PRD-1002', name: 'Optical Flow Conveyor Sensor', qty: 1 },
           { productId: pr3, ref: 'PRD-1003', name: '48V Redundant Power Module', qty: 1 },
         ])
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO manufacturing_orders (ref, bom_id, product_id, warehouse_id, workstation_id, qty_planned, qty_produced, scheduled_date, status, notes, created_by)
        VALUES ('MO2611-0001', ?, ?, ?, ?, 4, 0, '2026-11-28', 'validated', 'Q4 fulfillment batch for Northwind expansion.', ?)`
-    ).run(bom1, pr1, w1, ws1, actorEmail);
+    ).run(bom1, pr1, w1, ws1, actorEmail));
 
     // Opportunities, Shipments, Contracts, Interventions, Supplier RFQs
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO opportunities (ref, third_party_id, title, stage, probability, amount, close_date, owner_name, notes)
        VALUES
        ('OPP2611-0001', ?, 'Cold-Chain Fleet Telemetry Phase 2', 'negotiation', 75, 28400, '2026-12-15', 'Sales Desk', 'Final technical review scheduled.'),
        ('OPP2611-0002', ?, 'Automated Pallet Line Sensors (6x Warehouses)', 'proposition', 55, 42000, '2027-01-10', 'Sales Desk', 'Proposal PR2611-0003 submitted.')`
-    ).run(p3, p2);
+    ).run(p3, p2));
 
     if (salesOrders[0]) {
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO shipments (ref, sales_order_id, warehouse_id, carrier, tracking_number, ship_date, weight_kg, status, notes)
          VALUES ('SH2611-0001', ?, ?, 'DHL Freight', 'DHL-8841209341', '2026-11-08', 18.4, 'delivered', 'Signed at Chicago receiving dock.')`
-      ).run(salesOrders[0].id, salesOrders[0].warehouse_id);
+      ).run(salesOrders[0].id, salesOrders[0].warehouse_id));
     }
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO contracts (ref, third_party_id, title, billing_cycle, recurring_amount, start_date, next_billing_date, status, notes)
        VALUES
        ('CTR2611-0001', ?, '24/7 Industrial Telemetry SLA & Cloud Retention', 'monthly', 960, '2026-06-01', '2026-12-01', 'active', 'Auto-renews annually with 30-day notice.'),
        ('CTR2611-0002', ?, 'Munich Depot Priority Hardware Replacement', 'quarterly', 2400, '2026-10-01', '2027-01-01', 'active', 'Covers 4-hour European courier dispatch.')`
-    ).run(p1, p2);
+    ).run(p1, p2));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO interventions (ref, third_party_id, title, technician_name, scheduled_date, duration_hours, status, notes)
        VALUES ('INT2611-0001', ?, 'Line-4 Optical Calibration & Firmware Patch', 'Marcus Chen', '2026-11-29', 4.5, 'planned', 'Bring spare PT1000 calibration harness.')`
-    ).run(p1);
+    ).run(p1));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO supplier_rfqs (ref, third_party_id, title, request_date, deadline_date, incoterm, lines_json, estimated_total, status, notes)
        VALUES ('RFQ2611-0001', ?, 'Q1 Enclosure & 48V PSU Volume Quote', '2026-11-18', '2026-12-02', 'DDP', ?, 9200, 'open', 'Requesting tiered pricing for 100+ units.')`
     ).run(
       sup,
       JSON.stringify([{ productId: pr3, ref: 'PRD-1003', label: '48V Redundant Power Module', qty: 100, unitPrice: 72, discountPct: 0, taxRate: 20 }])
-    );
+    ));
 
     // SEPA, Journal Entries, Donations, Loans
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO sepa_batches (ref, batch_type, bank_account_id, execution_date, total_amount, items_json, status, created_by)
        VALUES ('SEPA2611-0001', 'credit_transfer', ?, '2026-11-30', 8448.0, ?, 'prepared', ?)`
     ).run(
       b1,
       JSON.stringify([{ partyName: 'Kestrel Precision Components', iban: 'DE89370400440532013000', invoiceRef: 'SI2611-0001', amount: 8448.0 }]),
       actorEmail
-    );
+    ));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, created_by)
        VALUES
        ('JRN2611-0001', '2026-11-12', 'SAL', 'Customer Invoice IN2611-0001 Revenue Recognition', '1200', '4000', 7364.0, 'IN2611-0001', ?),
        ('JRN2611-0002', '2026-11-14', 'BNK', 'Customer Settlement IN2611-0001', '1010', '1200', 8836.8, 'IN2611-0001', ?),
        ('JRN2611-0003', '2026-11-14', 'PUR', 'Supplier Bill SI2611-0001 Inventory Intake', '1400', '2000', 7040.0, 'SI2611-0001', ?)`
-    ).run(actorEmail, actorEmail, actorEmail);
+    ).run(actorEmail, actorEmail, actorEmail));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO donations (ref, donor_name, donor_email, amount, donation_date, payment_mode, status, notes)
        VALUES ('DON2611-0001', 'Open Industrial Alliance', 'grants@oia-foundation.example', 3500, '2026-11-04', 'SEPA Transfer', 'received', 'Annual open-hardware calibration grant.')`
-    ).run();
+    ).run());
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO loans (ref, label, lender_name, principal_amount, remaining_principal, interest_rate, term_months, start_date, status)
        VALUES ('LN2611-0001', 'CNC & Calibration Lab Equipment Facility', 'Silicon Valley Commercial Bank', 60000, 42000, 4.25, 48, '2025-07-01', 'active')`
-    ).run();
+    ).run());
 
     // Tickets & KB
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO tickets (ref, third_party_id, subject, category, severity, status, assignee_name, message, replies_json, created_by)
        VALUES
        ('TCK2611-0001', ?, 'LTE failover delay on Edge Gateway #4', 'Hardware', 'high', 'in_progress', 'Field Engineering', 'Unit took 45 seconds to switch from Ethernet to secondary LTE SIM during maintenance window.', ?, ?),
@@ -1117,123 +1095,123 @@ export function seedExtendedBusinessData(actorEmail: string): void {
       actorEmail,
       p2,
       actorEmail
-    );
+    ));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO kb_articles (ref, title, category, content, is_public, views)
        VALUES
        ('KB-101', 'Configuring Fast LTE Failover on Edge Gateway X4', 'Hardware', 'Set WAN Health Probe Interval to 5s and Failure Threshold to 2 packets in the Gateway Console under Network > Failover.', 1, 148),
        ('KB-102', 'SEPA ISO 20022 Export & Bank Reconciliation Checklist', 'Finance', 'Validate supplier IBANs under Third Parties, batch open bills under Billing > SEPA, and export the pain.001 XML package for treasury upload.', 1, 92)`
-    ).run();
+    ).run());
 
     // Collaboration: Agenda Events, Org Events, Surveys
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO agenda_events (uid, title, event_type, start_at, end_at, location, organizer, description)
        VALUES
        ('meridian-evt-101@erp', 'Q4 Supply Chain & Inventory Review', 'meeting', '2026-11-27T10:00:00', '2026-11-27T11:30:00', 'HQ Boardroom / Meet', 'Operations Lead', 'Review low-stock triggers for PSU-48V and Cold-Chain Probes.'),
        ('meridian-evt-102@erp', 'Line-4 Field Calibration Window', 'intervention', '2026-11-29T09:00:00', '2026-11-29T13:30:00', 'Chicago Plant', 'Marcus Chen', 'On-site optical calibration.')`
-    ).run();
+    ).run());
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO org_events (ref, title, event_date, venue, capacity, registered_count, status, description)
        VALUES ('EVT2611-0001', 'Industrial Telemetry & Dolibarr Automation Summit', '2026-12-12', 'Chicago Merchandise Mart', 120, 64, 'open', 'Customer showcase and live hardware workshop.')`
-    ).run();
+    ).run());
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO surveys (ref, title, question, options_json, votes_json, status)
        VALUES ('SRV2611-0001', 'Q1 Customer Portal Priorities', 'Which self-service portal capability should ship first in Q1?', ?, ?, 'open')`
     ).run(
       JSON.stringify(['Online Invoice PDF + Stripe Pay', 'Live Shipment Tracking Map', 'RMA & Warranty Claim Form']),
       JSON.stringify({ 'Online Invoice PDF + Stripe Pay': 14, 'Live Shipment Tracking Map': 9, 'RMA & Warranty Claim Form': 6 })
-    );
+    ));
 
     // HR: Employees, Leave, Expenses, Recruitment, Timesheets
     const emp1 = Number(
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO employees (ref, full_name, email, phone, department, job_title, hire_date, annual_salary, leave_balance_days, status)
          VALUES ('EMP-001', 'Marcus Chen', 'm.chen@meridian-erp.example', '+1 (312) 555-0133', 'Field Engineering', 'Lead Commissioning Engineer', '2024-03-15', 108000, 18.5, 'active')`
-      ).run().lastInsertRowid
+      ).run()).lastInsertRowid
     );
     const emp2 = Number(
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO employees (ref, full_name, email, phone, department, job_title, hire_date, annual_salary, leave_balance_days, status)
          VALUES ('EMP-002', 'Sofia Alvarez', 's.alvarez@meridian-erp.example', '+1 (312) 555-0155', 'Finance & Accounting', 'Senior Controller', '2023-09-01', 118000, 21, 'active')`
-      ).run().lastInsertRowid
+      ).run()).lastInsertRowid
     );
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO leave_requests (ref, employee_id, leave_type, start_date, end_date, days, reason, status, reviewed_by)
        VALUES ('LVR2611-0001', ?, 'Paid Time Off', '2026-12-22', '2026-12-24', 3, 'Holiday travel', 'pending', '')`
-    ).run(emp1);
+    ).run(emp1));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO expense_reports (ref, employee_id, category, expense_date, amount, tax_amount, description, status, approved_by)
        VALUES ('EXP2611-0001', ?, 'Travel & Lodging', '2026-11-16', 482.5, 48.25, 'Customer commissioning visit — Northwind Line-4', 'submitted', '')`
-    ).run(emp1);
+    ).run(emp1));
 
     const job1 = Number(
-      db.prepare(
+      (await db.prepare(
         `INSERT INTO job_postings (ref, title, department, location, contract_type, status, description)
          VALUES ('JOB2611-0001', 'Embedded Firmware & IIoT Engineer', 'Engineering', 'Chicago / Hybrid', 'Full-Time', 'open', 'Maintain Edge Gateway X4 RTOS drivers and MQTT telemetry pipelines.')`
-      ).run().lastInsertRowid
+      ).run()).lastInsertRowid
     );
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO candidates (job_id, full_name, email, phone, stage, notes)
        VALUES
        (?, 'Priya Nair', 'priya.nair@example.com', '+1 (312) 555-0177', 'interview', 'Strong STM32 and industrial Modbus experience.'),
        (?, 'Daniel Brooks', 'd.brooks@example.com', '+1 (415) 555-0112', 'screening', 'Background in embedded Linux telemetry.')`
-    ).run(job1, job1);
+    ).run(job1, job1));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO timesheets (employee_id, project_id, work_date, hours, task_label, billable)
        VALUES
        (?, ?, '2026-11-21', 7.5, 'Conveyor B optical sensor calibration', 1),
        (?, NULL, '2026-11-21', 8.0, 'November SEPA batch & VAT reconciliation', 0)`
-    ).run(emp1, pj1, emp2);
+    ).run(emp1, pj1, emp2));
 
     // EDM, Bookmarks, Mass Email, Collected Emails
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO edm_documents (ref, title, folder, mime_type, size_bytes, tags, content_text, uploaded_by)
        VALUES
        ('DOC2611-0001', 'ISO-9001 Warehouse Receiving SOP v3.2', 'Operations/SOP', 'text/markdown', 2480, 'sop,warehouse,iso9001', 'Verify lot serial range against PO before booking inbound stock movement.', ?),
        ('DOC2611-0002', 'SEPA Creditor Identifier Mandate Template', 'Finance/Compliance', 'text/plain', 1640, 'sepa,banking,compliance', 'Standard Core Direct Debit mandate notice for European B2B accounts.', ?)`
-    ).run(actorEmail, actorEmail);
+    ).run(actorEmail, actorEmail));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO bookmarks (title, url, category, created_by)
        VALUES
        ('Dolibarr ERP Official Repository', 'https://github.com/Dolibarr/dolibarr', 'Reference', ?),
        ('European Payments Council SEPA Guidelines', 'https://www.europeanpaymentscouncil.eu', 'Finance', ?)`
-    ).run(actorEmail, actorEmail);
+    ).run(actorEmail, actorEmail));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO email_campaigns (ref, subject, target_segment, body_text, recipient_count, status, sent_at, created_by)
        VALUES ('CMP2611-0001', 'Q4 Cold-Chain Calibration Window & Firmware v4.2', 'all_customers', 'Dear partner, schedule your annual PT1000 calibration slot and Edge Gateway firmware upgrade before December 15.', 3, 'sent', '2026-11-15T14:20:00Z', ?)`
-    ).run(actorEmail);
+    ).run(actorEmail));
 
-    db.prepare(
+    (await db.prepare(
       `INSERT INTO collected_emails (sender_email, subject, snippet, matched_party, status)
        VALUES
        ('n.okafor@helios-coldchain.example', 'Re: Oakland Pilot Proposal PR2611-0002', 'We reviewed the probe lead times and would like to confirm online signing next Tuesday.', 'Helios Cold-Chain Systems', 'unprocessed'),
        ('l.weber@vespera-logistics.example', 'Munich WMS Webhook IP Whitelist Request', 'Can your platform team share the outbound IP CIDR for Bavarian fulfillment notifications?', 'Vespera Logistics GmbH', 'unprocessed')`
-    ).run();
+    ).run());
 
-    db.exec('COMMIT');
+    (await db.exec('COMMIT'));
   } catch (err) {
-    db.exec('ROLLBACK');
+    (await db.exec('ROLLBACK'));
     throw err;
   }
 }
 
-export function seedSampleBusinessData(actorEmail: string): void {
-  const existingParties = db.prepare('SELECT COUNT(*) as cnt FROM third_parties').get() as { cnt: number };
+export async function seedSampleBusinessData(db: DbClient, actorEmail: string): Promise<void> {
+  const existingParties = (await db.prepare('SELECT COUNT(*) as cnt FROM third_parties').get()) as { cnt: number };
   if (existingParties.cnt > 0) {
-    seedExtendedBusinessData(actorEmail);
+    (await seedExtendedBusinessData(db, actorEmail));
     return;
   }
 
-  db.exec('BEGIN');
+  (await db.exec('BEGIN'));
   try {
     const insertParty = db.prepare(
       `INSERT INTO third_parties (ref, name, party_type, email, phone, website, address, city, country, tax_id, payment_terms, credit_limit, status, notes)
@@ -1241,7 +1219,7 @@ export function seedSampleBusinessData(actorEmail: string): void {
     );
 
     const p1 = Number(
-      insertParty.run(
+      (await insertParty.run(
         'CU2611-0001',
         'Northwind Manufacturing Co.',
         'customer',
@@ -1256,10 +1234,10 @@ export function seedSampleBusinessData(actorEmail: string): void {
         120000,
         'active',
         'Key enterprise manufacturing partner for automated assembly sensors.'
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
     const p2 = Number(
-      insertParty.run(
+      (await insertParty.run(
         'CU2611-0002',
         'Vespera Logistics GmbH',
         'customer',
@@ -1274,10 +1252,10 @@ export function seedSampleBusinessData(actorEmail: string): void {
         95000,
         'active',
         'European warehouse distribution rollout across Bavaria.'
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
     const p3 = Number(
-      insertParty.run(
+      (await insertParty.run(
         'PR2611-0003',
         'Helios Cold-Chain Systems',
         'prospect',
@@ -1292,10 +1270,10 @@ export function seedSampleBusinessData(actorEmail: string): void {
         50000,
         'active',
         'Evaluating Q1 telemetry controller package.'
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
     const p4 = Number(
-      insertParty.run(
+      (await insertParty.run(
         'SU2611-0004',
         'Kestrel Precision Components',
         'supplier',
@@ -1310,10 +1288,10 @@ export function seedSampleBusinessData(actorEmail: string): void {
         80000,
         'active',
         'Primary supplier for CNC enclosures and industrial power supplies.'
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
     const p5 = Number(
-      insertParty.run(
+      (await insertParty.run(
         'CS2611-0005',
         'Boreal Maritime Freight',
         'customer_supplier',
@@ -1328,61 +1306,61 @@ export function seedSampleBusinessData(actorEmail: string): void {
         75000,
         'active',
         'Both freight vendor and SaaS fleet monitoring customer.'
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
 
     const insertContact = db.prepare(
       `INSERT INTO contacts (third_party_id, first_name, last_name, job_title, email, phone, is_primary)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
-    insertContact.run(p1, 'Claire', 'Hendricks', 'VP of Operations', 'c.hendricks@northwind-mfg.example', '+1 (312) 555-0144', 1);
-    insertContact.run(p1, 'Marcus', 'Vogel', 'Accounts Payable Lead', 'm.vogel@northwind-mfg.example', '+1 (312) 555-0149', 0);
-    insertContact.run(p2, 'Lukas', 'Weber', 'Head of Procurement', 'l.weber@vespera-logistics.example', '+49 89 555 8122', 1);
-    insertContact.run(p3, 'Nadia', 'Okafor', 'Systems Architect', 'n.okafor@helios-coldchain.example', '+1 (415) 555-0190', 1);
-    insertContact.run(p4, 'David', 'Kowalski', 'Wholesale Desk', 'd.kowalski@kestrel-components.example', '+1 (512) 555-0170', 1);
-    insertContact.run(p5, 'Hannah', 'Lindqvist', 'Logistics Director', 'h.lindqvist@boreal-freight.example', '+1 (206) 555-0118', 1);
+    (await insertContact.run(p1, 'Claire', 'Hendricks', 'VP of Operations', 'c.hendricks@northwind-mfg.example', '+1 (312) 555-0144', 1));
+    (await insertContact.run(p1, 'Marcus', 'Vogel', 'Accounts Payable Lead', 'm.vogel@northwind-mfg.example', '+1 (312) 555-0149', 0));
+    (await insertContact.run(p2, 'Lukas', 'Weber', 'Head of Procurement', 'l.weber@vespera-logistics.example', '+49 89 555 8122', 1));
+    (await insertContact.run(p3, 'Nadia', 'Okafor', 'Systems Architect', 'n.okafor@helios-coldchain.example', '+1 (415) 555-0190', 1));
+    (await insertContact.run(p4, 'David', 'Kowalski', 'Wholesale Desk', 'd.kowalski@kestrel-components.example', '+1 (512) 555-0170', 1));
+    (await insertContact.run(p5, 'Hannah', 'Lindqvist', 'Logistics Director', 'h.lindqvist@boreal-freight.example', '+1 (206) 555-0118', 1));
 
     const insertWh = db.prepare(`INSERT INTO warehouses (ref, name, location, status) VALUES (?, ?, ?, 'active')`);
-    const w1 = Number(insertWh.run('WH-MAIN', 'Main Distribution Center', 'Chicago, IL').lastInsertRowid);
-    const w2 = Number(insertWh.run('WH-WEST', 'West Coast Hub', 'Oakland, CA').lastInsertRowid);
-    const w3 = Number(insertWh.run('WH-EU', 'Munich Fulfillment Depot', 'Munich, DE').lastInsertRowid);
+    const w1 = Number((await insertWh.run('WH-MAIN', 'Main Distribution Center', 'Chicago, IL')).lastInsertRowid);
+    const w2 = Number((await insertWh.run('WH-WEST', 'West Coast Hub', 'Oakland, CA')).lastInsertRowid);
+    const w3 = Number((await insertWh.run('WH-EU', 'Munich Fulfillment Depot', 'Munich, DE')).lastInsertRowid);
 
     const insertProd = db.prepare(
       `INSERT INTO products (ref, name, product_type, category, description, cost_price, sell_price, tax_rate, min_stock, barcode, on_sale, on_purchase)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
     );
-    const pr1 = Number(insertProd.run('PRD-1001', 'Industrial IoT Edge Gateway X4', 'product', 'Hardware', 'DIN-rail ruggedized telemetry gateway with dual Ethernet & LTE.', 320, 640, 20, 15, '3760024810014', 1).lastInsertRowid);
-    const pr2 = Number(insertProd.run('PRD-1002', 'Optical Flow Conveyor Sensor', 'product', 'Sensors', 'High-speed IP67 optical sensor unit for automated lines.', 110, 245, 20, 25, '3760024810021', 1).lastInsertRowid);
-    const pr3 = Number(insertProd.run('PRD-1003', '48V Redundant Power Module', 'product', 'Power', '240W industrial PSU with hot-swap failover relay.', 75, 165, 20, 20, '3760024810038', 1).lastInsertRowid);
-    const pr4 = Number(insertProd.run('PRD-1004', 'Thermal Probe Kit (3-Pack)', 'product', 'Sensors', 'Calibrated PT1000 stainless cold-chain temperature probes.', 48, 120, 20, 30, '3760024810045', 1).lastInsertRowid);
-    const pr5 = Number(insertProd.run('SRV-2001', 'On-Site Commissioning & Calibration', 'service', 'Professional Services', 'Full-day field engineering deployment and sensor calibration.', 450, 1250, 20, 0, '', 0).lastInsertRowid);
-    const pr6 = Number(insertProd.run('SRV-2002', 'Annual Telemetry Cloud License', 'service', 'Subscriptions', '12-month fleet monitoring, alerting, and API retention.', 180, 960, 20, 0, '', 0).lastInsertRowid);
+    const pr1 = Number((await insertProd.run('PRD-1001', 'Industrial IoT Edge Gateway X4', 'product', 'Hardware', 'DIN-rail ruggedized telemetry gateway with dual Ethernet & LTE.', 320, 640, 20, 15, '3760024810014', 1)).lastInsertRowid);
+    const pr2 = Number((await insertProd.run('PRD-1002', 'Optical Flow Conveyor Sensor', 'product', 'Sensors', 'High-speed IP67 optical sensor unit for automated lines.', 110, 245, 20, 25, '3760024810021', 1)).lastInsertRowid);
+    const pr3 = Number((await insertProd.run('PRD-1003', '48V Redundant Power Module', 'product', 'Power', '240W industrial PSU with hot-swap failover relay.', 75, 165, 20, 20, '3760024810038', 1)).lastInsertRowid);
+    const pr4 = Number((await insertProd.run('PRD-1004', 'Thermal Probe Kit (3-Pack)', 'product', 'Sensors', 'Calibrated PT1000 stainless cold-chain temperature probes.', 48, 120, 20, 30, '3760024810045', 1)).lastInsertRowid);
+    const pr5 = Number((await insertProd.run('SRV-2001', 'On-Site Commissioning & Calibration', 'service', 'Professional Services', 'Full-day field engineering deployment and sensor calibration.', 450, 1250, 20, 0, '', 0)).lastInsertRowid);
+    const pr6 = Number((await insertProd.run('SRV-2002', 'Annual Telemetry Cloud License', 'service', 'Subscriptions', '12-month fleet monitoring, alerting, and API retention.', 180, 960, 20, 0, '', 0)).lastInsertRowid);
 
     const insertStock = db.prepare(`INSERT INTO stock_levels (product_id, warehouse_id, quantity) VALUES (?, ?, ?)`);
-    insertStock.run(pr1, w1, 42);
-    insertStock.run(pr1, w2, 18);
-    insertStock.run(pr1, w3, 12);
-    insertStock.run(pr2, w1, 64);
-    insertStock.run(pr2, w2, 11);
-    insertStock.run(pr3, w1, 14);
-    insertStock.run(pr3, w2, 4);
-    insertStock.run(pr4, w1, 22);
-    insertStock.run(pr4, w3, 6);
+    (await insertStock.run(pr1, w1, 42));
+    (await insertStock.run(pr1, w2, 18));
+    (await insertStock.run(pr1, w3, 12));
+    (await insertStock.run(pr2, w1, 64));
+    (await insertStock.run(pr2, w2, 11));
+    (await insertStock.run(pr3, w1, 14));
+    (await insertStock.run(pr3, w2, 4));
+    (await insertStock.run(pr4, w1, 22));
+    (await insertStock.run(pr4, w3, 6));
 
     const insertMove = db.prepare(
       `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_delta, reason, doc_ref, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
-    insertMove.run(pr1, w1, 'in', 50, 'Initial opening stock balance', 'OPEN-2026', actorEmail);
-    insertMove.run(pr1, w1, 'out', -8, 'Fulfilled sales shipment SO2611-0001', 'SO2611-0001', actorEmail);
-    insertMove.run(pr2, w1, 'in', 64, 'Supplier receipt from Kestrel Precision', 'PO2611-0001', actorEmail);
-    insertMove.run(pr3, w1, 'out', -12, 'Field replacement batch', 'SO2611-0001', actorEmail);
+    (await insertMove.run(pr1, w1, 'in', 50, 'Initial opening stock balance', 'OPEN-2026', actorEmail));
+    (await insertMove.run(pr1, w1, 'out', -8, 'Fulfilled sales shipment SO2611-0001', 'SO2611-0001', actorEmail));
+    (await insertMove.run(pr2, w1, 'in', 64, 'Supplier receipt from Kestrel Precision', 'PO2611-0001', actorEmail));
+    (await insertMove.run(pr3, w1, 'out', -12, 'Field replacement batch', 'SO2611-0001', actorEmail));
 
     const insertProposal = db.prepare(
       `INSERT INTO proposals (ref, third_party_id, title, issue_date, valid_until, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, signed_by, signed_at, signature_name, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    insertProposal.run(
+    (await insertProposal.run(
       'PR2611-0001',
       p1,
       'Chicago Plant Line-4 Telemetry Upgrade',
@@ -1401,8 +1379,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       '2026-11-04T16:30:00Z',
       'Claire Hendricks',
       actorEmail
-    );
-    insertProposal.run(
+    ));
+    (await insertProposal.run(
       'PR2611-0002',
       p3,
       'Oakland Cold-Chain Pilot Rollout',
@@ -1421,8 +1399,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       '',
       '',
       actorEmail
-    );
-    insertProposal.run(
+    ));
+    (await insertProposal.run(
       'PR2611-0003',
       p2,
       'Munich Hub Conveyor Sensor Expansion',
@@ -1440,13 +1418,13 @@ export function seedSampleBusinessData(actorEmail: string): void {
       '',
       '',
       actorEmail
-    );
+    ));
 
     const insertSO = db.prepare(
       `INSERT INTO sales_orders (ref, third_party_id, proposal_ref, order_date, delivery_date, warehouse_id, incoterm, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    insertSO.run(
+    (await insertSO.run(
       'SO2611-0001',
       p1,
       'PR2611-0001',
@@ -1464,8 +1442,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       8836.8,
       'Shipped and invoiced.',
       actorEmail
-    );
-    insertSO.run(
+    ));
+    (await insertSO.run(
       'SO2611-0002',
       p2,
       '',
@@ -1483,13 +1461,13 @@ export function seedSampleBusinessData(actorEmail: string): void {
       9600,
       'Ready for dispatch from Munich depot.',
       actorEmail
-    );
+    ));
 
     const insertPO = db.prepare(
       `INSERT INTO purchase_orders (ref, third_party_id, order_date, expected_date, warehouse_id, incoterm, status, lines_json, subtotal_ht, tax_total, total_ttc, notes, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    insertPO.run(
+    (await insertPO.run(
       'PO2611-0001',
       p4,
       '2026-11-04',
@@ -1505,8 +1483,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       8448,
       'Received in full at Main Distribution Center.',
       actorEmail
-    );
-    insertPO.run(
+    ));
+    (await insertPO.run(
       'PO2611-0002',
       p4,
       '2026-11-20',
@@ -1523,13 +1501,13 @@ export function seedSampleBusinessData(actorEmail: string): void {
       5616,
       'Replenishment order for low-stock SKUs.',
       actorEmail
-    );
+    ));
 
     const insertInv = db.prepare(
       `INSERT INTO invoices (ref, invoice_type, invoice_kind, third_party_id, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    insertInv.run(
+    (await insertInv.run(
       'IN2611-0001',
       'customer',
       'standard',
@@ -1548,8 +1526,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       8836.8,
       'Paid via ACH wire.',
       actorEmail
-    );
-    insertInv.run(
+    ));
+    (await insertInv.run(
       'IN2611-0002',
       'customer',
       'standard',
@@ -1567,8 +1545,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       3500,
       '50% deposit received; remaining balance overdue.',
       actorEmail
-    );
-    insertInv.run(
+    ));
+    (await insertInv.run(
       'IN2611-0003',
       'customer',
       'standard',
@@ -1586,8 +1564,8 @@ export function seedSampleBusinessData(actorEmail: string): void {
       0,
       'Awaiting Net 45 settlement.',
       actorEmail
-    );
-    insertInv.run(
+    ));
+    (await insertInv.run(
       'SI2611-0001',
       'supplier',
       'standard',
@@ -1605,31 +1583,31 @@ export function seedSampleBusinessData(actorEmail: string): void {
       0,
       'Supplier invoice verified against warehouse receipt.',
       actorEmail
-    );
+    ));
 
     const insertBank = db.prepare(
       `INSERT INTO bank_accounts (ref, name, bank_name, account_number, currency, balance, account_type, status)
        VALUES (?, ?, ?, ?, 'USD', ?, ?, 'active')`
     );
-    const b1 = Number(insertBank.run('BNK-OPS', 'Corporate Operating Checking', 'JPMorgan Chase', '•••• 4821', 148920.8, 'checking').lastInsertRowid);
-    const b2 = Number(insertBank.run('BNK-RES', 'Treasury Reserve Savings', 'Silicon Valley Commercial', '•••• 9014', 215000.0, 'savings').lastInsertRowid);
-    insertBank.run('CSH-HQ', 'Chicago HQ Petty Cash', 'Internal Cash Box', 'HQ-SAFE-01', 2450.0, 'cash');
+    const b1 = Number((await insertBank.run('BNK-OPS', 'Corporate Operating Checking', 'JPMorgan Chase', '•••• 4821', 148920.8, 'checking')).lastInsertRowid);
+    const b2 = Number((await insertBank.run('BNK-RES', 'Treasury Reserve Savings', 'Silicon Valley Commercial', '•••• 9014', 215000.0, 'savings')).lastInsertRowid);
+    (await insertBank.run('CSH-HQ', 'Chicago HQ Petty Cash', 'Internal Cash Box', 'HQ-SAFE-01', 2450.0, 'cash'));
 
     const insertTx = db.prepare(
       `INSERT INTO bank_transactions (bank_account_id, tx_date, label, category, amount, direction, invoice_ref, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    insertTx.run(b1, '2026-11-14', 'Payment IN2611-0001 — Northwind Manufacturing Co.', 'Customer Payment', 8836.8, 'credit', 'IN2611-0001', actorEmail);
-    insertTx.run(b1, '2026-10-20', 'Deposit IN2611-0002 — Boreal Maritime Freight', 'Customer Payment', 3500.0, 'credit', 'IN2611-0002', actorEmail);
-    insertTx.run(b1, '2026-11-01', 'Warehouse Lease — Chicago Distribution Center', 'Facilities', 6800.0, 'debit', '', actorEmail);
-    insertTx.run(b2, '2026-11-05', 'Quarterly Capital Allocation Transfer', 'Treasury Transfer', 25000.0, 'credit', '', actorEmail);
+    (await insertTx.run(b1, '2026-11-14', 'Payment IN2611-0001 — Northwind Manufacturing Co.', 'Customer Payment', 8836.8, 'credit', 'IN2611-0001', actorEmail));
+    (await insertTx.run(b1, '2026-10-20', 'Deposit IN2611-0002 — Boreal Maritime Freight', 'Customer Payment', 3500.0, 'credit', 'IN2611-0002', actorEmail));
+    (await insertTx.run(b1, '2026-11-01', 'Warehouse Lease — Chicago Distribution Center', 'Facilities', 6800.0, 'debit', '', actorEmail));
+    (await insertTx.run(b2, '2026-11-05', 'Quarterly Capital Allocation Transfer', 'Treasury Transfer', 25000.0, 'credit', '', actorEmail));
 
     const insertProj = db.prepare(
       `INSERT INTO projects (ref, title, third_party_id, start_date, due_date, budget_amount, status, progress, description, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const pj1 = Number(
-      insertProj.run(
+      (await insertProj.run(
         'PJ2611-0001',
         'Northwind Line-4 Automation Rollout',
         p1,
@@ -1640,10 +1618,10 @@ export function seedSampleBusinessData(actorEmail: string): void {
         65,
         'End-to-end deployment of Edge Gateways and conveyor sensor telemetry.',
         actorEmail
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
     const pj2 = Number(
-      insertProj.run(
+      (await insertProj.run(
         'PJ2611-0002',
         'Vespera Munich Depot Integration',
         p2,
@@ -1654,39 +1632,42 @@ export function seedSampleBusinessData(actorEmail: string): void {
         30,
         'ERP EDI sync and regional warehouse telemetry onboarding.',
         actorEmail
-      ).lastInsertRowid
+      )).lastInsertRowid
     );
 
     const insertTask = db.prepare(
       `INSERT INTO tasks (project_id, ref, title, assignee_name, priority, status, estimated_hours, logged_hours, progress, due_date)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    insertTask.run(pj1, 'TSK-101', 'Rack-mount 8x Edge Gateways & VLAN config', 'Field Engineering Team', 'high', 'done', 16, 14.5, 100, '2026-11-14');
-    insertTask.run(pj1, 'TSK-102', 'Calibrate optical sensors on Conveyor B', 'Field Engineering Team', 'high', 'in_progress', 12, 7.5, 60, '2026-11-28');
-    insertTask.run(pj1, 'TSK-103', 'Client UAT sign-off & handover', 'Operations Lead', 'medium', 'todo', 8, 0, 0, '2026-12-10');
-    insertTask.run(pj2, 'TSK-201', 'Provision Munich EU cloud tenant & RBAC', 'Platform Ops', 'high', 'done', 10, 9.0, 100, '2026-11-18');
-    insertTask.run(pj2, 'TSK-202', 'Configure automated low-stock webhook alerts', 'Platform Ops', 'medium', 'in_progress', 14, 4.0, 30, '2026-12-08');
+    (await insertTask.run(pj1, 'TSK-101', 'Rack-mount 8x Edge Gateways & VLAN config', 'Field Engineering Team', 'high', 'done', 16, 14.5, 100, '2026-11-14'));
+    (await insertTask.run(pj1, 'TSK-102', 'Calibrate optical sensors on Conveyor B', 'Field Engineering Team', 'high', 'in_progress', 12, 7.5, 60, '2026-11-28'));
+    (await insertTask.run(pj1, 'TSK-103', 'Client UAT sign-off & handover', 'Operations Lead', 'medium', 'todo', 8, 0, 0, '2026-12-10'));
+    (await insertTask.run(pj2, 'TSK-201', 'Provision Munich EU cloud tenant & RBAC', 'Platform Ops', 'high', 'done', 10, 9.0, 100, '2026-11-18'));
+    (await insertTask.run(pj2, 'TSK-202', 'Configure automated low-stock webhook alerts', 'Platform Ops', 'medium', 'in_progress', 14, 4.0, 30, '2026-12-08'));
 
-    db.exec('COMMIT');
+    (await db.exec('COMMIT'));
   } catch (err) {
-    db.exec('ROLLBACK');
+    (await db.exec('ROLLBACK'));
     throw err;
   }
 
-  seedExtendedBusinessData(actorEmail);
+  (await seedExtendedBusinessData(db, actorEmail));
 }
 
-export function writeAuditLog(params: {
-  userId?: number | null;
-  userEmail: string;
-  action: string;
-  module: string;
-  entityRef?: string;
-  details?: string;
-  ipAddress?: string;
-  severity?: 'info' | 'warning' | 'critical';
-}): void {
-  db.prepare(
+export async function writeAuditLog(
+  db: DbClient,
+  params: {
+    userId?: number | null;
+    userEmail: string;
+    action: string;
+    module: string;
+    entityRef?: string;
+    details?: string;
+    ipAddress?: string;
+    severity?: 'info' | 'warning' | 'critical';
+  }
+): Promise<void> {
+  (await db.prepare(
     `INSERT INTO audit_logs (user_id, user_email, action, module, entity_ref, details, ip_address, severity)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
@@ -1698,12 +1679,96 @@ export function writeAuditLog(params: {
     params.details ?? '',
     params.ipAddress ?? '',
     params.severity ?? 'info'
-  );
+  ));
 }
 
-ensureDefaults();
-// Idempotently populate extended modules if workspace was already bootstrapped in a prior session
-const preExistingParties = db.prepare('SELECT COUNT(*) as cnt FROM third_parties').get() as { cnt: number };
-if (preExistingParties.cnt > 0) {
-  seedExtendedBusinessData('system-upgrade');
+export async function getChallengeSigningSecret(db: DbClient, env: AppEnv): Promise<string> {
+  if (env.SESSION_SECRET && env.SESSION_SECRET.trim()) {
+    return env.SESSION_SECRET.trim();
+  }
+  const existing = (await db
+    .prepare("SELECT config_json FROM integrations_config WHERE config_key = '_internal_challenge_key'")
+    .get()) as { config_json: string } | undefined;
+  if (existing?.config_json) {
+    try {
+      const parsed = JSON.parse(existing.config_json) as { secret?: string };
+      if (parsed.secret) return parsed.secret;
+    } catch {
+      // regenerate below
+    }
+  }
+  const generated = crypto.randomBytes(32).toString('hex');
+  await db
+    .prepare(`INSERT OR IGNORE INTO integrations_config (config_key, config_json) VALUES ('_internal_challenge_key', ?)`)
+    .run(JSON.stringify({ secret: generated }));
+  const saved = (await db
+    .prepare("SELECT config_json FROM integrations_config WHERE config_key = '_internal_challenge_key'")
+    .get()) as { config_json: string } | undefined;
+  if (saved?.config_json) {
+    try {
+      const parsed = JSON.parse(saved.config_json) as { secret?: string };
+      if (parsed.secret) return parsed.secret;
+    } catch {
+      // fall back
+    }
+  }
+  return generated;
+}
+
+const initializedDbs = new WeakSet<object>();
+let d1IsolateSchemaReady = false;
+
+export async function initDatabase(db: DbClient): Promise<void> {
+  if (initializedDbs.has(db)) {
+    return;
+  }
+  if (db.dialect === 'd1' && d1IsolateSchemaReady) {
+    initializedDbs.add(db);
+    return;
+  }
+
+  if (db.dialect === 'sqlite') {
+    await db.exec('PRAGMA journal_mode = WAL;');
+  } else {
+    // Fast probe on cold Cloudflare Worker isolates: skip full 40-table DDL if already initialized
+    try {
+      const row = await db.prepare('SELECT id FROM system_settings WHERE id = 1').get();
+      await db.prepare('SELECT invoice_kind FROM invoices LIMIT 1').get();
+      if (row) {
+        d1IsolateSchemaReady = true;
+        initializedDbs.add(db);
+        return;
+      }
+    } catch {
+      // Fresh or unmigrated D1 database: run full DDL + defaults below
+    }
+  }
+
+  await db.exec(SCHEMA_SQL);
+
+  // Safe additive migrations for existing databases
+  await ensureColumn(db, 'users', 'phone', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'users', 'job_title', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'users', 'department', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'users', 'timezone', "TEXT NOT NULL DEFAULT 'Asia/Manila'");
+  await ensureColumn(db, 'third_parties', 'social_json', "TEXT NOT NULL DEFAULT '{}'");
+  await ensureColumn(db, 'products', 'barcode', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'proposals', 'signed_by', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'proposals', 'signed_at', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'proposals', 'signature_name', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'sales_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'EXW'");
+  await ensureColumn(db, 'purchase_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'FOB'");
+  await ensureColumn(db, 'invoices', 'invoice_kind', "TEXT NOT NULL DEFAULT 'standard'");
+
+  await ensureDefaults(db);
+
+  const preExistingParties = (await db.prepare('SELECT COUNT(*) as cnt FROM third_parties').get()) as { cnt: number };
+  if (preExistingParties.cnt > 0) {
+    await seedExtendedBusinessData(db, 'system-upgrade');
+  }
+
+  if (db.dialect === 'd1') {
+    d1IsolateSchemaReady = true;
+  }
+  initializedDbs.add(db);
 }
