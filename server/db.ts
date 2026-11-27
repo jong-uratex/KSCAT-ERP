@@ -414,6 +414,9 @@ export const SCHEMA_SQL = `
     invoice_type TEXT NOT NULL CHECK (invoice_type IN ('customer', 'supplier')),
     invoice_kind TEXT NOT NULL DEFAULT 'standard' CHECK (invoice_kind IN ('standard', 'credit_note')),
     third_party_id INTEGER NOT NULL REFERENCES third_parties(id),
+    project_id INTEGER,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    exchange_rate REAL NOT NULL DEFAULT 1,
     source_ref TEXT NOT NULL DEFAULT '',
     issue_date TEXT NOT NULL,
     due_date TEXT NOT NULL,
@@ -450,6 +453,9 @@ export const SCHEMA_SQL = `
     amount REAL NOT NULL,
     direction TEXT NOT NULL CHECK (direction IN ('credit', 'debit')),
     invoice_ref TEXT NOT NULL DEFAULT '',
+    reconciled INTEGER NOT NULL DEFAULT 0,
+    reconciled_at TEXT NOT NULL DEFAULT '',
+    statement_ref TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -486,6 +492,93 @@ export const SCHEMA_SQL = `
     credit_account_code TEXT NOT NULL,
     amount REAL NOT NULL,
     source_ref TEXT NOT NULL DEFAULT '',
+    project_id INTEGER,
+    is_reversal INTEGER NOT NULL DEFAULT 0,
+    reversed_entry_ref TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS fiscal_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+    closed_by TEXT NOT NULL DEFAULT '',
+    closed_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS currencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    symbol TEXT NOT NULL DEFAULT '$',
+    exchange_rate REAL NOT NULL DEFAULT 1,
+    is_base INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS tax_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    rate REAL NOT NULL DEFAULT 0,
+    tax_type TEXT NOT NULL DEFAULT 'both' CHECK (tax_type IN ('sales', 'purchase', 'both')),
+    applies_to TEXT NOT NULL DEFAULT 'Standard Goods & Services',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS project_budgets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    cost_code TEXT NOT NULL DEFAULT 'GEN-01',
+    category TEXT NOT NULL DEFAULT 'Services & Labor',
+    description TEXT NOT NULL DEFAULT '',
+    planned_budget REAL NOT NULL DEFAULT 0,
+    committed_amount REAL NOT NULL DEFAULT 0,
+    hourly_cost_rate REAL NOT NULL DEFAULT 65,
+    hourly_bill_rate REAL NOT NULL DEFAULT 145,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS fixed_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'Machinery & Equipment',
+    acquisition_date TEXT NOT NULL,
+    purchase_cost REAL NOT NULL DEFAULT 0,
+    salvage_value REAL NOT NULL DEFAULT 0,
+    useful_life_months INTEGER NOT NULL DEFAULT 60,
+    depreciation_method TEXT NOT NULL DEFAULT 'straight_line' CHECK (depreciation_method IN ('straight_line', 'declining_balance')),
+    accumulated_depreciation REAL NOT NULL DEFAULT 0,
+    last_depreciation_date TEXT NOT NULL DEFAULT '',
+    location TEXT NOT NULL DEFAULT 'Chicago HQ',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'fully_depreciated', 'disposed')),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS recurring_invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    invoice_type TEXT NOT NULL DEFAULT 'customer' CHECK (invoice_type IN ('customer', 'supplier')),
+    third_party_id INTEGER NOT NULL REFERENCES third_parties(id),
+    project_id INTEGER,
+    title TEXT NOT NULL,
+    frequency TEXT NOT NULL DEFAULT 'monthly' CHECK (frequency IN ('monthly', 'quarterly', 'annual')),
+    next_run_date TEXT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    lines_json TEXT NOT NULL DEFAULT '[]',
+    total_ttc REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'ended')),
+    last_generated_ref TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -618,9 +711,15 @@ export const SCHEMA_SQL = `
     phone TEXT NOT NULL DEFAULT '',
     department TEXT NOT NULL DEFAULT 'Operations',
     job_title TEXT NOT NULL DEFAULT '',
+    employment_type TEXT NOT NULL DEFAULT 'Full-Time',
     hire_date TEXT NOT NULL,
     annual_salary REAL NOT NULL DEFAULT 75000,
     leave_balance_days REAL NOT NULL DEFAULT 20,
+    tax_id TEXT NOT NULL DEFAULT '',
+    bank_account TEXT NOT NULL DEFAULT '',
+    emergency_contact TEXT NOT NULL DEFAULT '',
+    job_history_json TEXT NOT NULL DEFAULT '[]',
+    tax_documents_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'on_leave', 'terminated')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -684,6 +783,138 @@ export const SCHEMA_SQL = `
     hours REAL NOT NULL DEFAULT 8,
     task_label TEXT NOT NULL DEFAULT '',
     billable INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS attendance_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    work_date TEXT NOT NULL,
+    clock_in TEXT NOT NULL DEFAULT '09:00',
+    clock_out TEXT NOT NULL DEFAULT '',
+    shift_name TEXT NOT NULL DEFAULT 'Day Shift (09:00–17:30)',
+    regular_hours REAL NOT NULL DEFAULT 8,
+    overtime_hours REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'present' CHECK (status IN ('present', 'late', 'remote', 'absent', 'approved')),
+    notes TEXT NOT NULL DEFAULT '',
+    approved_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS shift_schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    shift_name TEXT NOT NULL DEFAULT 'Standard Day Shift',
+    start_time TEXT NOT NULL DEFAULT '09:00',
+    end_time TEXT NOT NULL DEFAULT '17:30',
+    work_days TEXT NOT NULL DEFAULT 'Mon–Fri',
+    location TEXT NOT NULL DEFAULT 'HQ / Hybrid',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS payroll_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    pay_period TEXT NOT NULL,
+    pay_date TEXT NOT NULL,
+    total_gross REAL NOT NULL DEFAULT 0,
+    total_deductions REAL NOT NULL DEFAULT 0,
+    total_net REAL NOT NULL DEFAULT 0,
+    employee_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'processed' CHECK (status IN ('draft', 'processed', 'paid')),
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS payslips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    payroll_run_id INTEGER NOT NULL REFERENCES payroll_runs(id) ON DELETE CASCADE,
+    employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    pay_period TEXT NOT NULL,
+    gross_pay REAL NOT NULL DEFAULT 0,
+    tax_deduction REAL NOT NULL DEFAULT 0,
+    social_deduction REAL NOT NULL DEFAULT 0,
+    health_deduction REAL NOT NULL DEFAULT 0,
+    other_deductions REAL NOT NULL DEFAULT 0,
+    net_pay REAL NOT NULL DEFAULT 0,
+    direct_deposit_ref TEXT NOT NULL DEFAULT '',
+    payment_method TEXT NOT NULL DEFAULT 'Direct Deposit',
+    status TEXT NOT NULL DEFAULT 'generated' CHECK (status IN ('generated', 'paid')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS benefit_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'Health Insurance',
+    employer_contribution REAL NOT NULL DEFAULT 0,
+    employee_contribution REAL NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS benefit_enrollments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    plan_id INTEGER NOT NULL REFERENCES benefit_plans(id) ON DELETE CASCADE,
+    coverage_tier TEXT NOT NULL DEFAULT 'Employee Only',
+    enrollment_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'cancelled')),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS onboarding_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    employee_id INTEGER REFERENCES employees(id) ON DELETE CASCADE,
+    candidate_id INTEGER REFERENCES candidates(id) ON DELETE SET NULL,
+    task_title TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'Identity & Tax Forms',
+    due_date TEXT NOT NULL,
+    assignee_name TEXT NOT NULL DEFAULT 'HR Operations',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'completed')),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS kpi_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    evaluator_name TEXT NOT NULL DEFAULT '',
+    review_period TEXT NOT NULL,
+    period_start TEXT NOT NULL DEFAULT '',
+    period_end TEXT NOT NULL DEFAULT '',
+    metrics_json TEXT NOT NULL DEFAULT '[]',
+    overall_score REAL NOT NULL DEFAULT 0,
+    rating_label TEXT NOT NULL DEFAULT 'Meets Expectations',
+    strengths TEXT NOT NULL DEFAULT '',
+    improvement_plan TEXT NOT NULL DEFAULT '',
+    employee_comments TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'self_review', 'submitted', 'approved')),
+    reviewed_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS hr_compliance_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'Labor Law',
+    jurisdiction TEXT NOT NULL DEFAULT 'Federal / State',
+    due_date TEXT NOT NULL,
+    owner_name TEXT NOT NULL DEFAULT 'HR Compliance',
+    compliance_rate REAL NOT NULL DEFAULT 100,
+    status TEXT NOT NULL DEFAULT 'compliant' CHECK (status IN ('compliant', 'due_soon', 'action_required')),
+    notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -840,7 +1071,7 @@ export async function ensureDefaults(db: DbClient): Promise<void> {
     (await insAcct.run('2000', 'Accounts Payable', 'liability', 8448.0));
     (await insAcct.run('2200', 'VAT / Sales Tax Payable', 'liability', 2196.8));
     (await insAcct.run('2500', 'Long-Term Debt & Loans', 'liability', 42000.0));
-    (await insAcct.run('3000', 'Retained Earnings & Capital', 'equity', 330000.0));
+    (await insAcct.run('3000', 'Retained Earnings & Capital', 'equity', 348414.0));
     (await insAcct.run('4000', 'Hardware & Product Sales', 'revenue', 18024.0));
     (await insAcct.run('4100', 'SaaS & Commissioning Services', 'revenue', 8260.0));
     (await insAcct.run('4500', 'Foundation Donations & Grants', 'revenue', 3500.0));
@@ -1201,6 +1432,393 @@ export async function seedExtendedBusinessData(db: DbClient, actorEmail: string)
   } catch (err) {
     (await db.exec('ROLLBACK'));
     throw err;
+  }
+
+  await seedHrExtendedData(db, actorEmail);
+  await seedFinanceExtendedData(db, actorEmail);
+}
+
+export async function seedFinanceExtendedData(db: DbClient, actorEmail: string): Promise<void> {
+  const fpCount = (await db.prepare('SELECT COUNT(*) as cnt FROM fiscal_periods').get()) as { cnt: number };
+  if (fpCount.cnt > 0) return;
+
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO accounting_accounts (code, label, account_class, balance)
+       VALUES
+       ('1500', 'Fixed Assets & Calibration Equipment', 'asset', 64000.0),
+       ('1290', 'Accumulated Depreciation', 'asset', -10400.0),
+       ('3010', 'Fixed Asset Capital Reserve', 'equity', 64000.0),
+       ('6300', 'Depreciation & Amortization Expense', 'expense', 10400.0)`
+    )
+    .run();
+
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO fiscal_periods (code, name, start_date, end_date, status, closed_by, closed_at)
+       VALUES
+       ('FY2026-Q3', 'FY2026 Q3 Consolidated Period', '2026-07-01', '2026-09-30', 'closed', ?, '2026-10-05T18:00:00Z'),
+       ('FY2026-10', 'October 2026 Monthly Close', '2026-10-01', '2026-10-31', 'closed', ?, '2026-11-04T17:30:00Z'),
+       ('FY2026-11', 'November 2026 Operating Period', '2026-11-01', '2026-11-30', 'open', '', ''),
+       ('FY2026-12', 'December 2026 Closing Period', '2026-12-01', '2026-12-31', 'open', '', '')`
+    )
+    .run(actorEmail, actorEmail);
+
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO currencies (code, name, symbol, exchange_rate, is_base)
+       VALUES
+       ('USD', 'US Dollar (Base)', '$', 1.0, 1),
+       ('EUR', 'Euro', '€', 0.92, 0),
+       ('PHP', 'Philippine Peso', '₱', 58.2, 0),
+       ('GBP', 'British Pound', '£', 0.79, 0),
+       ('JPY', 'Japanese Yen', '¥', 152.5, 0)`
+    )
+    .run();
+
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO tax_rates (code, name, rate, tax_type, applies_to, is_active, notes)
+       VALUES
+       ('VAT-20', 'Standard VAT / Sales Tax (20%)', 20.0, 'both', 'Hardware, Commissioning & B2B Services', 1, 'Primary commercial rate on invoices and supplier bills.'),
+       ('VAT-12', 'Regional Standard VAT (12%)', 12.0, 'both', 'APAC Domestic Supply & Maintenance', 1, 'Standard regional VAT schedule.'),
+       ('VAT-5', 'Reduced Calibration Rate (5%)', 5.0, 'sales', 'Educational & Grant Hardware', 1, 'Qualifying open-alliance telemetry deliveries.'),
+       ('WHT-2', 'Withholding Tax Services (2%)', 2.0, 'purchase', 'Subcontractor & Consulting Fees', 1, 'Deductible contractor withholding tax.'),
+       ('ZERO-0', 'Zero-Rated Export (0%)', 0.0, 'both', 'Cross-Border Exempt Exports', 1, 'Zero-rated international shipments.')`
+    )
+    .run();
+
+  const firstProjects = (await db
+    .prepare('SELECT id, ref FROM projects ORDER BY id ASC LIMIT 2')
+    .all()) as Array<{ id: number; ref: string }>;
+
+  if (firstProjects[0]) {
+    await db
+      .prepare(`UPDATE invoices SET project_id = ? WHERE ref = 'IN2611-0001' AND project_id IS NULL`)
+      .run(firstProjects[0].id);
+    await db
+      .prepare(`UPDATE journal_entries SET project_id = ? WHERE ref IN ('JRN2611-0001', 'JRN2611-0003') AND project_id IS NULL`)
+      .run(firstProjects[0].id);
+
+    const pbCnt = (await db.prepare('SELECT COUNT(*) as cnt FROM project_budgets').get()) as { cnt: number };
+    if (pbCnt.cnt === 0) {
+      await db
+        .prepare(
+          `INSERT INTO project_budgets (project_id, cost_code, category, description, planned_budget, committed_amount, hourly_cost_rate, hourly_bill_rate)
+           VALUES
+           (?, 'MAT-100', 'Hardware & Materials', 'Edge Gateways X4 & Conveyor Sensors allocation', 8500, 7040, 68, 155),
+           (?, 'LAB-200', 'Field Commissioning Labor', 'On-site telemetry installation & calibration hours', 6500, 2200, 68, 155),
+           (?, 'TRV-300', 'Travel & Calibration Expenses', 'Field engineering lodging, airfare, and calibration consumables', 3500, 482.5, 68, 155)`
+        )
+        .run(firstProjects[0].id, firstProjects[0].id, firstProjects[0].id);
+      if (firstProjects[1]) {
+        await db
+          .prepare(
+            `INSERT INTO project_budgets (project_id, cost_code, category, description, planned_budget, committed_amount, hourly_cost_rate, hourly_bill_rate)
+             VALUES
+             (?, 'CLD-100', 'Cloud & EDI Engineering', 'Munich EU cloud tenant & RBAC webhook integration', 14000, 3200, 75, 165),
+             (?, 'SUP-200', 'Depot Hardware Reserves', 'Priority spare telemetry modules', 10000, 0, 75, 165)`
+          )
+          .run(firstProjects[1].id, firstProjects[1].id);
+      }
+    }
+  }
+
+  await db
+    .prepare(
+      `UPDATE bank_transactions
+       SET reconciled = 1, reconciled_at = '2026-11-15', statement_ref = 'STMT-2026-11-A'
+       WHERE invoice_ref IN ('IN2611-0001', 'IN2611-0002') AND reconciled = 0`
+    )
+    .run();
+
+  const faCnt = (await db.prepare('SELECT COUNT(*) as cnt FROM fixed_assets').get()) as { cnt: number };
+  if (faCnt.cnt === 0) {
+    await db
+      .prepare(
+        `INSERT INTO fixed_assets (ref, name, category, acquisition_date, purchase_cost, salvage_value, useful_life_months, depreciation_method, accumulated_depreciation, last_depreciation_date, location, status, notes)
+         VALUES
+         ('FA2611-0001', '5-Axis CNC Enclosure Milling Cell', 'Machinery & Production', '2025-07-01', 46000, 4000, 60, 'straight_line', 7700, '2026-10-31', 'Chicago Main Plant', 'active', 'Financed via LN2611-0001 equipment facility.'),
+         ('FA2611-0002', 'Precision Thermal & Optical Calibration Bench', 'Lab & Testing Equipment', '2025-09-01', 18000, 1500, 48, 'straight_line', 2700, '2026-10-31', 'Chicago QA Lab', 'active', 'Used for PT1000 & Optical Sensor ISO certification.')`
+      )
+      .run();
+  }
+
+  const recCnt = (await db.prepare('SELECT COUNT(*) as cnt FROM recurring_invoices').get()) as { cnt: number };
+  if (recCnt.cnt === 0) {
+    const parties = (await db
+      .prepare("SELECT id, name FROM third_parties WHERE party_type IN ('customer', 'customer_supplier') ORDER BY id ASC LIMIT 2")
+      .all()) as Array<{ id: number; name: string }>;
+    if (parties[0]) {
+      await db
+        .prepare(
+          `INSERT INTO recurring_invoices (ref, invoice_type, third_party_id, project_id, title, frequency, next_run_date, currency, lines_json, total_ttc, status, last_generated_ref, notes, created_by)
+           VALUES (?, 'customer', ?, ?, '24/7 Industrial Telemetry SLA & Cloud Retention', 'monthly', '2026-12-01', 'USD', ?, 1152.0, 'active', 'IN2611-0001', 'Auto-billed monthly per contract CTR2611-0001.', ?)`
+        )
+        .run(
+          'REC2611-0001',
+          parties[0].id,
+          firstProjects[0]?.id ?? null,
+          JSON.stringify([{ productId: null, ref: 'SRV-2002', label: 'Annual Telemetry Cloud License (Monthly SLA)', qty: 1, unitPrice: 960, discountPct: 0, taxRate: 20 }]),
+          actorEmail
+        );
+    }
+    if (parties[1]) {
+      await db
+        .prepare(
+          `INSERT INTO recurring_invoices (ref, invoice_type, third_party_id, project_id, title, frequency, next_run_date, currency, lines_json, total_ttc, status, last_generated_ref, notes, created_by)
+           VALUES (?, 'customer', ?, ?, 'Munich Depot Priority Hardware SLA', 'quarterly', '2027-01-01', 'EUR', ?, 2880.0, 'active', '', 'Quarterly recurring hardware support retainer.', ?)`
+        )
+        .run(
+          'REC2611-0002',
+          parties[1].id,
+          firstProjects[1]?.id ?? null,
+          JSON.stringify([{ productId: null, ref: 'SRV-2001', label: 'Munich Priority Hardware Support Retainer', qty: 1, unitPrice: 2400, discountPct: 0, taxRate: 20 }]),
+          actorEmail
+        );
+    }
+  }
+}
+
+export async function seedHrExtendedData(db: DbClient, actorEmail: string): Promise<void> {
+  const kpiCount = (await db.prepare('SELECT COUNT(*) as cnt FROM kpi_evaluations').get()) as { cnt: number };
+  if (kpiCount.cnt > 0) return;
+
+  const employees = (await db
+    .prepare('SELECT id, ref, full_name, email, department, job_title, annual_salary, tax_id FROM employees ORDER BY id ASC')
+    .all()) as Array<{
+    id: number;
+    ref: string;
+    full_name: string;
+    email: string;
+    department: string;
+    job_title: string;
+    annual_salary: number;
+    tax_id: string;
+  }>;
+  if (employees.length === 0) return;
+
+  const candidates = (await db.prepare('SELECT id, full_name FROM candidates ORDER BY id ASC').all()) as Array<{
+    id: number;
+    full_name: string;
+  }>;
+
+  const emp1 = employees[0];
+  const emp2 = employees[1] ?? employees[0];
+
+  // Enrich employee directory rows with self-service metadata, job history & tax docs
+  if (!emp1.tax_id) {
+    await db
+      .prepare(
+        `UPDATE employees
+         SET tax_id = ?, bank_account = ?, emergency_contact = ?, employment_type = ?, job_history_json = ?, tax_documents_json = ?
+         WHERE id = ?`
+      )
+      .run(
+        'TIN-US-884-2190',
+        'Chase Checking •••• 6190',
+        'Elena Chen · +1 (312) 555-0188 (Spouse)',
+        'Full-Time',
+        JSON.stringify([
+          { role: 'Field Commissioning Engineer', department: 'Field Engineering', startDate: '2024-03-15', endDate: '2025-06-30', notes: 'Chicago & Midwest plant automation rollouts.' },
+          { role: 'Lead Commissioning Engineer', department: 'Field Engineering', startDate: '2025-07-01', endDate: 'Present', notes: 'Promoted to lead industrial telemetry deployments.' },
+        ]),
+        JSON.stringify([
+          { title: 'W-2 Wage & Tax Statement (2025)', year: '2025', formType: 'W-2', status: 'Verified', uploadedAt: '2026-01-24' },
+          { title: 'Form W-4 Employee Withholding Certificate', year: '2026', formType: 'W-4', status: 'On File', uploadedAt: '2026-01-10' },
+        ]),
+        emp1.id
+      );
+  }
+
+  if (emp2.id !== emp1.id && !emp2.tax_id) {
+    await db
+      .prepare(
+        `UPDATE employees
+         SET tax_id = ?, bank_account = ?, emergency_contact = ?, employment_type = ?, job_history_json = ?, tax_documents_json = ?
+         WHERE id = ?`
+      )
+      .run(
+        'TIN-US-773-9041',
+        'Citibank Savings •••• 3412',
+        'Carlos Alvarez · +1 (312) 555-0164 (Brother)',
+        'Full-Time',
+        JSON.stringify([
+          { role: 'Financial Controller', department: 'Finance & Accounting', startDate: '2023-09-01', endDate: '2025-03-31', notes: 'AP/AR automation and SEPA cash management.' },
+          { role: 'Senior Controller', department: 'Finance & Accounting', startDate: '2025-04-01', endDate: 'Present', notes: 'Oversees statutory tax compliance & monthly close.' },
+        ]),
+        JSON.stringify([
+          { title: 'W-2 Wage & Tax Statement (2025)', year: '2025', formType: 'W-2', status: 'Verified', uploadedAt: '2026-01-24' },
+          { title: 'Form I-9 Employment Eligibility Verification', year: '2023', formType: 'I-9', status: 'Verified', uploadedAt: '2023-09-01' },
+        ]),
+        emp2.id
+      );
+  }
+
+  // Shift Schedules
+  const shiftCount = (await db.prepare('SELECT COUNT(*) as cnt FROM shift_schedules').get()) as { cnt: number };
+  if (shiftCount.cnt === 0) {
+    await db
+      .prepare(
+        `INSERT INTO shift_schedules (ref, employee_id, shift_name, start_time, end_time, work_days, location, status)
+         VALUES
+         ('SHF2611-0001', ?, 'Field Operations Early Shift', '07:30', '16:00', 'Mon–Fri', 'Chicago Plant & Client Sites', 'active'),
+         ('SHF2611-0002', ?, 'Corporate Finance Core Shift', '09:00', '17:30', 'Mon–Fri', 'HQ / Hybrid', 'active')`
+      )
+      .run(emp1.id, emp2.id);
+  }
+
+  // Attendance Logs
+  const attCount = (await db.prepare('SELECT COUNT(*) as cnt FROM attendance_logs').get()) as { cnt: number };
+  if (attCount.cnt === 0) {
+    await db
+      .prepare(
+        `INSERT INTO attendance_logs (employee_id, work_date, clock_in, clock_out, shift_name, regular_hours, overtime_hours, status, notes, approved_by)
+         VALUES
+         (?, '2026-11-24', '07:28', '18:00', 'Field Operations Early Shift', 8.0, 2.5, 'approved', 'Line-4 PLC sensor cutover overtime.', ?),
+         (?, '2026-11-25', '07:31', '16:15', 'Field Operations Early Shift', 8.0, 0.25, 'present', 'Standard commissioning shift.', ''),
+         (?, '2026-11-24', '08:56', '17:35', 'Corporate Finance Core Shift', 8.0, 0, 'remote', 'Monthly close & SEPA batch prep.', ''),
+         (?, '2026-11-25', '09:18', '17:45', 'Corporate Finance Core Shift', 8.0, 0, 'late', 'Commuter rail delay; worked full 8h.', '')`
+      )
+      .run(emp1.id, actorEmail, emp1.id, emp2.id, emp2.id);
+  }
+
+  // Benefit Plans & Enrollments
+  const planCount = (await db.prepare('SELECT COUNT(*) as cnt FROM benefit_plans').get()) as { cnt: number };
+  let plan1Id = 1;
+  let plan2Id = 2;
+  if (planCount.cnt === 0) {
+    plan1Id = Number(
+      (
+        await db
+          .prepare(
+            `INSERT INTO benefit_plans (ref, name, provider, category, employer_contribution, employee_contribution, description, status)
+             VALUES ('BEN-HLT-01', 'Comprehensive PPO Health & Dental', 'BlueCross Shield', 'Health Insurance', 480, 140, 'Zero-deductible in-network medical, dental & vision plan.', 'active')`
+          )
+          .run()
+      ).lastInsertRowid
+    );
+    plan2Id = Number(
+      (
+        await db
+          .prepare(
+            `INSERT INTO benefit_plans (ref, name, provider, category, employer_contribution, employee_contribution, description, status)
+             VALUES ('BEN-RET-02', '401(k) Corporate Match (5%)', 'Fidelity Workplace', 'Retirement / 401k', 350, 250, 'Dollar-for-dollar match up to 5% of gross base salary.', 'active')`
+          )
+          .run()
+      ).lastInsertRowid
+    );
+    await db
+      .prepare(
+        `INSERT INTO benefit_enrollments (employee_id, plan_id, coverage_tier, enrollment_date, status, notes)
+         VALUES
+         (?, ?, 'Employee + Spouse', '2026-01-01', 'active', '2026 open enrollment confirmed.'),
+         (?, ?, 'Employee Only', '2026-01-01', 'active', '5% salary deferral active.')`
+      )
+      .run(emp1.id, plan1Id, emp2.id, plan2Id);
+  }
+
+  // Payroll Runs & Payslips
+  const payrollCount = (await db.prepare('SELECT COUNT(*) as cnt FROM payroll_runs').get()) as { cnt: number };
+  if (payrollCount.cnt === 0) {
+    const gross1 = Number((emp1.annual_salary / 12 + 194.71).toFixed(2));
+    const tax1 = Number((gross1 * 0.15).toFixed(2));
+    const soc1 = Number((gross1 * 0.045).toFixed(2));
+    const hlth1 = 140;
+    const net1 = Number((gross1 - tax1 - soc1 - hlth1).toFixed(2));
+
+    const gross2 = Number((emp2.annual_salary / 12).toFixed(2));
+    const tax2 = Number((gross2 * 0.15).toFixed(2));
+    const soc2 = Number((gross2 * 0.045).toFixed(2));
+    const hlth2 = 250;
+    const net2 = Number((gross2 - tax2 - soc2 - hlth2).toFixed(2));
+
+    const runId = Number(
+      (
+        await db
+          .prepare(
+            `INSERT INTO payroll_runs (ref, pay_period, pay_date, total_gross, total_deductions, total_net, employee_count, status, created_by)
+             VALUES ('PAY2611-0001', '2026-11', '2026-11-30', ?, ?, ?, 2, 'paid', ?)`
+          )
+          .run(
+            Number((gross1 + gross2).toFixed(2)),
+            Number((tax1 + soc1 + hlth1 + tax2 + soc2 + hlth2).toFixed(2)),
+            Number((net1 + net2).toFixed(2)),
+            actorEmail
+          )
+      ).lastInsertRowid
+    );
+
+    await db
+      .prepare(
+        `INSERT INTO payslips (ref, payroll_run_id, employee_id, pay_period, gross_pay, tax_deduction, social_deduction, health_deduction, other_deductions, net_pay, direct_deposit_ref, payment_method, status)
+         VALUES
+         ('SLP2611-0001', ?, ?, '2026-11', ?, ?, ?, ?, 0, ?, 'ACH-6190-1126', 'Direct Deposit', 'paid'),
+         ('SLP2611-0002', ?, ?, '2026-11', ?, ?, ?, ?, 0, ?, 'ACH-3412-1126', 'Direct Deposit', 'paid')`
+      )
+      .run(runId, emp1.id, gross1, tax1, soc1, hlth1, net1, runId, emp2.id, gross2, tax2, soc2, hlth2, net2);
+  }
+
+  // Digital Onboarding Checklists
+  const onbCount = (await db.prepare('SELECT COUNT(*) as cnt FROM onboarding_tasks').get()) as { cnt: number };
+  if (onbCount.cnt === 0) {
+    const cand1 = candidates[0]?.id ?? null;
+    await db
+      .prepare(
+        `INSERT INTO onboarding_tasks (ref, employee_id, candidate_id, task_title, category, due_date, assignee_name, status, notes)
+         VALUES
+         ('ONB2611-0001', ?, ?, 'E-Sign Employment Offer, NDA & IP Assignment', 'Contract & NDA', '2026-12-01', 'People Operations', 'completed', 'Signed digitally prior to start date.'),
+         ('ONB2611-0002', ?, ?, 'Collect Tax W-4, I-9 & Direct Deposit Routing', 'Identity & Tax Forms', '2026-12-03', 'Payroll Desk', 'in_progress', 'Awaiting voided check confirmation.'),
+         ('ONB2611-0003', ?, NULL, 'Issue Hardware Laptop, Badge & TOTP MFA Key', 'IT Provisioning', '2026-12-05', 'Platform IT', 'pending', 'Provisioned in Security RBAC matrix.'),
+         ('ONB2611-0004', ?, NULL, 'Complete Workplace Safety & Compliance Orientation', 'Orientation & Training', '2026-12-08', 'Operations Lead', 'pending', 'Mandatory before plant floor access.')`
+      )
+      .run(emp1.id, cand1, emp1.id, cand1, emp2.id, emp1.id);
+  }
+
+  // KPI Evaluations
+  await db
+    .prepare(
+      `INSERT INTO kpi_evaluations (ref, employee_id, evaluator_name, review_period, period_start, period_end, metrics_json, overall_score, rating_label, strengths, improvement_plan, employee_comments, status, reviewed_by)
+       VALUES
+       ('KPI2611-0001', ?, 'Operations Director', '2026-Q4', '2026-10-01', '2026-12-31', ?, 92.5, 'Exceeds Expectations',
+        'Zero unplanned downtime during Northwind Line-4 telemetry cutover; mentored two junior field technicians.',
+        'Document standardized Modbus calibration runbook for EMEA depots by Q1.',
+        'Appreciate support on spare PT1000 calibration kits.', 'approved', ?),
+       ('KPI2611-0002', ?, 'Chief Financial Officer', '2026-Q4', '2026-10-01', '2026-12-31', ?, 86.0, 'Meets Expectations',
+        'Closed October & November SEPA reconciliation 2 days ahead of schedule with 100% VAT audit accuracy.',
+        'Automate recurring supplier bill matching rules inside Treasury.',
+        '', 'submitted', '')`
+    )
+    .run(
+      emp1.id,
+      JSON.stringify([
+        { id: 'm1', kpiName: 'On-Time Commissioning Rate', category: 'Delivery', weightPct: 35, targetValue: '95%', actualValue: '98.5%', unit: '%', score: 96 },
+        { id: 'm2', kpiName: 'First-Visit Calibration Accuracy', category: 'Quality', weightPct: 30, targetValue: '96%', actualValue: '97%', unit: '%', score: 92 },
+        { id: 'm3', kpiName: 'Client UAT Satisfaction (CSAT)', category: 'Customer', weightPct: 20, targetValue: '4.6/5', actualValue: '4.9/5', unit: 'pts', score: 94 },
+        { id: 'm4', kpiName: 'Field Safety & SOP Compliance', category: 'Compliance', weightPct: 15, targetValue: '100%', actualValue: '100%', unit: '%', score: 85 },
+      ]),
+      actorEmail,
+      emp2.id,
+      JSON.stringify([
+        { id: 'm1', kpiName: 'Month-End Close Cycle Time', category: 'Efficiency', weightPct: 40, targetValue: '5 days', actualValue: '3 days', unit: 'days', score: 92 },
+        { id: 'm2', kpiName: 'SEPA & Tax Filing Accuracy', category: 'Compliance', weightPct: 35, targetValue: '100%', actualValue: '99.4%', unit: '%', score: 84 },
+        { id: 'm3', kpiName: 'Overdue AR Follow-Up SLA', category: 'Finance', weightPct: 25, targetValue: '90%', actualValue: '86%', unit: '%', score: 79 },
+      ])
+    );
+
+  // HR Compliance Records
+  const compCount = (await db.prepare('SELECT COUNT(*) as cnt FROM hr_compliance_records').get()) as { cnt: number };
+  if (compCount.cnt === 0) {
+    await db
+      .prepare(
+        `INSERT INTO hr_compliance_records (ref, title, category, jurisdiction, due_date, owner_name, compliance_rate, status, notes)
+         VALUES
+         ('CMP2611-0001', 'Q4 Federal & State Payroll Tax Withholding Audit', 'Tax Filing', 'Federal / IL', '2026-12-15', 'Sofia Alvarez', 100, 'compliant', 'Reconciled against November payroll run PAY2611-0001.'),
+         ('CMP2611-0002', 'OSHA Warehouse & Field Electrical Safety Certification', 'Safety & OSHA', 'OSHA / US', '2026-12-20', 'Marcus Chen', 92, 'due_soon', '1 field contractor renewal pending certificate upload.'),
+         ('CMP2611-0003', 'Minimum Wage, Overtime & Break Compliance Review', 'Labor Law', 'IL / CA / DE', '2026-12-31', 'HR Operations', 100, 'compliant', 'Overtime multiplier 1.5x verified across all shift logs.'),
+         ('CMP2611-0004', 'Annual Employee Data Privacy & GDPR Policy Acknowledgment', 'Data Privacy', 'Global / EU', '2026-12-10', 'Security Admin', 88, 'action_required', 'Pending digital signature from 2 remote staff members.')`
+      )
+      .run();
   }
 }
 
@@ -1730,10 +2348,15 @@ export async function initDatabase(db: DbClient): Promise<void> {
   if (db.dialect === 'sqlite') {
     await db.exec('PRAGMA journal_mode = WAL;');
   } else {
-    // Fast probe on cold Cloudflare Worker isolates: skip full 40-table DDL if already initialized
+    // Fast probe on cold Cloudflare Worker isolates: skip full DDL if already initialized & upgraded
     try {
       const row = await db.prepare('SELECT id FROM system_settings WHERE id = 1').get();
-      await db.prepare('SELECT invoice_kind FROM invoices LIMIT 1').get();
+      await db.prepare('SELECT invoice_kind, project_id, currency FROM invoices LIMIT 1').get();
+      await db.prepare('SELECT reconciled FROM bank_transactions LIMIT 1').get();
+      await db.prepare('SELECT project_id FROM journal_entries LIMIT 1').get();
+      await db.prepare('SELECT id FROM fixed_assets LIMIT 1').get();
+      await db.prepare('SELECT tax_id FROM employees LIMIT 1').get();
+      await db.prepare('SELECT id FROM kpi_evaluations LIMIT 1').get();
       if (row) {
         d1IsolateSchemaReady = true;
         initializedDbs.add(db);
@@ -1759,12 +2382,29 @@ export async function initDatabase(db: DbClient): Promise<void> {
   await ensureColumn(db, 'sales_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'EXW'");
   await ensureColumn(db, 'purchase_orders', 'incoterm', "TEXT NOT NULL DEFAULT 'FOB'");
   await ensureColumn(db, 'invoices', 'invoice_kind', "TEXT NOT NULL DEFAULT 'standard'");
+  await ensureColumn(db, 'invoices', 'project_id', 'INTEGER');
+  await ensureColumn(db, 'invoices', 'currency', "TEXT NOT NULL DEFAULT 'USD'");
+  await ensureColumn(db, 'invoices', 'exchange_rate', 'REAL NOT NULL DEFAULT 1');
+  await ensureColumn(db, 'bank_transactions', 'reconciled', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'bank_transactions', 'reconciled_at', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'bank_transactions', 'statement_ref', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'journal_entries', 'project_id', 'INTEGER');
+  await ensureColumn(db, 'journal_entries', 'is_reversal', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'journal_entries', 'reversed_entry_ref', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'employees', 'employment_type', "TEXT NOT NULL DEFAULT 'Full-Time'");
+  await ensureColumn(db, 'employees', 'tax_id', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'employees', 'bank_account', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'employees', 'emergency_contact', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(db, 'employees', 'job_history_json', "TEXT NOT NULL DEFAULT '[]'");
+  await ensureColumn(db, 'employees', 'tax_documents_json', "TEXT NOT NULL DEFAULT '[]'");
 
   await ensureDefaults(db);
 
   const preExistingParties = (await db.prepare('SELECT COUNT(*) as cnt FROM third_parties').get()) as { cnt: number };
   if (preExistingParties.cnt > 0) {
     await seedExtendedBusinessData(db, 'system-upgrade');
+    await seedHrExtendedData(db, 'system-upgrade');
+    await seedFinanceExtendedData(db, 'system-upgrade');
   }
 
   if (db.dialect === 'd1') {

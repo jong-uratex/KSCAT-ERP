@@ -540,7 +540,7 @@ export default function App() {
               />
             )}
             {currentNav?.key === 'hr' && (
-              <HrView permissions={permissions} onNotify={notify} />
+              <HrView permissions={permissions} currentUserEmail={user.email} onNotify={notify} />
             )}
             {currentNav?.key === 'tools' && (
               <WorkspaceToolsView

@@ -84,6 +84,14 @@ export interface AuthenticatedRequest extends ApiRequest {
   authSessionId?: number;
 }
 
+function safeCsvCell(val: unknown): string {
+  let s = String(val ?? '');
+  if (/^[=+\-@\t\r]/.test(s)) {
+    s = `'${s}`;
+  }
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
 interface DocumentLineInput {
   productId?: number | null;
   ref?: string;
@@ -2483,9 +2491,11 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
   router.get('/invoices', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
     const rows = (await db
       .prepare(
-        `SELECT i.*, tp.name AS party_name, tp.ref AS party_ref
+        `SELECT i.*, tp.name AS party_name, tp.ref AS party_ref,
+                p.ref AS project_ref, p.title AS project_title
          FROM invoices i
          JOIN third_parties tp ON tp.id = i.third_party_id
+         LEFT JOIN projects p ON p.id = i.project_id
          ORDER BY i.id DESC`
       )
       .all());
@@ -2493,13 +2503,33 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
   });
 
   router.post('/invoices', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedRequest, res) => {
-    const { invoiceType = 'customer', invoiceKind = 'standard', thirdPartyId, issueDate, dueDate, lines, notes = '' } = req.body ?? {};
+    const {
+      invoiceType = 'customer',
+      invoiceKind = 'standard',
+      thirdPartyId,
+      projectId = null,
+      currency = 'USD',
+      exchangeRate,
+      issueDate,
+      dueDate,
+      lines,
+      notes = '',
+    } = req.body ?? {};
     if (!thirdPartyId) {
       res.status(400).json({ error: 'Third party is required.' });
       return;
     }
     const cleanType = invoiceType === 'supplier' ? 'supplier' : 'customer';
     const cleanKind = invoiceKind === 'credit_note' ? 'credit_note' : 'standard';
+    const cleanProjId = projectId !== null && projectId !== '' && Number(projectId) > 0 ? Number(projectId) : null;
+    const cleanCurrency = String(currency || 'USD').trim().toUpperCase().slice(0, 8) || 'USD';
+    let fxRate = Number(exchangeRate);
+    if (!Number.isFinite(fxRate) || fxRate <= 0) {
+      const currRow = (await db.prepare('SELECT exchange_rate FROM currencies WHERE code = ?').get(cleanCurrency)) as
+        | { exchange_rate: number }
+        | undefined;
+      fxRate = currRow?.exchange_rate && currRow.exchange_rate > 0 ? currRow.exchange_rate : 1;
+    }
     try {
       const totals = computeLineTotals(lines);
       const prefix = cleanKind === 'credit_note' ? (cleanType === 'supplier' ? 'SC' : 'CR') : cleanType === 'supplier' ? 'SI' : 'IN';
@@ -2508,14 +2538,17 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
       const due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
       const info = (await db
         .prepare(
-          `INSERT INTO invoices (ref, invoice_type, invoice_kind, third_party_id, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
-           VALUES (?, ?, ?, ?, '', ?, ?, 'draft', ?, ?, ?, ?, 0, ?, ?)`
+          `INSERT INTO invoices (ref, invoice_type, invoice_kind, third_party_id, project_id, currency, exchange_rate, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, 'draft', ?, ?, ?, ?, 0, ?, ?)`
         )
         .run(
           ref,
           cleanType,
           cleanKind,
           Number(thirdPartyId),
+          cleanProjId,
+          cleanCurrency,
+          fxRate,
           String(issueDate || today),
           String(dueDate || due),
           JSON.stringify(totals.sanitized),
@@ -2531,7 +2564,7 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
         action: cleanKind === 'credit_note' ? 'CREATE_CREDIT_NOTE' : 'CREATE_INVOICE',
         module: 'billing',
         entityRef: ref,
-        details: `Created ${cleanType} ${cleanKind.replace('_', ' ')} ${ref} ($${totals.totalTtc.toFixed(2)})`,
+        details: `Created ${cleanType} ${cleanKind.replace('_', ' ')} ${ref} (${cleanCurrency} ${totals.totalTtc.toFixed(2)})`,
         ipAddress: getClientIp(req),
       }));
       res.status(201).json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid)));
@@ -2543,20 +2576,42 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
   router.put('/invoices/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     const existing = (await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)) as
-      | { id: number; ref: string; status: string }
+      | { id: number; ref: string; status: string; project_id: number | null; currency: string; exchange_rate: number }
       | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Invoice not found.' });
       return;
     }
-    const { thirdPartyId, issueDate, dueDate, lines, notes, status } = req.body ?? {};
+    const { thirdPartyId, projectId, currency, exchangeRate, issueDate, dueDate, lines, notes, status } = req.body ?? {};
     const isDraft = existing.status === 'draft';
+    const nextProjectId =
+      projectId === undefined
+        ? existing.project_id
+        : projectId === null || projectId === '' || Number(projectId) <= 0
+          ? null
+          : Number(projectId);
+    const nextCurrency =
+      isDraft && currency ? String(currency).trim().toUpperCase().slice(0, 8) || existing.currency : existing.currency;
+    let nextFx = existing.exchange_rate || 1;
+    if (isDraft) {
+      if (exchangeRate !== undefined && Number(exchangeRate) > 0) {
+        nextFx = Number(exchangeRate);
+      } else if (currency && nextCurrency !== existing.currency) {
+        const currRow = (await db.prepare('SELECT exchange_rate FROM currencies WHERE code = ?').get(nextCurrency)) as
+          | { exchange_rate: number }
+          | undefined;
+        nextFx = currRow?.exchange_rate && currRow.exchange_rate > 0 ? currRow.exchange_rate : 1;
+      }
+    }
     try {
       const totals = isDraft && Array.isArray(lines) && lines.length > 0 ? computeLineTotals(lines) : null;
       const allowedStatus = new Set(['draft', 'validated', 'cancelled']);
       (await db.prepare(
         `UPDATE invoices
          SET third_party_id = COALESCE(?, third_party_id),
+             project_id = ?,
+             currency = ?,
+             exchange_rate = ?,
              issue_date = COALESCE(?, issue_date),
              due_date = COALESCE(?, due_date),
              lines_json = COALESCE(?, lines_json),
@@ -2568,6 +2623,9 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
          WHERE id = ?`
       ).run(
         isDraft && thirdPartyId !== undefined ? Number(thirdPartyId) : null,
+        nextProjectId,
+        nextCurrency,
+        nextFx,
         isDraft && issueDate ? String(issueDate) : null,
         dueDate ? String(dueDate) : null,
         totals ? JSON.stringify(totals.sanitized) : null,
@@ -2977,6 +3035,91 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
       (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to delete transaction.' });
     }
+  });
+
+  router.post('/bank-transactions/:id/reconcile', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id)) as
+      | { id: number; reconciled: number; label: string; statement_ref: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Bank transaction not found.' });
+      return;
+    }
+    const { reconciled, statementRef } = req.body ?? {};
+    const nextRec = reconciled !== undefined ? (reconciled ? 1 : 0) : existing.reconciled ? 0 : 1;
+    const nextDate = nextRec ? new Date().toISOString().slice(0, 10) : '';
+    const nextStmt =
+      nextRec === 0
+        ? ''
+        : statementRef !== undefined && String(statementRef).trim()
+          ? String(statementRef).trim()
+          : existing.statement_ref || `STMT-${new Date().toISOString().slice(0, 7)}`;
+
+    (await db
+      .prepare('UPDATE bank_transactions SET reconciled = ?, reconciled_at = ?, statement_ref = ? WHERE id = ?')
+      .run(nextRec, nextDate, nextStmt, id));
+    (await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: nextRec ? 'RECONCILE_BANK_TRANSACTION' : 'UNRECONCILE_BANK_TRANSACTION',
+      module: 'billing',
+      entityRef: `TX-${id}`,
+      details: `${nextRec ? 'Reconciled' : 'Unreconciled'} "${existing.label}" (${nextStmt || 'cleared'})`,
+      ipAddress: getClientIp(req),
+    }));
+    res.json((await db.prepare('SELECT * FROM bank_transactions WHERE id = ?').get(id)));
+  });
+
+  router.get('/bank-transactions/export', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
+    const rows = (await db
+      .prepare(
+        `SELECT bt.*, ba.ref AS account_ref, ba.name AS account_name
+         FROM bank_transactions bt
+         JOIN bank_accounts ba ON ba.id = bt.bank_account_id
+         ORDER BY bt.tx_date DESC, bt.id DESC`
+      )
+      .all()) as Array<{
+      id: number;
+      tx_date: string;
+      account_ref: string;
+      account_name: string;
+      label: string;
+      category: string;
+      direction: string;
+      amount: number;
+      invoice_ref: string;
+      reconciled: number;
+      reconciled_at: string;
+      statement_ref: string;
+    }>;
+    const headers = ['ID', 'Date', 'Account Ref', 'Account Name', 'Label', 'Category', 'Direction', 'Amount', 'Invoice Ref', 'Reconciled', 'Reconciled Date', 'Statement Ref'];
+    const lines = [
+      headers.map(safeCsvCell).join(','),
+      ...rows.map((r) =>
+        [
+          r.id,
+          r.tx_date,
+          r.account_ref,
+          r.account_name,
+          r.label,
+          r.category,
+          r.direction,
+          r.amount.toFixed(2),
+          r.invoice_ref,
+          r.reconciled ? 'Yes' : 'No',
+          r.reconciled_at,
+          r.statement_ref,
+        ]
+          .map(safeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: rows.length,
+      filename: `kscat-bank-ledger-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
   });
 
   // ========================

@@ -1890,35 +1890,413 @@ export function createExtraApiRouter(db: DbClient, env: AppEnv, deps: ExtraRoute
   });
 
   // ========================
-  // FINANCE EXTENSIONS (SEPA, ACCOUNTING, DONATIONS, LOANS, MARGINS)
+  // FINANCE & PROJECT ACCOUNTING EXTENSIONS
   // ========================
+  async function applyAccountPosting(accountCode: string, side: 'debit' | 'credit', amount: number): Promise<void> {
+    const acct = (await db.prepare('SELECT account_class FROM accounting_accounts WHERE code = ?').get(accountCode)) as
+      | { account_class: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense' }
+      | undefined;
+    const isDebitNormal = !acct || acct.account_class === 'asset' || acct.account_class === 'expense';
+    const delta = isDebitNormal ? (side === 'debit' ? amount : -amount) : side === 'credit' ? amount : -amount;
+    await db.prepare('UPDATE accounting_accounts SET balance = balance + ? WHERE code = ?').run(delta, accountCode);
+  }
+
+  async function getClosedPeriodForDate(dateStr: string): Promise<{ code: string; name: string } | undefined> {
+    return (await db
+      .prepare(`SELECT code, name FROM fiscal_periods WHERE status = 'closed' AND start_date <= ? AND end_date >= ? LIMIT 1`)
+      .get(dateStr, dateStr)) as { code: string; name: string } | undefined;
+  }
+
+  function advanceRecurringDate(dateStr: string, frequency: string): string {
+    const d = new Date(`${dateStr}T00:00:00Z`);
+    if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+    if (frequency === 'annual') {
+      d.setUTCFullYear(d.getUTCFullYear() + 1);
+    } else if (frequency === 'quarterly') {
+      d.setUTCMonth(d.getUTCMonth() + 3);
+    } else {
+      d.setUTCMonth(d.getUTCMonth() + 1);
+    }
+    return d.toISOString().slice(0, 10);
+  }
+
+  function computeFinanceLinesTotals(rawLines: unknown) {
+    const list = Array.isArray(rawLines) ? rawLines : [];
+    const sanitized = list
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => {
+        const l = item as Record<string, unknown>;
+        return {
+          productId: l.productId ? Number(l.productId) : null,
+          ref: String(l.ref ?? '').trim(),
+          label: String(l.label ?? 'Service Line').trim() || 'Service Line',
+          qty: Math.max(0.01, Number(l.qty) || 1),
+          unitPrice: Math.max(0, Number(l.unitPrice) || 0),
+          discountPct: Math.min(100, Math.max(0, Number(l.discountPct) || 0)),
+          taxRate: Math.min(100, Math.max(0, Number(l.taxRate) ?? 20)),
+        };
+      });
+    let subtotalHt = 0;
+    let taxTotal = 0;
+    for (const l of sanitized) {
+      const lineHt = l.qty * l.unitPrice * (1 - l.discountPct / 100);
+      subtotalHt += lineHt;
+      taxTotal += lineHt * (l.taxRate / 100);
+    }
+    subtotalHt = Math.round(subtotalHt * 100) / 100;
+    taxTotal = Math.round(taxTotal * 100) / 100;
+    const totalTtc = Math.round((subtotalHt + taxTotal) * 100) / 100;
+    return { sanitized, subtotalHt, taxTotal, totalTtc };
+  }
+
   router.get('/finance-extensions', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
-    const sepaBatches = (await db
+    const sepaBatches = await db
       .prepare(
         `SELECT sb.*, ba.name AS bank_name, ba.ref AS bank_ref
          FROM sepa_batches sb
          JOIN bank_accounts ba ON ba.id = sb.bank_account_id
          ORDER BY sb.id DESC`
       )
-      .all());
-    const accounts = (await db.prepare('SELECT * FROM accounting_accounts ORDER BY code ASC').all());
-    const journalEntries = (await db.prepare('SELECT * FROM journal_entries ORDER BY entry_date DESC, id DESC LIMIT 100').all());
-    const donations = (await db.prepare('SELECT * FROM donations ORDER BY id DESC').all());
-    const loans = (await db.prepare('SELECT * FROM loans ORDER BY id DESC').all());
+      .all();
 
-    const marginStats = (await db
+    const accounts = (await db.prepare('SELECT * FROM accounting_accounts ORDER BY code ASC').all()) as Array<{
+      id: number;
+      code: string;
+      label: string;
+      account_class: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+      balance: number;
+      is_active: number;
+    }>;
+
+    const journalEntries = await db
+      .prepare(
+        `SELECT je.*, p.ref AS project_ref, p.title AS project_title
+         FROM journal_entries je
+         LEFT JOIN projects p ON p.id = je.project_id
+         ORDER BY je.entry_date DESC, je.id DESC
+         LIMIT 150`
+      )
+      .all();
+
+    const donations = await db.prepare('SELECT * FROM donations ORDER BY id DESC').all();
+    const loans = await db.prepare('SELECT * FROM loans ORDER BY id DESC').all();
+    const fiscalPeriods = await db.prepare('SELECT * FROM fiscal_periods ORDER BY start_date DESC, id DESC').all();
+    const currencies = await db.prepare('SELECT * FROM currencies ORDER BY is_base DESC, code ASC').all();
+    const taxRates = await db.prepare('SELECT * FROM tax_rates ORDER BY rate DESC, code ASC').all();
+
+    const projectBudgets = await db
+      .prepare(
+        `SELECT pb.*, p.ref AS project_ref, p.title AS project_title, p.status AS project_status
+         FROM project_budgets pb
+         JOIN projects p ON p.id = pb.project_id
+         ORDER BY pb.project_id ASC, pb.cost_code ASC`
+      )
+      .all();
+
+    const rawAssets = (await db.prepare('SELECT * FROM fixed_assets ORDER BY acquisition_date DESC, id DESC').all()) as Array<{
+      id: number;
+      ref: string;
+      name: string;
+      category: string;
+      acquisition_date: string;
+      purchase_cost: number;
+      salvage_value: number;
+      useful_life_months: number;
+      depreciation_method: 'straight_line' | 'declining_balance';
+      accumulated_depreciation: number;
+      last_depreciation_date: string;
+      location: string;
+      status: 'active' | 'fully_depreciated' | 'disposed';
+      notes: string;
+    }>;
+    const fixedAssets = rawAssets.map((a) => {
+      const nbv = Math.max(0, Math.round((a.purchase_cost - a.accumulated_depreciation) * 100) / 100);
+      const depreciableBase = Math.max(0, a.purchase_cost - a.salvage_value);
+      const life = Math.max(1, a.useful_life_months);
+      const estMonthly =
+        a.status !== 'active'
+          ? 0
+          : a.depreciation_method === 'declining_balance'
+            ? Math.round((Math.max(0, nbv - a.salvage_value) * (2 / life)) * 100) / 100
+            : Math.round((depreciableBase / life) * 100) / 100;
+      return { ...a, net_book_value: nbv, monthly_depreciation: Math.min(estMonthly, Math.max(0, nbv - a.salvage_value)) };
+    });
+
+    const recurringInvoices = await db
+      .prepare(
+        `SELECT ri.*, tp.name AS party_name, tp.ref AS party_ref, p.ref AS project_ref, p.title AS project_title
+         FROM recurring_invoices ri
+         JOIN third_parties tp ON tp.id = ri.third_party_id
+         LEFT JOIN projects p ON p.id = ri.project_id
+         ORDER BY ri.next_run_date ASC, ri.id DESC`
+      )
+      .all();
+
+    const marginStats = await db
       .prepare(
         `SELECT
-           COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND invoice_kind = 'standard' AND status != 'cancelled' THEN subtotal_ht ELSE 0 END), 0) AS revenue_ht,
-           COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND invoice_kind = 'credit_note' AND status != 'cancelled' THEN subtotal_ht ELSE 0 END), 0) AS credit_notes_ht,
-           COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status != 'cancelled' THEN subtotal_ht ELSE 0 END), 0) AS purchases_ht,
-           COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND status != 'cancelled' THEN tax_total ELSE 0 END), 0) AS vat_collected,
-           COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status != 'cancelled' THEN tax_total ELSE 0 END), 0) AS vat_deductible
+           COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND invoice_kind = 'standard' AND status != 'cancelled' THEN subtotal_ht / COALESCE(NULLIF(exchange_rate, 0), 1) ELSE 0 END), 0) AS revenue_ht,
+           COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND invoice_kind = 'credit_note' AND status != 'cancelled' THEN subtotal_ht / COALESCE(NULLIF(exchange_rate, 0), 1) ELSE 0 END), 0) AS credit_notes_ht,
+           COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status != 'cancelled' THEN subtotal_ht / COALESCE(NULLIF(exchange_rate, 0), 1) ELSE 0 END), 0) AS purchases_ht,
+           COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND status != 'cancelled' THEN tax_total / COALESCE(NULLIF(exchange_rate, 0), 1) ELSE 0 END), 0) AS vat_collected,
+           COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status != 'cancelled' THEN tax_total / COALESCE(NULLIF(exchange_rate, 0), 1) ELSE 0 END), 0) AS vat_deductible
          FROM invoices`
       )
-      .get());
+      .get();
 
-    res.json({ sepaBatches, accounts, journalEntries, donations, loans, marginStats });
+    // Project Profitability & Job Costing
+    const projRows = (await db
+      .prepare(
+        `SELECT p.id, p.ref, p.title, p.budget_amount, p.status, p.progress, tp.name AS customer_name
+         FROM projects p
+         LEFT JOIN third_parties tp ON tp.id = p.third_party_id
+         ORDER BY p.id ASC`
+      )
+      .all()) as Array<{
+      id: number;
+      ref: string;
+      title: string;
+      budget_amount: number;
+      status: string;
+      progress: number;
+      customer_name: string | null;
+    }>;
+
+    const budgetAggRows = (await db
+      .prepare(
+        `SELECT project_id,
+                COALESCE(SUM(planned_budget), 0) AS planned_budget,
+                COALESCE(SUM(committed_amount), 0) AS committed_cost,
+                COALESCE(AVG(hourly_cost_rate), 65) AS avg_cost_rate,
+                COALESCE(AVG(hourly_bill_rate), 145) AS avg_bill_rate
+         FROM project_budgets
+         GROUP BY project_id`
+      )
+      .all()) as Array<{
+      project_id: number;
+      planned_budget: number;
+      committed_cost: number;
+      avg_cost_rate: number;
+      avg_bill_rate: number;
+    }>;
+
+    const invProjRows = (await db
+      .prepare(
+        `SELECT project_id,
+                COALESCE(SUM(CASE WHEN invoice_type = 'customer' AND invoice_kind = 'standard' AND status != 'cancelled' THEN subtotal_ht / COALESCE(NULLIF(exchange_rate, 0), 1)
+                                  WHEN invoice_type = 'customer' AND invoice_kind = 'credit_note' AND status != 'cancelled' THEN -subtotal_ht / COALESCE(NULLIF(exchange_rate, 0), 1)
+                                  ELSE 0 END), 0) AS invoiced_revenue,
+                COALESCE(SUM(CASE WHEN invoice_type = 'supplier' AND status != 'cancelled' THEN subtotal_ht / COALESCE(NULLIF(exchange_rate, 0), 1) ELSE 0 END), 0) AS supplier_costs
+         FROM invoices
+         WHERE project_id IS NOT NULL
+         GROUP BY project_id`
+      )
+      .all()) as Array<{ project_id: number; invoiced_revenue: number; supplier_costs: number }>;
+
+    const tsProjRows = (await db
+      .prepare(
+        `SELECT project_id,
+                COALESCE(SUM(CASE WHEN billable = 1 THEN hours ELSE 0 END), 0) AS billable_hours,
+                COALESCE(SUM(CASE WHEN billable = 0 THEN hours ELSE 0 END), 0) AS non_billable_hours
+         FROM timesheets
+         WHERE project_id IS NOT NULL
+         GROUP BY project_id`
+      )
+      .all()) as Array<{ project_id: number; billable_hours: number; non_billable_hours: number }>;
+
+    const jrnProjRows = (await db
+      .prepare(
+        `SELECT je.project_id,
+                COALESCE(SUM(CASE WHEN aa.account_class = 'expense' THEN je.amount ELSE 0 END), 0) AS gl_expenses
+         FROM journal_entries je
+         LEFT JOIN accounting_accounts aa ON aa.code = je.debit_account_code
+         WHERE je.project_id IS NOT NULL
+         GROUP BY je.project_id`
+      )
+      .all()) as Array<{ project_id: number; gl_expenses: number }>;
+
+    const budgetByProj = new Map(budgetAggRows.map((r) => [r.project_id, r]));
+    const invByProj = new Map(invProjRows.map((r) => [r.project_id, r]));
+    const tsByProj = new Map(tsProjRows.map((r) => [r.project_id, r]));
+    const jrnByProj = new Map(jrnProjRows.map((r) => [r.project_id, r]));
+
+    const projectProfitability = projRows.map((p) => {
+      const b = budgetByProj.get(p.id);
+      const inv = invByProj.get(p.id);
+      const ts = tsByProj.get(p.id);
+      const jrn = jrnByProj.get(p.id);
+      const plannedBudget = b && b.planned_budget > 0 ? b.planned_budget : p.budget_amount;
+      const committedCost = b?.committed_cost ?? 0;
+      const costRate = b?.avg_cost_rate ?? 65;
+      const billRate = b?.avg_bill_rate ?? 145;
+      const billableHours = ts?.billable_hours ?? 0;
+      const nonBillableHours = ts?.non_billable_hours ?? 0;
+      const laborCost = Math.round((billableHours + nonBillableHours) * costRate * 100) / 100;
+      const billableLaborValue = Math.round(billableHours * billRate * 100) / 100;
+      const invoicedRevenue = Math.round((inv?.invoiced_revenue ?? 0) * 100) / 100;
+      const supplierCosts = Math.round((inv?.supplier_costs ?? 0) * 100) / 100;
+      const glDirectCosts = Math.round((jrn?.gl_expenses ?? 0) * 100) / 100;
+      const totalActualCost = Math.round((supplierCosts + laborCost + glDirectCosts) * 100) / 100;
+      const effectiveRevenue = invoicedRevenue > 0 ? invoicedRevenue : billableLaborValue;
+      const grossProfit = Math.round((invoicedRevenue - totalActualCost) * 100) / 100;
+      const marginPct = invoicedRevenue > 0 ? Math.round((grossProfit / invoicedRevenue) * 1000) / 10 : 0;
+      const budgetUtilizationPct = plannedBudget > 0 ? Math.round((totalActualCost / plannedBudget) * 1000) / 10 : 0;
+      return {
+        project_id: p.id,
+        project_ref: p.ref,
+        project_title: p.title,
+        customer_name: p.customer_name || 'Internal',
+        status: p.status,
+        progress: p.progress,
+        planned_budget: plannedBudget,
+        committed_cost: committedCost,
+        invoiced_revenue: invoicedRevenue,
+        billable_hours: billableHours,
+        non_billable_hours: nonBillableHours,
+        labor_cost: laborCost,
+        billable_labor_value: billableLaborValue,
+        supplier_costs: supplierCosts,
+        gl_direct_costs: glDirectCosts,
+        total_actual_cost: totalActualCost,
+        effective_revenue: effectiveRevenue,
+        gross_profit: grossProfit,
+        margin_pct: marginPct,
+        budget_utilization_pct: budgetUtilizationPct,
+      };
+    });
+
+    // AR & AP Aging Summary
+    const openInvoices = (await db
+      .prepare(
+        `SELECT invoice_type, due_date, total_ttc, amount_paid, exchange_rate
+         FROM invoices
+         WHERE status IN ('validated', 'partial')`
+      )
+      .all()) as Array<{
+      invoice_type: 'customer' | 'supplier';
+      due_date: string;
+      total_ttc: number;
+      amount_paid: number;
+      exchange_rate: number;
+    }>;
+
+    const todayMs = Date.UTC(
+      new Date().getUTCFullYear(),
+      new Date().getUTCMonth(),
+      new Date().getUTCDate()
+    );
+    const emptyAging = () => ({ current: 0, days_1_30: 0, days_31_60: 0, days_61_plus: 0, total: 0 });
+    const arAging = emptyAging();
+    const apAging = emptyAging();
+    for (const inv of openInvoices) {
+      const fx = inv.exchange_rate && inv.exchange_rate > 0 ? inv.exchange_rate : 1;
+      const remaining = Math.max(0, (inv.total_ttc - inv.amount_paid) / fx);
+      if (remaining <= 0.005) continue;
+      const dueMs = Date.parse(`${inv.due_date}T00:00:00Z`);
+      const daysOverdue = Number.isFinite(dueMs) ? Math.floor((todayMs - dueMs) / 86400000) : 0;
+      const bucket = inv.invoice_type === 'supplier' ? apAging : arAging;
+      if (daysOverdue <= 0) bucket.current += remaining;
+      else if (daysOverdue <= 30) bucket.days_1_30 += remaining;
+      else if (daysOverdue <= 60) bucket.days_31_60 += remaining;
+      else bucket.days_61_plus += remaining;
+      bucket.total += remaining;
+    }
+    for (const b of [arAging, apAging]) {
+      b.current = Math.round(b.current * 100) / 100;
+      b.days_1_30 = Math.round(b.days_1_30 * 100) / 100;
+      b.days_31_60 = Math.round(b.days_31_60 * 100) / 100;
+      b.days_61_plus = Math.round(b.days_61_plus * 100) / 100;
+      b.total = Math.round(b.total * 100) / 100;
+    }
+
+    // Automated Financial Statements (Trial Balance, Profit & Loss, Balance Sheet)
+    const activeAccts = accounts.filter((a) => a.is_active !== 0);
+    let totalDebits = 0;
+    let totalCredits = 0;
+    const trialBalanceRows = activeAccts.map((a) => {
+      const isDebitNormal = a.account_class === 'asset' || a.account_class === 'expense';
+      const debit = isDebitNormal ? (a.balance >= 0 ? a.balance : 0) : a.balance < 0 ? Math.abs(a.balance) : 0;
+      const credit = !isDebitNormal ? (a.balance >= 0 ? a.balance : 0) : a.balance < 0 ? Math.abs(a.balance) : 0;
+      totalDebits += debit;
+      totalCredits += credit;
+      return {
+        code: a.code,
+        label: a.label,
+        account_class: a.account_class,
+        debit: Math.round(debit * 100) / 100,
+        credit: Math.round(credit * 100) / 100,
+      };
+    });
+    totalDebits = Math.round(totalDebits * 100) / 100;
+    totalCredits = Math.round(totalCredits * 100) / 100;
+
+    const revenueItems = activeAccts
+      .filter((a) => a.account_class === 'revenue')
+      .map((a) => ({ code: a.code, label: a.label, amount: Math.round(a.balance * 100) / 100 }));
+    const expenseItems = activeAccts
+      .filter((a) => a.account_class === 'expense')
+      .map((a) => ({ code: a.code, label: a.label, amount: Math.round(a.balance * 100) / 100 }));
+    const totalRevenue = Math.round(revenueItems.reduce((s, x) => s + x.amount, 0) * 100) / 100;
+    const totalExpenses = Math.round(expenseItems.reduce((s, x) => s + x.amount, 0) * 100) / 100;
+    const netIncome = Math.round((totalRevenue - totalExpenses) * 100) / 100;
+
+    const assetItems = activeAccts
+      .filter((a) => a.account_class === 'asset')
+      .map((a) => ({ code: a.code, label: a.label, amount: Math.round(a.balance * 100) / 100 }));
+    const liabilityItems = activeAccts
+      .filter((a) => a.account_class === 'liability')
+      .map((a) => ({ code: a.code, label: a.label, amount: Math.round(a.balance * 100) / 100 }));
+    const equityItems = activeAccts
+      .filter((a) => a.account_class === 'equity')
+      .map((a) => ({ code: a.code, label: a.label, amount: Math.round(a.balance * 100) / 100 }));
+    const totalAssets = Math.round(assetItems.reduce((s, x) => s + x.amount, 0) * 100) / 100;
+    const totalLiabilities = Math.round(liabilityItems.reduce((s, x) => s + x.amount, 0) * 100) / 100;
+    const totalEquity = Math.round(equityItems.reduce((s, x) => s + x.amount, 0) * 100) / 100;
+    const totalLiabilitiesAndEquity = Math.round((totalLiabilities + totalEquity + netIncome) * 100) / 100;
+
+    res.json({
+      sepaBatches,
+      accounts,
+      journalEntries,
+      donations,
+      loans,
+      marginStats,
+      fiscalPeriods,
+      currencies,
+      taxRates,
+      projectBudgets,
+      projectProfitability,
+      fixedAssets,
+      recurringInvoices,
+      agingSummary: { ar: arAging, ap: apAging },
+      financialStatements: {
+        trialBalance: {
+          rows: trialBalanceRows,
+          totalDebits,
+          totalCredits,
+          isBalanced: Math.abs(totalDebits - totalCredits) < 0.02,
+        },
+        profitAndLoss: {
+          revenueItems,
+          expenseItems,
+          totalRevenue,
+          totalExpenses,
+          netIncome,
+          netMarginPct: totalRevenue > 0 ? Math.round((netIncome / totalRevenue) * 1000) / 10 : 0,
+        },
+        balanceSheet: {
+          assetItems,
+          liabilityItems,
+          equityItems,
+          totalAssets,
+          totalLiabilities,
+          totalEquity,
+          netIncome,
+          totalLiabilitiesAndEquity,
+          isBalanced: Math.abs(totalAssets - totalLiabilitiesAndEquity) < 0.02,
+        },
+      },
+    });
   });
 
   router.post('/sepa-batches', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
@@ -2175,7 +2553,16 @@ ${txBlocks}
   });
 
   router.post('/accounting/journal', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
-    const { entryDate, journalCode = 'GEN', description, debitAccountCode, creditAccountCode, amount, sourceRef = '' } = req.body ?? {};
+    const {
+      entryDate,
+      journalCode = 'GEN',
+      description,
+      debitAccountCode,
+      creditAccountCode,
+      amount,
+      sourceRef = '',
+      projectId = null,
+    } = req.body ?? {};
     const amt = Number(amount);
     if (!String(description ?? '').trim() || !debitAccountCode || !creditAccountCode || !Number.isFinite(amt) || amt <= 0) {
       res.status(400).json({ error: 'Description, debit/credit accounts, and positive amount are required.' });
@@ -2185,27 +2572,35 @@ ${txBlocks}
       res.status(400).json({ error: 'Debit and credit accounts must be distinct for balanced double-entry.' });
       return;
     }
+    const cleanDate = String(entryDate || new Date().toISOString().slice(0, 10));
+    const closedPeriod = await getClosedPeriodForDate(cleanDate);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Fiscal period ${closedPeriod.code} (${closedPeriod.name}) is closed for ${cleanDate}.` });
+      return;
+    }
+    const cleanProjId = projectId !== null && projectId !== '' && Number(projectId) > 0 ? Number(projectId) : null;
     const ref = (await seqRef('journal_entries', 'JRN'));
     (await db.exec('BEGIN'));
     try {
       const info = (await db
         .prepare(
-          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, project_id, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           ref,
-          String(entryDate || new Date().toISOString().slice(0, 10)),
+          cleanDate,
           String(journalCode).trim().toUpperCase() || 'GEN',
           String(description).trim(),
           String(debitAccountCode),
           String(creditAccountCode),
           amt,
           String(sourceRef).trim(),
+          cleanProjId,
           req.authUser!.email
         ));
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance + ? WHERE code = ?').run(amt, String(debitAccountCode)));
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance - ? WHERE code = ?').run(amt, String(creditAccountCode)));
+      await applyAccountPosting(String(debitAccountCode), 'debit', amt);
+      await applyAccountPosting(String(creditAccountCode), 'credit', amt);
       (await db.exec('COMMIT'));
       (await writeAuditLog(db, {
         userId: req.authUser!.id,
@@ -2236,13 +2631,25 @@ ${txBlocks}
           credit_account_code: string;
           amount: number;
           source_ref: string;
+          project_id: number | null;
         }
       | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Journal entry not found.' });
       return;
     }
-    const { entryDate, journalCode, description, debitAccountCode, creditAccountCode, amount, sourceRef } = req.body ?? {};
+    const existingLocked = await getClosedPeriodForDate(existing.entry_date);
+    if (existingLocked) {
+      res.status(409).json({ error: `Cannot modify entry inside closed period ${existingLocked.code}. Use Reversal instead.` });
+      return;
+    }
+    const { entryDate, journalCode, description, debitAccountCode, creditAccountCode, amount, sourceRef, projectId } = req.body ?? {};
+    const nextDate = entryDate ? String(entryDate) : existing.entry_date;
+    const nextLocked = await getClosedPeriodForDate(nextDate);
+    if (nextLocked) {
+      res.status(409).json({ error: `Target date falls inside closed fiscal period ${nextLocked.code}.` });
+      return;
+    }
     const nextDebit = debitAccountCode ? String(debitAccountCode) : existing.debit_account_code;
     const nextCredit = creditAccountCode ? String(creditAccountCode) : existing.credit_account_code;
     const nextAmt = amount !== undefined ? Number(amount) : existing.amount;
@@ -2250,11 +2657,16 @@ ${txBlocks}
       res.status(400).json({ error: 'Distinct debit/credit accounts and positive amount are required.' });
       return;
     }
+    const nextProjId =
+      projectId === undefined
+        ? existing.project_id
+        : projectId === null || projectId === '' || Number(projectId) <= 0
+          ? null
+          : Number(projectId);
     (await db.exec('BEGIN'));
     try {
-      // Reverse previous GL impact, then apply updated GL impact
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance - ? WHERE code = ?').run(existing.amount, existing.debit_account_code));
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance + ? WHERE code = ?').run(existing.amount, existing.credit_account_code));
+      await applyAccountPosting(existing.debit_account_code, 'credit', existing.amount);
+      await applyAccountPosting(existing.credit_account_code, 'debit', existing.amount);
       (await db.prepare(
         `UPDATE journal_entries
          SET entry_date = ?,
@@ -2263,20 +2675,22 @@ ${txBlocks}
              debit_account_code = ?,
              credit_account_code = ?,
              amount = ?,
-             source_ref = ?
+             source_ref = ?,
+             project_id = ?
          WHERE id = ?`
       ).run(
-        entryDate ? String(entryDate) : existing.entry_date,
+        nextDate,
         journalCode ? String(journalCode).trim().toUpperCase() : existing.journal_code,
         description ? String(description).trim() : existing.description,
         nextDebit,
         nextCredit,
         nextAmt,
         sourceRef !== undefined ? String(sourceRef).trim() : existing.source_ref,
+        nextProjId,
         id
       ));
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance + ? WHERE code = ?').run(nextAmt, nextDebit));
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance - ? WHERE code = ?').run(nextAmt, nextCredit));
+      await applyAccountPosting(nextDebit, 'debit', nextAmt);
+      await applyAccountPosting(nextCredit, 'credit', nextAmt);
       (await db.exec('COMMIT'));
       (await writeAuditLog(db, {
         userId: req.authUser!.id,
@@ -2294,19 +2708,88 @@ ${txBlocks}
     }
   });
 
-  router.delete('/accounting/journal/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+  router.post('/accounting/journal/:id/reverse', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
     const id = Number(req.params.id);
     const existing = (await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(id)) as
-      | { id: number; ref: string; debit_account_code: string; credit_account_code: string; amount: number }
+      | {
+          id: number;
+          ref: string;
+          journal_code: string;
+          description: string;
+          debit_account_code: string;
+          credit_account_code: string;
+          amount: number;
+          project_id: number | null;
+        }
       | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Journal entry not found.' });
       return;
     }
+    const revDate = String(req.body?.entryDate || new Date().toISOString().slice(0, 10));
+    const closedPeriod = await getClosedPeriodForDate(revDate);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Reversal date falls inside closed fiscal period ${closedPeriod.code}. Choose an open period date.` });
+      return;
+    }
+    const revRef = await seqRef('journal_entries', 'REV');
     (await db.exec('BEGIN'));
     try {
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance - ? WHERE code = ?').run(existing.amount, existing.debit_account_code));
-      (await db.prepare('UPDATE accounting_accounts SET balance = balance + ? WHERE code = ?').run(existing.amount, existing.credit_account_code));
+      const info = await db
+        .prepare(
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, project_id, is_reversal, reversed_entry_ref, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+        )
+        .run(
+          revRef,
+          revDate,
+          existing.journal_code,
+          `Reversal of ${existing.ref}: ${existing.description}`,
+          existing.credit_account_code,
+          existing.debit_account_code,
+          existing.amount,
+          existing.ref,
+          existing.project_id ?? null,
+          existing.ref,
+          req.authUser!.email
+        );
+      await applyAccountPosting(existing.credit_account_code, 'debit', existing.amount);
+      await applyAccountPosting(existing.debit_account_code, 'credit', existing.amount);
+      (await db.exec('COMMIT'));
+      (await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'REVERSE_JOURNAL_ENTRY',
+        module: 'billing',
+        entityRef: revRef,
+        details: `Posted reversal ${revRef} offsetting ${existing.ref} ($${existing.amount.toFixed(2)})`,
+        ipAddress: getClientIp(req),
+      }));
+      res.status(201).json(await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(info.lastInsertRowid));
+    } catch (err) {
+      (await db.exec('ROLLBACK'));
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to reverse journal entry.' });
+    }
+  });
+
+  router.delete('/accounting/journal/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(id)) as
+      | { id: number; ref: string; entry_date: string; debit_account_code: string; credit_account_code: string; amount: number }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Journal entry not found.' });
+      return;
+    }
+    const closedPeriod = await getClosedPeriodForDate(existing.entry_date);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Cannot delete entry inside closed fiscal period ${closedPeriod.code}. Post a reversal instead.` });
+      return;
+    }
+    (await db.exec('BEGIN'));
+    try {
+      await applyAccountPosting(existing.debit_account_code, 'credit', existing.amount);
+      await applyAccountPosting(existing.credit_account_code, 'debit', existing.amount);
       (await db.prepare('DELETE FROM journal_entries WHERE id = ?').run(id));
       (await db.exec('COMMIT'));
       (await writeAuditLog(db, {
@@ -2324,6 +2807,944 @@ ${txBlocks}
       (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to delete journal entry.' });
     }
+  });
+
+  router.get('/accounting/export', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
+    const accounts = (await db.prepare('SELECT * FROM accounting_accounts WHERE is_active = 1 ORDER BY code ASC').all()) as Array<{
+      code: string;
+      label: string;
+      account_class: string;
+      balance: number;
+    }>;
+    const headers = ['Account Code', 'Account Label', 'Class', 'Debit Balance', 'Credit Balance', 'Signed Balance'];
+    const lines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...accounts.map((a) => {
+        const isDebitNormal = a.account_class === 'asset' || a.account_class === 'expense';
+        const debit = isDebitNormal ? (a.balance >= 0 ? a.balance : 0) : a.balance < 0 ? Math.abs(a.balance) : 0;
+        const credit = !isDebitNormal ? (a.balance >= 0 ? a.balance : 0) : a.balance < 0 ? Math.abs(a.balance) : 0;
+        return [a.code, a.label, a.account_class, debit.toFixed(2), credit.toFixed(2), a.balance.toFixed(2)]
+          .map(sanitizeCsvCell)
+          .join(',');
+      }),
+    ];
+    res.json({
+      count: accounts.length,
+      filename: `kscat-trial-balance-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
+  });
+
+  // Fiscal Periods
+  router.post('/accounting/fiscal-periods', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const { code, name, startDate, endDate } = req.body ?? {};
+    const cleanCode = String(code ?? '').trim().toUpperCase();
+    const cleanName = String(name ?? '').trim();
+    if (!cleanCode || !cleanName || !startDate || !endDate) {
+      res.status(400).json({ error: 'Period code, name, start date, and end date are required.' });
+      return;
+    }
+    if (String(endDate) < String(startDate)) {
+      res.status(400).json({ error: 'End date must be on or after start date.' });
+      return;
+    }
+    try {
+      const info = await db
+        .prepare(`INSERT INTO fiscal_periods (code, name, start_date, end_date, status) VALUES (?, ?, ?, ?, 'open')`)
+        .run(cleanCode, cleanName, String(startDate), String(endDate));
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'CREATE_FISCAL_PERIOD',
+        module: 'billing',
+        entityRef: cleanCode,
+        details: `Created fiscal period ${cleanCode} (${startDate} to ${endDate})`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json(await db.prepare('SELECT * FROM fiscal_periods WHERE id = ?').get(info.lastInsertRowid));
+    } catch {
+      res.status(400).json({ error: 'Fiscal period code already exists.' });
+    }
+  });
+
+  router.put('/accounting/fiscal-periods/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT code FROM fiscal_periods WHERE id = ?').get(id)) as { code: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fiscal period not found.' });
+      return;
+    }
+    const { name, startDate, endDate, status } = req.body ?? {};
+    const nextStatus = status === 'open' || status === 'closed' ? status : null;
+    await db
+      .prepare(
+        `UPDATE fiscal_periods
+         SET name = COALESCE(?, name),
+             start_date = COALESCE(?, start_date),
+             end_date = COALESCE(?, end_date),
+             status = COALESCE(?, status),
+             closed_by = CASE WHEN ? = 'closed' THEN ? WHEN ? = 'open' THEN '' ELSE closed_by END,
+             closed_at = CASE WHEN ? = 'closed' THEN ? WHEN ? = 'open' THEN '' ELSE closed_at END
+         WHERE id = ?`
+      )
+      .run(
+        name ? String(name).trim() : null,
+        startDate ? String(startDate) : null,
+        endDate ? String(endDate) : null,
+        nextStatus,
+        nextStatus,
+        req.authUser!.email,
+        nextStatus,
+        nextStatus,
+        new Date().toISOString(),
+        nextStatus,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_FISCAL_PERIOD',
+      module: 'billing',
+      entityRef: existing.code,
+      details: `Updated fiscal period ${existing.code}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM fiscal_periods WHERE id = ?').get(id));
+  });
+
+  router.post('/accounting/fiscal-periods/:id/toggle', authenticate, requirePermission('billing', 'validate'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM fiscal_periods WHERE id = ?').get(id)) as
+      | { id: number; code: string; status: 'open' | 'closed' }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fiscal period not found.' });
+      return;
+    }
+    const nextStatus = existing.status === 'open' ? 'closed' : 'open';
+    await db
+      .prepare(`UPDATE fiscal_periods SET status = ?, closed_by = ?, closed_at = ? WHERE id = ?`)
+      .run(nextStatus, nextStatus === 'closed' ? req.authUser!.email : '', nextStatus === 'closed' ? new Date().toISOString() : '', id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: nextStatus === 'closed' ? 'CLOSE_FISCAL_PERIOD' : 'REOPEN_FISCAL_PERIOD',
+      module: 'billing',
+      entityRef: existing.code,
+      details: `${nextStatus === 'closed' ? 'Closed' : 'Reopened'} fiscal period ${existing.code}`,
+      ipAddress: getClientIp(req),
+      severity: nextStatus === 'closed' ? 'info' : 'warning',
+    });
+    res.json(await db.prepare('SELECT * FROM fiscal_periods WHERE id = ?').get(id));
+  });
+
+  router.delete('/accounting/fiscal-periods/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT code, status FROM fiscal_periods WHERE id = ?').get(id)) as
+      | { code: string; status: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fiscal period not found.' });
+      return;
+    }
+    if (existing.status === 'closed') {
+      res.status(409).json({ error: 'Reopen the closed fiscal period before deleting it.' });
+      return;
+    }
+    await db.prepare('DELETE FROM fiscal_periods WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_FISCAL_PERIOD',
+      module: 'billing',
+      entityRef: existing.code,
+      details: `Deleted fiscal period ${existing.code}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  // Currencies & FX Rates
+  router.post('/finance/currencies', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const { code, name, symbol = '$', exchangeRate = 1, isBase = false } = req.body ?? {};
+    const cleanCode = String(code ?? '').trim().toUpperCase().slice(0, 8);
+    const cleanName = String(name ?? '').trim();
+    const rate = isBase ? 1 : Number(exchangeRate);
+    if (!cleanCode || !cleanName || !Number.isFinite(rate) || rate <= 0) {
+      res.status(400).json({ error: 'Currency code, name, and positive exchange rate are required.' });
+      return;
+    }
+    await db.exec('BEGIN');
+    try {
+      if (isBase) {
+        await db.prepare('UPDATE currencies SET is_base = 0').run();
+      }
+      const info = await db
+        .prepare(`INSERT INTO currencies (code, name, symbol, exchange_rate, is_base) VALUES (?, ?, ?, ?, ?)`)
+        .run(cleanCode, cleanName, String(symbol || '$').trim().slice(0, 4), rate, isBase ? 1 : 0);
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'CREATE_CURRENCY',
+        module: 'billing',
+        entityRef: cleanCode,
+        details: `Added currency ${cleanCode} (${cleanName}) @ ${rate}`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json(await db.prepare('SELECT * FROM currencies WHERE id = ?').get(info.lastInsertRowid));
+    } catch {
+      await db.exec('ROLLBACK');
+      res.status(400).json({ error: 'Currency code already exists.' });
+    }
+  });
+
+  router.put('/finance/currencies/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM currencies WHERE id = ?').get(id)) as
+      | { id: number; code: string; is_base: number }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Currency not found.' });
+      return;
+    }
+    const { name, symbol, exchangeRate, isBase } = req.body ?? {};
+    const nextIsBase = isBase !== undefined ? (isBase ? 1 : 0) : existing.is_base;
+    const rate = nextIsBase ? 1 : exchangeRate !== undefined ? Number(exchangeRate) : null;
+    if (rate !== null && (!Number.isFinite(rate) || rate <= 0)) {
+      res.status(400).json({ error: 'Exchange rate must be positive.' });
+      return;
+    }
+    await db.exec('BEGIN');
+    try {
+      if (isBase) {
+        await db.prepare('UPDATE currencies SET is_base = 0').run();
+      }
+      await db
+        .prepare(
+          `UPDATE currencies
+           SET name = COALESCE(?, name),
+               symbol = COALESCE(?, symbol),
+               exchange_rate = COALESCE(?, exchange_rate),
+               is_base = ?,
+               updated_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(
+          name ? String(name).trim() : null,
+          symbol ? String(symbol).trim().slice(0, 4) : null,
+          rate,
+          nextIsBase,
+          id
+        );
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'UPDATE_CURRENCY',
+        module: 'billing',
+        entityRef: existing.code,
+        details: `Updated currency ${existing.code}`,
+        ipAddress: getClientIp(req),
+      });
+      res.json(await db.prepare('SELECT * FROM currencies WHERE id = ?').get(id));
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to update currency.' });
+    }
+  });
+
+  router.delete('/finance/currencies/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT code, is_base FROM currencies WHERE id = ?').get(id)) as
+      | { code: string; is_base: number }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Currency not found.' });
+      return;
+    }
+    if (existing.is_base) {
+      res.status(409).json({ error: 'Cannot delete the active base currency. Assign another base currency first.' });
+      return;
+    }
+    await db.prepare('DELETE FROM currencies WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_CURRENCY',
+      module: 'billing',
+      entityRef: existing.code,
+      details: `Deleted currency ${existing.code}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  // Tax Rates & Codes
+  router.post('/finance/tax-rates', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const { code, name, rate = 0, taxType = 'both', appliesTo = 'Standard Goods & Services', isActive = true, notes = '' } = req.body ?? {};
+    const cleanCode = String(code ?? '').trim().toUpperCase();
+    const cleanName = String(name ?? '').trim();
+    const numRate = Number(rate);
+    if (!cleanCode || !cleanName || !Number.isFinite(numRate) || numRate < 0 || numRate > 100) {
+      res.status(400).json({ error: 'Tax code, name, and rate (0-100%) are required.' });
+      return;
+    }
+    try {
+      const info = await db
+        .prepare(
+          `INSERT INTO tax_rates (code, name, rate, tax_type, applies_to, is_active, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          cleanCode,
+          cleanName,
+          numRate,
+          ['sales', 'purchase', 'both'].includes(taxType) ? taxType : 'both',
+          String(appliesTo).trim() || 'Standard Goods & Services',
+          isActive ? 1 : 0,
+          String(notes).trim()
+        );
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'CREATE_TAX_RATE',
+        module: 'billing',
+        entityRef: cleanCode,
+        details: `Created tax rate ${cleanCode} (${numRate}%)`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json(await db.prepare('SELECT * FROM tax_rates WHERE id = ?').get(info.lastInsertRowid));
+    } catch {
+      res.status(400).json({ error: 'Tax code already exists.' });
+    }
+  });
+
+  router.put('/finance/tax-rates/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT code FROM tax_rates WHERE id = ?').get(id)) as { code: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Tax code not found.' });
+      return;
+    }
+    const { name, rate, taxType, appliesTo, isActive, notes } = req.body ?? {};
+    const nextRate = rate !== undefined ? Number(rate) : null;
+    if (nextRate !== null && (!Number.isFinite(nextRate) || nextRate < 0 || nextRate > 100)) {
+      res.status(400).json({ error: 'Tax rate must be between 0 and 100%.' });
+      return;
+    }
+    await db
+      .prepare(
+        `UPDATE tax_rates
+         SET name = COALESCE(?, name),
+             rate = COALESCE(?, rate),
+             tax_type = COALESCE(?, tax_type),
+             applies_to = COALESCE(?, applies_to),
+             is_active = COALESCE(?, is_active),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        name ? String(name).trim() : null,
+        nextRate,
+        ['sales', 'purchase', 'both'].includes(taxType) ? taxType : null,
+        appliesTo !== undefined ? String(appliesTo).trim() : null,
+        isActive !== undefined ? (isActive ? 1 : 0) : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_TAX_RATE',
+      module: 'billing',
+      entityRef: existing.code,
+      details: `Updated tax rate ${existing.code}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM tax_rates WHERE id = ?').get(id));
+  });
+
+  router.delete('/finance/tax-rates/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT code FROM tax_rates WHERE id = ?').get(id)) as { code: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Tax code not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM tax_rates WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_TAX_RATE',
+      module: 'billing',
+      entityRef: existing.code,
+      details: `Deleted tax rate ${existing.code}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  router.get('/finance/tax-rates/export', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
+    const rows = (await db.prepare('SELECT * FROM tax_rates ORDER BY rate DESC, code ASC').all()) as Array<{
+      code: string;
+      name: string;
+      rate: number;
+      tax_type: string;
+      applies_to: string;
+      is_active: number;
+      notes: string;
+    }>;
+    const headers = ['Code', 'Name', 'Rate %', 'Scope', 'Applies To', 'Active', 'Notes'];
+    const lines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...rows.map((r) =>
+        [r.code, r.name, r.rate.toFixed(2), r.tax_type, r.applies_to, r.is_active ? 'Active' : 'Inactive', r.notes]
+          .map(sanitizeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: rows.length,
+      filename: `kscat-tax-schedule-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
+  });
+
+  // Project Budget Allocations & Cost Codes
+  router.post('/finance/project-budgets', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      projectId,
+      costCode = 'GEN-01',
+      category = 'Services & Labor',
+      description = '',
+      plannedBudget = 0,
+      committedAmount = 0,
+      hourlyCostRate = 65,
+      hourlyBillRate = 145,
+    } = req.body ?? {};
+    if (!projectId) {
+      res.status(400).json({ error: 'Project is required.' });
+      return;
+    }
+    const info = await db
+      .prepare(
+        `INSERT INTO project_budgets (project_id, cost_code, category, description, planned_budget, committed_amount, hourly_cost_rate, hourly_bill_rate)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        Number(projectId),
+        String(costCode).trim().toUpperCase() || 'GEN-01',
+        String(category).trim() || 'Services & Labor',
+        String(description).trim(),
+        Math.max(0, Number(plannedBudget) || 0),
+        Math.max(0, Number(committedAmount) || 0),
+        Math.max(0, Number(hourlyCostRate) || 0),
+        Math.max(0, Number(hourlyBillRate) || 0)
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_PROJECT_BUDGET',
+      module: 'billing',
+      entityRef: String(costCode).trim().toUpperCase(),
+      details: `Allocated $${Number(plannedBudget || 0).toFixed(2)} budget (${costCode}) on project #${projectId}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM project_budgets WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/finance/project-budgets/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT cost_code FROM project_budgets WHERE id = ?').get(id)) as
+      | { cost_code: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Budget line not found.' });
+      return;
+    }
+    const { projectId, costCode, category, description, plannedBudget, committedAmount, hourlyCostRate, hourlyBillRate } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE project_budgets
+         SET project_id = COALESCE(?, project_id),
+             cost_code = COALESCE(?, cost_code),
+             category = COALESCE(?, category),
+             description = COALESCE(?, description),
+             planned_budget = COALESCE(?, planned_budget),
+             committed_amount = COALESCE(?, committed_amount),
+             hourly_cost_rate = COALESCE(?, hourly_cost_rate),
+             hourly_bill_rate = COALESCE(?, hourly_bill_rate)
+         WHERE id = ?`
+      )
+      .run(
+        projectId !== undefined ? Number(projectId) : null,
+        costCode ? String(costCode).trim().toUpperCase() : null,
+        category ? String(category).trim() : null,
+        description !== undefined ? String(description).trim() : null,
+        plannedBudget !== undefined ? Math.max(0, Number(plannedBudget)) : null,
+        committedAmount !== undefined ? Math.max(0, Number(committedAmount)) : null,
+        hourlyCostRate !== undefined ? Math.max(0, Number(hourlyCostRate)) : null,
+        hourlyBillRate !== undefined ? Math.max(0, Number(hourlyBillRate)) : null,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_PROJECT_BUDGET',
+      module: 'billing',
+      entityRef: existing.cost_code,
+      details: `Updated project budget allocation #${id}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM project_budgets WHERE id = ?').get(id));
+  });
+
+  router.delete('/finance/project-budgets/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT cost_code FROM project_budgets WHERE id = ?').get(id)) as
+      | { cost_code: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Budget line not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM project_budgets WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_PROJECT_BUDGET',
+      module: 'billing',
+      entityRef: existing.cost_code,
+      details: `Deleted project budget line ${existing.cost_code}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  // Fixed Assets & Automated Depreciation
+  router.post('/finance/fixed-assets', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      name,
+      category = 'Machinery & Equipment',
+      acquisitionDate,
+      purchaseCost,
+      salvageValue = 0,
+      usefulLifeMonths = 60,
+      depreciationMethod = 'straight_line',
+      accumulatedDepreciation = 0,
+      location = 'Chicago HQ',
+      notes = '',
+    } = req.body ?? {};
+    const cost = Number(purchaseCost);
+    if (!String(name ?? '').trim() || !Number.isFinite(cost) || cost <= 0) {
+      res.status(400).json({ error: 'Asset name and positive purchase cost are required.' });
+      return;
+    }
+    const ref = await seqRef('fixed_assets', 'FA');
+    const salvage = Math.max(0, Math.min(cost, Number(salvageValue) || 0));
+    const accum = Math.max(0, Math.min(cost - salvage, Number(accumulatedDepreciation) || 0));
+    const status = accum >= cost - salvage - 0.01 ? 'fully_depreciated' : 'active';
+    const info = await db
+      .prepare(
+        `INSERT INTO fixed_assets (ref, name, category, acquisition_date, purchase_cost, salvage_value, useful_life_months, depreciation_method, accumulated_depreciation, location, status, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        String(name).trim(),
+        String(category).trim() || 'Machinery & Equipment',
+        String(acquisitionDate || new Date().toISOString().slice(0, 10)),
+        cost,
+        salvage,
+        Math.max(1, Number(usefulLifeMonths) || 60),
+        depreciationMethod === 'declining_balance' ? 'declining_balance' : 'straight_line',
+        accum,
+        String(location).trim() || 'Chicago HQ',
+        status,
+        String(notes).trim()
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_FIXED_ASSET',
+      module: 'billing',
+      entityRef: ref,
+      details: `Registered fixed asset ${name} ($${cost.toFixed(2)})`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM fixed_assets WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/finance/fixed-assets/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM fixed_assets WHERE id = ?').get(id)) as
+      | { ref: string; purchase_cost: number; salvage_value: number; accumulated_depreciation: number }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fixed asset not found.' });
+      return;
+    }
+    const { name, category, acquisitionDate, purchaseCost, salvageValue, usefulLifeMonths, depreciationMethod, location, status, notes } =
+      req.body ?? {};
+    const nextCost = purchaseCost !== undefined ? Math.max(1, Number(purchaseCost)) : existing.purchase_cost;
+    const nextSalvage = salvageValue !== undefined ? Math.max(0, Math.min(nextCost, Number(salvageValue))) : existing.salvage_value;
+    await db
+      .prepare(
+        `UPDATE fixed_assets
+         SET name = COALESCE(?, name),
+             category = COALESCE(?, category),
+             acquisition_date = COALESCE(?, acquisition_date),
+             purchase_cost = ?,
+             salvage_value = ?,
+             useful_life_months = COALESCE(?, useful_life_months),
+             depreciation_method = COALESCE(?, depreciation_method),
+             location = COALESCE(?, location),
+             status = COALESCE(?, status),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        name ? String(name).trim() : null,
+        category ? String(category).trim() : null,
+        acquisitionDate ? String(acquisitionDate) : null,
+        nextCost,
+        nextSalvage,
+        usefulLifeMonths !== undefined ? Math.max(1, Number(usefulLifeMonths)) : null,
+        ['straight_line', 'declining_balance'].includes(depreciationMethod) ? depreciationMethod : null,
+        location !== undefined ? String(location).trim() : null,
+        ['active', 'fully_depreciated', 'disposed'].includes(status) ? status : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_FIXED_ASSET',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Updated fixed asset ${existing.ref}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM fixed_assets WHERE id = ?').get(id));
+  });
+
+  router.post('/finance/fixed-assets/:id/depreciate', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const asset = (await db.prepare('SELECT * FROM fixed_assets WHERE id = ?').get(id)) as
+      | {
+          id: number;
+          ref: string;
+          name: string;
+          purchase_cost: number;
+          salvage_value: number;
+          useful_life_months: number;
+          depreciation_method: 'straight_line' | 'declining_balance';
+          accumulated_depreciation: number;
+          status: string;
+        }
+      | undefined;
+    if (!asset) {
+      res.status(404).json({ error: 'Fixed asset not found.' });
+      return;
+    }
+    if (asset.status !== 'active') {
+      res.status(400).json({ error: 'Only active assets can record monthly depreciation.' });
+      return;
+    }
+    const postDate = String(req.body?.postDate || new Date().toISOString().slice(0, 10));
+    const closedPeriod = await getClosedPeriodForDate(postDate);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Cannot post depreciation into closed fiscal period ${closedPeriod.code}.` });
+      return;
+    }
+    const remainingDepreciable = Math.max(0, asset.purchase_cost - asset.salvage_value - asset.accumulated_depreciation);
+    if (remainingDepreciable <= 0.01) {
+      await db.prepare(`UPDATE fixed_assets SET status = 'fully_depreciated' WHERE id = ?`).run(id);
+      res.status(400).json({ error: 'Asset is already fully depreciated down to salvage value.' });
+      return;
+    }
+    const life = Math.max(1, asset.useful_life_months);
+    const rawMonthly =
+      asset.depreciation_method === 'declining_balance'
+        ? remainingDepreciable * (2 / life)
+        : (asset.purchase_cost - asset.salvage_value) / life;
+    const charge = Math.min(remainingDepreciable, Math.max(0.01, Math.round(rawMonthly * 100) / 100));
+    const nextAccum = Math.round((asset.accumulated_depreciation + charge) * 100) / 100;
+    const nextStatus = asset.purchase_cost - asset.salvage_value - nextAccum <= 0.01 ? 'fully_depreciated' : 'active';
+    const jrnRef = await seqRef('journal_entries', 'DEP');
+
+    await db.exec('BEGIN');
+    try {
+      await db
+        .prepare(`UPDATE fixed_assets SET accumulated_depreciation = ?, last_depreciation_date = ?, status = ? WHERE id = ?`)
+        .run(nextAccum, postDate, nextStatus, id);
+      await db
+        .prepare(
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, created_by)
+           VALUES (?, ?, 'DEP', ?, '6300', '1290', ?, ?, ?)`
+        )
+        .run(jrnRef, postDate, `Monthly Depreciation — ${asset.ref} (${asset.name})`, charge, asset.ref, req.authUser!.email);
+      await applyAccountPosting('6300', 'debit', charge);
+      await applyAccountPosting('1290', 'credit', charge);
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'DEPRECIATE_FIXED_ASSET',
+        module: 'billing',
+        entityRef: asset.ref,
+        details: `Posted $${charge.toFixed(2)} depreciation (${jrnRef}) on ${asset.ref}`,
+        ipAddress: getClientIp(req),
+      });
+      res.json({ asset: await db.prepare('SELECT * FROM fixed_assets WHERE id = ?').get(id), journalRef: jrnRef, charge });
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to post depreciation.' });
+    }
+  });
+
+  router.delete('/finance/fixed-assets/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref, name FROM fixed_assets WHERE id = ?').get(id)) as
+      | { ref: string; name: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fixed asset not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM fixed_assets WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_FIXED_ASSET',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Deleted fixed asset ${existing.ref} (${existing.name})`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  // Recurring Invoice Templates
+  router.post('/finance/recurring-invoices', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      invoiceType = 'customer',
+      thirdPartyId,
+      projectId = null,
+      title,
+      frequency = 'monthly',
+      nextRunDate,
+      currency = 'USD',
+      lines,
+      notes = '',
+    } = req.body ?? {};
+    if (!thirdPartyId || !String(title ?? '').trim()) {
+      res.status(400).json({ error: 'Third party and schedule title are required.' });
+      return;
+    }
+    const totals = computeFinanceLinesTotals(lines);
+    if (totals.sanitized.length === 0) {
+      res.status(400).json({ error: 'At least one billing line item is required.' });
+      return;
+    }
+    const ref = await seqRef('recurring_invoices', 'REC');
+    const cleanType = invoiceType === 'supplier' ? 'supplier' : 'customer';
+    const cleanFreq = ['monthly', 'quarterly', 'annual'].includes(frequency) ? frequency : 'monthly';
+    const cleanProj = projectId !== null && projectId !== '' && Number(projectId) > 0 ? Number(projectId) : null;
+    const info = await db
+      .prepare(
+        `INSERT INTO recurring_invoices (ref, invoice_type, third_party_id, project_id, title, frequency, next_run_date, currency, lines_json, total_ttc, status, notes, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+      )
+      .run(
+        ref,
+        cleanType,
+        Number(thirdPartyId),
+        cleanProj,
+        String(title).trim(),
+        cleanFreq,
+        String(nextRunDate || new Date().toISOString().slice(0, 10)),
+        String(currency || 'USD').trim().toUpperCase().slice(0, 8),
+        JSON.stringify(totals.sanitized),
+        totals.totalTtc,
+        String(notes).trim(),
+        req.authUser!.email
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_RECURRING_INVOICE',
+      module: 'billing',
+      entityRef: ref,
+      details: `Created recurring ${cleanFreq} template ${ref}: ${title}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM recurring_invoices WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/finance/recurring-invoices/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM recurring_invoices WHERE id = ?').get(id)) as
+      | { id: number; ref: string; project_id: number | null }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Recurring template not found.' });
+      return;
+    }
+    const { invoiceType, thirdPartyId, projectId, title, frequency, nextRunDate, currency, lines, status, notes } = req.body ?? {};
+    const totals = Array.isArray(lines) && lines.length > 0 ? computeFinanceLinesTotals(lines) : null;
+    const nextProj =
+      projectId === undefined
+        ? existing.project_id
+        : projectId === null || projectId === '' || Number(projectId) <= 0
+          ? null
+          : Number(projectId);
+    await db
+      .prepare(
+        `UPDATE recurring_invoices
+         SET invoice_type = COALESCE(?, invoice_type),
+             third_party_id = COALESCE(?, third_party_id),
+             project_id = ?,
+             title = COALESCE(?, title),
+             frequency = COALESCE(?, frequency),
+             next_run_date = COALESCE(?, next_run_date),
+             currency = COALESCE(?, currency),
+             lines_json = COALESCE(?, lines_json),
+             total_ttc = COALESCE(?, total_ttc),
+             status = COALESCE(?, status),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        invoiceType === 'supplier' || invoiceType === 'customer' ? invoiceType : null,
+        thirdPartyId !== undefined ? Number(thirdPartyId) : null,
+        nextProj,
+        title ? String(title).trim() : null,
+        ['monthly', 'quarterly', 'annual'].includes(frequency) ? frequency : null,
+        nextRunDate ? String(nextRunDate) : null,
+        currency ? String(currency).trim().toUpperCase().slice(0, 8) : null,
+        totals ? JSON.stringify(totals.sanitized) : null,
+        totals ? totals.totalTtc : null,
+        ['active', 'paused', 'ended'].includes(status) ? status : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_RECURRING_INVOICE',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Updated recurring template ${existing.ref}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM recurring_invoices WHERE id = ?').get(id));
+  });
+
+  router.post('/finance/recurring-invoices/:id/generate', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const tpl = (await db.prepare('SELECT * FROM recurring_invoices WHERE id = ?').get(id)) as
+      | {
+          id: number;
+          ref: string;
+          invoice_type: 'customer' | 'supplier';
+          third_party_id: number;
+          project_id: number | null;
+          title: string;
+          frequency: 'monthly' | 'quarterly' | 'annual';
+          next_run_date: string;
+          currency: string;
+          lines_json: string;
+          notes: string;
+        }
+      | undefined;
+    if (!tpl) {
+      res.status(404).json({ error: 'Recurring template not found.' });
+      return;
+    }
+    const parsedLines = JSON.parse(tpl.lines_json || '[]');
+    const totals = computeFinanceLinesTotals(parsedLines);
+    const currRow = (await db.prepare('SELECT exchange_rate FROM currencies WHERE code = ?').get(tpl.currency)) as
+      | { exchange_rate: number }
+      | undefined;
+    const fxRate = currRow?.exchange_rate && currRow.exchange_rate > 0 ? currRow.exchange_rate : 1;
+    const prefix = tpl.invoice_type === 'supplier' ? 'SI' : 'IN';
+    const invRef = await nextSequenceRef('invoices', prefix);
+    const issueDate = new Date().toISOString().slice(0, 10);
+    const dueDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+    const nextRun = advanceRecurringDate(tpl.next_run_date || issueDate, tpl.frequency);
+
+    await db.exec('BEGIN');
+    try {
+      const info = await db
+        .prepare(
+          `INSERT INTO invoices (ref, invoice_type, invoice_kind, third_party_id, project_id, currency, exchange_rate, source_ref, issue_date, due_date, status, lines_json, subtotal_ht, tax_total, total_ttc, amount_paid, notes, created_by)
+           VALUES (?, ?, 'standard', ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, 0, ?, ?)`
+        )
+        .run(
+          invRef,
+          tpl.invoice_type,
+          tpl.third_party_id,
+          tpl.project_id ?? null,
+          tpl.currency || 'USD',
+          fxRate,
+          tpl.ref,
+          issueDate,
+          dueDate,
+          JSON.stringify(totals.sanitized),
+          totals.subtotalHt,
+          totals.taxTotal,
+          totals.totalTtc,
+          `${tpl.title}${tpl.notes ? ` — ${tpl.notes}` : ''}`,
+          req.authUser!.email
+        );
+      await db
+        .prepare(`UPDATE recurring_invoices SET last_generated_ref = ?, next_run_date = ? WHERE id = ?`)
+        .run(invRef, nextRun, id);
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'GENERATE_RECURRING_INVOICE',
+        module: 'billing',
+        entityRef: invRef,
+        details: `Generated ${invRef} from recurring template ${tpl.ref} (next run ${nextRun})`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json({ invoice: await db.prepare('SELECT * FROM invoices WHERE id = ?').get(info.lastInsertRowid), nextRunDate: nextRun });
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to generate invoice.' });
+    }
+  });
+
+  router.delete('/finance/recurring-invoices/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref, title FROM recurring_invoices WHERE id = ?').get(id)) as
+      | { ref: string; title: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Recurring template not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM recurring_invoices WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_RECURRING_INVOICE',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Deleted recurring template ${existing.ref} (${existing.title})`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
   });
 
   router.post('/donations', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
@@ -3127,10 +4548,85 @@ END:VEVENT`
   });
 
   // ========================
-  // HR MANAGEMENT
+  // HR MANAGEMENT & HRIS + KPI EVALUATION
   // ========================
+  function normalizeLeaveType(val: unknown): string | null {
+    const raw = String(val ?? '').trim();
+    if (raw === 'Paid Time Off' || raw === 'Sick Leave' || raw === 'Parental' || raw === 'Unpaid') return raw;
+    if (raw === 'Parental Leave') return 'Parental';
+    if (raw === 'Unpaid Leave') return 'Unpaid';
+    return null;
+  }
+
+  function computeClockHours(clockIn: string, clockOut: string): { regularHours: number; overtimeHours: number } {
+    const mIn = /^(\d{1,2}):(\d{2})$/.exec(clockIn.trim());
+    const mOut = /^(\d{1,2}):(\d{2})$/.exec(clockOut.trim());
+    if (!mIn || !mOut) return { regularHours: 8, overtimeHours: 0 };
+    const startMins = Number(mIn[1]) * 60 + Number(mIn[2]);
+    let endMins = Number(mOut[1]) * 60 + Number(mOut[2]);
+    if (endMins < startMins) endMins += 24 * 60;
+    const total = Math.max(0, Number(((endMins - startMins) / 60).toFixed(2)));
+    const regularHours = Math.min(8, total);
+    const overtimeHours = Math.max(0, Number((total - 8).toFixed(2)));
+    return { regularHours, overtimeHours };
+  }
+
+  function computeKpiSummary(rawMetrics: unknown): {
+    metricsJson: string;
+    overallScore: number;
+    ratingLabel: string;
+  } {
+    const arr = Array.isArray(rawMetrics) ? rawMetrics : [];
+    const cleaned = arr
+      .map((item, idx) => {
+        const obj = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+        const kpiName = String(obj.kpiName ?? '').trim();
+        if (!kpiName) return null;
+        const weightPct = Math.max(0, Math.min(100, Number(obj.weightPct) || 0));
+        const score = Math.max(0, Math.min(100, Number(obj.score) || 0));
+        return {
+          id: String(obj.id || `m${idx + 1}`),
+          kpiName,
+          category: String(obj.category || 'Operations').trim(),
+          weightPct,
+          targetValue: String(obj.targetValue ?? '').trim(),
+          actualValue: String(obj.actualValue ?? '').trim(),
+          unit: String(obj.unit ?? '%').trim(),
+          score,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+
+    let overallScore = 0;
+    if (cleaned.length > 0) {
+      const totalWeight = cleaned.reduce((acc, m) => acc + m.weightPct, 0);
+      if (totalWeight > 0) {
+        overallScore = Number(
+          (cleaned.reduce((acc, m) => acc + m.score * m.weightPct, 0) / totalWeight).toFixed(1)
+        );
+      } else {
+        overallScore = Number((cleaned.reduce((acc, m) => acc + m.score, 0) / cleaned.length).toFixed(1));
+      }
+    }
+
+    const ratingLabel =
+      overallScore >= 90
+        ? 'Exceeds Expectations'
+        : overallScore >= 75
+          ? 'Meets Expectations'
+          : overallScore >= 60
+            ? 'Developing'
+            : 'Needs Improvement';
+
+    return {
+      metricsJson: JSON.stringify(cleaned),
+      overallScore,
+      ratingLabel,
+    };
+  }
+
   router.get('/hr', authenticate, requirePermission('hr', 'read'), async (_req, res) => {
-    const employees = (await db.prepare('SELECT * FROM employees ORDER BY id ASC').all());
+    const employees = (await db.prepare('SELECT * FROM employees ORDER BY id ASC').all()) as Array<Record<string, unknown>>;
     const leaveRequests = (await db
       .prepare(
         `SELECT lr.*, e.full_name AS employee_name, e.department
@@ -3138,25 +4634,25 @@ END:VEVENT`
          JOIN employees e ON e.id = lr.employee_id
          ORDER BY lr.id DESC`
       )
-      .all());
-    const expenseReports = (await db
+      .all()) as Array<Record<string, unknown>>;
+    const expenseReports = await db
       .prepare(
         `SELECT er.*, e.full_name AS employee_name, e.department
          FROM expense_reports er
          JOIN employees e ON e.id = er.employee_id
          ORDER BY er.id DESC`
       )
-      .all());
-    const jobs = (await db.prepare('SELECT * FROM job_postings ORDER BY id DESC').all());
-    const candidates = (await db
+      .all();
+    const jobs = await db.prepare('SELECT * FROM job_postings ORDER BY id DESC').all();
+    const candidates = await db
       .prepare(
         `SELECT c.*, j.title AS job_title, j.ref AS job_ref
          FROM candidates c
          JOIN job_postings j ON j.id = c.job_id
          ORDER BY c.id DESC`
       )
-      .all());
-    const timesheets = (await db
+      .all();
+    const timesheets = await db
       .prepare(
         `SELECT ts.*, e.full_name AS employee_name, pr.ref AS project_ref, pr.title AS project_title
          FROM timesheets ts
@@ -3164,21 +4660,173 @@ END:VEVENT`
          LEFT JOIN projects pr ON pr.id = ts.project_id
          ORDER BY ts.work_date DESC, ts.id DESC`
       )
-      .all());
-    res.json({ employees, leaveRequests, expenseReports, jobs, candidates, timesheets });
+      .all();
+    const attendanceLogs = (await db
+      .prepare(
+        `SELECT al.*, e.full_name AS employee_name, e.department
+         FROM attendance_logs al
+         JOIN employees e ON e.id = al.employee_id
+         ORDER BY al.work_date DESC, al.id DESC`
+      )
+      .all()) as Array<Record<string, unknown>>;
+    const shiftSchedules = await db
+      .prepare(
+        `SELECT ss.*, e.full_name AS employee_name, e.department
+         FROM shift_schedules ss
+         JOIN employees e ON e.id = ss.employee_id
+         ORDER BY ss.id DESC`
+      )
+      .all();
+    const payrollRuns = (await db.prepare('SELECT * FROM payroll_runs ORDER BY pay_period DESC, id DESC').all()) as Array<
+      Record<string, unknown>
+    >;
+    const payslips = await db
+      .prepare(
+        `SELECT ps.*, e.full_name AS employee_name, e.ref AS employee_ref, e.department, e.job_title, e.tax_id, e.bank_account
+         FROM payslips ps
+         JOIN employees e ON e.id = ps.employee_id
+         ORDER BY ps.pay_period DESC, ps.id DESC`
+      )
+      .all();
+    const benefitPlans = await db.prepare('SELECT * FROM benefit_plans ORDER BY id ASC').all();
+    const benefitEnrollments = await db
+      .prepare(
+        `SELECT be.*, e.full_name AS employee_name, e.department, bp.name AS plan_name, bp.ref AS plan_ref,
+                bp.category AS plan_category, bp.employee_contribution, bp.employer_contribution
+         FROM benefit_enrollments be
+         JOIN employees e ON e.id = be.employee_id
+         JOIN benefit_plans bp ON bp.id = be.plan_id
+         ORDER BY be.id DESC`
+      )
+      .all();
+    const onboardingTasks = (await db
+      .prepare(
+        `SELECT ot.*, e.full_name AS employee_name, c.full_name AS candidate_name
+         FROM onboarding_tasks ot
+         LEFT JOIN employees e ON e.id = ot.employee_id
+         LEFT JOIN candidates c ON c.id = ot.candidate_id
+         ORDER BY ot.due_date ASC, ot.id DESC`
+      )
+      .all()) as Array<Record<string, unknown>>;
+    const kpiEvaluations = (await db
+      .prepare(
+        `SELECT ke.*, e.full_name AS employee_name, e.department, e.job_title
+         FROM kpi_evaluations ke
+         JOIN employees e ON e.id = ke.employee_id
+         ORDER BY ke.review_period DESC, ke.id DESC`
+      )
+      .all()) as Array<Record<string, unknown>>;
+    const complianceRecords = (await db
+      .prepare('SELECT * FROM hr_compliance_records ORDER BY due_date ASC, id DESC')
+      .all()) as Array<Record<string, unknown>>;
+
+    // Analytics & Compliance summary
+    const totalHeadcount = employees.length;
+    const activeHeadcount = employees.filter((e) => e.status === 'active').length;
+    const onLeaveCount = employees.filter((e) => e.status === 'on_leave').length;
+    const terminatedCount = employees.filter((e) => e.status === 'terminated').length;
+    const turnoverRatePct = totalHeadcount > 0 ? Number(((terminatedCount / totalHeadcount) * 100).toFixed(1)) : 0;
+    const totalAnnualPayroll = employees
+      .filter((e) => e.status !== 'terminated')
+      .reduce((acc, e) => acc + (Number(e.annual_salary) || 0), 0);
+    const monthlyPayrollEstimate = Number((totalAnnualPayroll / 12).toFixed(2));
+    const latestPayrollNet = payrollRuns[0] ? Number(payrollRuns[0].total_net) || 0 : 0;
+    const totalOvertimeHours = Number(
+      attendanceLogs.reduce((acc, a) => acc + (Number(a.overtime_hours) || 0), 0).toFixed(2)
+    );
+    const pendingLeaveCount = leaveRequests.filter((l) => l.status === 'pending').length;
+    const completedOnboarding = onboardingTasks.filter((t) => t.status === 'completed').length;
+    const onboardingCompletionPct =
+      onboardingTasks.length > 0 ? Math.round((completedOnboarding / onboardingTasks.length) * 100) : 100;
+    const avgKpiScore =
+      kpiEvaluations.length > 0
+        ? Number(
+            (
+              kpiEvaluations.reduce((acc, k) => acc + (Number(k.overall_score) || 0), 0) / kpiEvaluations.length
+            ).toFixed(1)
+          )
+        : 0;
+    const complianceRatePct =
+      complianceRecords.length > 0
+        ? Number(
+            (
+              complianceRecords.reduce((acc, c) => acc + (Number(c.compliance_rate) || 0), 0) /
+              complianceRecords.length
+            ).toFixed(1)
+          )
+        : 100;
+
+    const deptMap = new Map<string, { department: string; headcount: number; payroll: number }>();
+    for (const emp of employees) {
+      if (emp.status === 'terminated') continue;
+      const dept = String(emp.department || 'Operations');
+      const cur = deptMap.get(dept) ?? { department: dept, headcount: 0, payroll: 0 };
+      cur.headcount += 1;
+      cur.payroll += Number(emp.annual_salary) || 0;
+      deptMap.set(dept, cur);
+    }
+
+    res.json({
+      employees,
+      leaveRequests,
+      expenseReports,
+      jobs,
+      candidates,
+      timesheets,
+      attendanceLogs,
+      shiftSchedules,
+      payrollRuns,
+      payslips,
+      benefitPlans,
+      benefitEnrollments,
+      onboardingTasks,
+      kpiEvaluations,
+      complianceRecords,
+      analytics: {
+        totalHeadcount,
+        activeHeadcount,
+        onLeaveCount,
+        terminatedCount,
+        turnoverRatePct,
+        totalAnnualPayroll,
+        monthlyPayrollEstimate,
+        latestPayrollNet,
+        totalOvertimeHours,
+        pendingLeaveCount,
+        onboardingCompletionPct,
+        avgKpiScore,
+        complianceRatePct,
+        departmentBreakdown: Array.from(deptMap.values()),
+      },
+    });
   });
 
   router.post('/employees', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
-    const { fullName, email, phone = '', department = 'Operations', jobTitle = '', hireDate, annualSalary = 75000, leaveBalanceDays = 20 } = req.body ?? {};
+    const {
+      fullName,
+      email,
+      phone = '',
+      department = 'Operations',
+      jobTitle = '',
+      employmentType = 'Full-Time',
+      hireDate,
+      annualSalary = 75000,
+      leaveBalanceDays = 20,
+      taxId = '',
+      bankAccount = '',
+      emergencyContact = '',
+      jobHistoryJson = '[]',
+      taxDocumentsJson = '[]',
+    } = req.body ?? {};
     if (!String(fullName ?? '').trim() || !String(email ?? '').trim()) {
       res.status(400).json({ error: 'Employee name and email are required.' });
       return;
     }
-    const ref = (await seqRef('employees', 'EMP'));
-    const info = (await db
+    const ref = await seqRef('employees', 'EMP');
+    const info = await db
       .prepare(
-        `INSERT INTO employees (ref, full_name, email, phone, department, job_title, hire_date, annual_salary, leave_balance_days, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+        `INSERT INTO employees (ref, full_name, email, phone, department, job_title, employment_type, hire_date, annual_salary, leave_balance_days, tax_id, bank_account, emergency_contact, job_history_json, tax_documents_json, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
       )
       .run(
         ref,
@@ -3187,11 +4835,17 @@ END:VEVENT`
         String(phone).trim(),
         String(department).trim(),
         String(jobTitle).trim(),
+        String(employmentType).trim() || 'Full-Time',
         String(hireDate || new Date().toISOString().slice(0, 10)),
         Number(annualSalary) || 0,
-        Number(leaveBalanceDays) || 20
-      ));
-    (await writeAuditLog(db, {
+        Number(leaveBalanceDays) || 20,
+        String(taxId).trim(),
+        String(bankAccount).trim(),
+        String(emergencyContact).trim(),
+        typeof jobHistoryJson === 'string' ? jobHistoryJson : JSON.stringify(jobHistoryJson ?? []),
+        typeof taxDocumentsJson === 'string' ? taxDocumentsJson : JSON.stringify(taxDocumentsJson ?? [])
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'CREATE_EMPLOYEE',
@@ -3199,8 +4853,8 @@ END:VEVENT`
       entityRef: ref,
       details: `Onboarded staff member ${fullName}`,
       ipAddress: getClientIp(req),
-    }));
-    res.status(201).json((await db.prepare('SELECT * FROM employees WHERE id = ?').get(info.lastInsertRowid)));
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM employees WHERE id = ?').get(info.lastInsertRowid));
   });
 
   router.put('/employees/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
@@ -3210,32 +4864,70 @@ END:VEVENT`
       res.status(404).json({ error: 'Employee not found.' });
       return;
     }
-    const { fullName, email, phone, department, jobTitle, hireDate, annualSalary, leaveBalanceDays, status } = req.body ?? {};
-    (await db.prepare(
-      `UPDATE employees
-       SET full_name = COALESCE(?, full_name),
-           email = COALESCE(?, email),
-           phone = COALESCE(?, phone),
-           department = COALESCE(?, department),
-           job_title = COALESCE(?, job_title),
-           hire_date = COALESCE(?, hire_date),
-           annual_salary = COALESCE(?, annual_salary),
-           leave_balance_days = COALESCE(?, leave_balance_days),
-           status = COALESCE(?, status)
-       WHERE id = ?`
-    ).run(
-      fullName ? String(fullName).trim() : null,
-      email ? String(email).trim() : null,
-      phone !== undefined ? String(phone).trim() : null,
-      department ? String(department).trim() : null,
-      jobTitle !== undefined ? String(jobTitle).trim() : null,
-      hireDate ? String(hireDate) : null,
-      annualSalary !== undefined ? Number(annualSalary) : null,
-      leaveBalanceDays !== undefined ? Number(leaveBalanceDays) : null,
-      ['active', 'on_leave', 'terminated'].includes(status) ? status : null,
-      id
-    ));
-    (await writeAuditLog(db, {
+    const {
+      fullName,
+      email,
+      phone,
+      department,
+      jobTitle,
+      employmentType,
+      hireDate,
+      annualSalary,
+      leaveBalanceDays,
+      taxId,
+      bankAccount,
+      emergencyContact,
+      jobHistoryJson,
+      taxDocumentsJson,
+      status,
+    } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE employees
+         SET full_name = COALESCE(?, full_name),
+             email = COALESCE(?, email),
+             phone = COALESCE(?, phone),
+             department = COALESCE(?, department),
+             job_title = COALESCE(?, job_title),
+             employment_type = COALESCE(?, employment_type),
+             hire_date = COALESCE(?, hire_date),
+             annual_salary = COALESCE(?, annual_salary),
+             leave_balance_days = COALESCE(?, leave_balance_days),
+             tax_id = COALESCE(?, tax_id),
+             bank_account = COALESCE(?, bank_account),
+             emergency_contact = COALESCE(?, emergency_contact),
+             job_history_json = COALESCE(?, job_history_json),
+             tax_documents_json = COALESCE(?, tax_documents_json),
+             status = COALESCE(?, status)
+         WHERE id = ?`
+      )
+      .run(
+        fullName ? String(fullName).trim() : null,
+        email ? String(email).trim() : null,
+        phone !== undefined ? String(phone).trim() : null,
+        department ? String(department).trim() : null,
+        jobTitle !== undefined ? String(jobTitle).trim() : null,
+        employmentType ? String(employmentType).trim() : null,
+        hireDate ? String(hireDate) : null,
+        annualSalary !== undefined ? Number(annualSalary) : null,
+        leaveBalanceDays !== undefined ? Number(leaveBalanceDays) : null,
+        taxId !== undefined ? String(taxId).trim() : null,
+        bankAccount !== undefined ? String(bankAccount).trim() : null,
+        emergencyContact !== undefined ? String(emergencyContact).trim() : null,
+        jobHistoryJson !== undefined
+          ? typeof jobHistoryJson === 'string'
+            ? jobHistoryJson
+            : JSON.stringify(jobHistoryJson)
+          : null,
+        taxDocumentsJson !== undefined
+          ? typeof taxDocumentsJson === 'string'
+            ? taxDocumentsJson
+            : JSON.stringify(taxDocumentsJson)
+          : null,
+        ['active', 'on_leave', 'terminated'].includes(status) ? status : null,
+        id
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_EMPLOYEE',
@@ -3243,8 +4935,64 @@ END:VEVENT`
       entityRef: existing.ref,
       details: `Updated employee ${existing.ref}`,
       ipAddress: getClientIp(req),
-    }));
-    res.json((await db.prepare('SELECT * FROM employees WHERE id = ?').get(id)));
+    });
+    res.json(await db.prepare('SELECT * FROM employees WHERE id = ?').get(id));
+  });
+
+  // Self-Service Portal update (allows HR writers OR the matching staff member updating personal contact/tax docs/bank)
+  router.put('/hr/self-service/:id', authenticate, requirePermission('hr', 'read'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id, ref, email FROM employees WHERE id = ?').get(id)) as
+      | { id: number; ref: string; email: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Employee profile not found.' });
+      return;
+    }
+    const isSelf = existing.email.trim().toLowerCase() === req.authUser!.email.trim().toLowerCase();
+    if (!isSelf && !hasPermission(req.authPermissions, 'hr', 'write')) {
+      res.status(403).json({ error: 'You may only update your own self-service profile unless granted HR write access.' });
+      return;
+    }
+    const { phone, emergencyContact, bankAccount, taxId, jobHistoryJson, taxDocumentsJson } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE employees
+         SET phone = COALESCE(?, phone),
+             emergency_contact = COALESCE(?, emergency_contact),
+             bank_account = COALESCE(?, bank_account),
+             tax_id = COALESCE(?, tax_id),
+             job_history_json = COALESCE(?, job_history_json),
+             tax_documents_json = COALESCE(?, tax_documents_json)
+         WHERE id = ?`
+      )
+      .run(
+        phone !== undefined ? String(phone).trim() : null,
+        emergencyContact !== undefined ? String(emergencyContact).trim() : null,
+        bankAccount !== undefined ? String(bankAccount).trim() : null,
+        taxId !== undefined ? String(taxId).trim() : null,
+        jobHistoryJson !== undefined
+          ? typeof jobHistoryJson === 'string'
+            ? jobHistoryJson
+            : JSON.stringify(jobHistoryJson)
+          : null,
+        taxDocumentsJson !== undefined
+          ? typeof taxDocumentsJson === 'string'
+            ? taxDocumentsJson
+            : JSON.stringify(taxDocumentsJson)
+          : null,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'SELF_SERVICE_UPDATE',
+      module: 'hr',
+      entityRef: existing.ref,
+      details: `Updated self-service HR details for ${existing.ref}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM employees WHERE id = ?').get(id));
   });
 
   router.delete('/employees/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
@@ -3256,8 +5004,8 @@ END:VEVENT`
       res.status(404).json({ error: 'Employee not found.' });
       return;
     }
-    (await db.prepare('DELETE FROM employees WHERE id = ?').run(id));
-    (await writeAuditLog(db, {
+    await db.prepare('DELETE FROM employees WHERE id = ?').run(id);
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_EMPLOYEE',
@@ -3266,7 +5014,7 @@ END:VEVENT`
       details: `Deleted employee ${existing.full_name}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    }));
+    });
     res.json({ ok: true });
   });
 
@@ -3276,14 +5024,15 @@ END:VEVENT`
       res.status(400).json({ error: 'Employee, start date, and end date are required.' });
       return;
     }
-    const ref = (await seqRef('leave_requests', 'LVR'));
-    const info = (await db
+    const cleanType = normalizeLeaveType(leaveType) ?? 'Paid Time Off';
+    const ref = await seqRef('leave_requests', 'LVR');
+    const info = await db
       .prepare(
         `INSERT INTO leave_requests (ref, employee_id, leave_type, start_date, end_date, days, reason, status, reviewed_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '')`
       )
-      .run(ref, Number(employeeId), leaveType, String(startDate), String(endDate), Math.max(0.5, Number(days) || 1), String(reason).trim()));
-    res.status(201).json((await db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(info.lastInsertRowid)));
+      .run(ref, Number(employeeId), cleanType, String(startDate), String(endDate), Math.max(0.5, Number(days) || 1), String(reason).trim());
+    res.status(201).json(await db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(info.lastInsertRowid));
   });
 
   router.put('/leave-requests/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
@@ -3294,25 +5043,28 @@ END:VEVENT`
       return;
     }
     const { employeeId, leaveType, startDate, endDate, days, reason } = req.body ?? {};
-    (await db.prepare(
-      `UPDATE leave_requests
-       SET employee_id = COALESCE(?, employee_id),
-           leave_type = COALESCE(?, leave_type),
-           start_date = COALESCE(?, start_date),
-           end_date = COALESCE(?, end_date),
-           days = COALESCE(?, days),
-           reason = COALESCE(?, reason)
-       WHERE id = ?`
-    ).run(
-      employeeId !== undefined ? Number(employeeId) : null,
-      ['Paid Time Off', 'Sick Leave', 'Parental', 'Parental Leave', 'Unpaid', 'Unpaid Leave'].includes(leaveType) ? leaveType : null,
-      startDate ? String(startDate) : null,
-      endDate ? String(endDate) : null,
-      days !== undefined ? Math.max(0.5, Number(days) || 1) : null,
-      reason !== undefined ? String(reason).trim() : null,
-      id
-    ));
-    (await writeAuditLog(db, {
+    const cleanType = leaveType !== undefined ? normalizeLeaveType(leaveType) : null;
+    await db
+      .prepare(
+        `UPDATE leave_requests
+         SET employee_id = COALESCE(?, employee_id),
+             leave_type = COALESCE(?, leave_type),
+             start_date = COALESCE(?, start_date),
+             end_date = COALESCE(?, end_date),
+             days = COALESCE(?, days),
+             reason = COALESCE(?, reason)
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        cleanType,
+        startDate ? String(startDate) : null,
+        endDate ? String(endDate) : null,
+        days !== undefined ? Math.max(0.5, Number(days) || 1) : null,
+        reason !== undefined ? String(reason).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_LEAVE_REQUEST',
@@ -3320,8 +5072,8 @@ END:VEVENT`
       entityRef: existing.ref,
       details: `Updated leave request ${existing.ref}`,
       ipAddress: getClientIp(req),
-    }));
-    res.json((await db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(id)));
+    });
+    res.json(await db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(id));
   });
 
   router.delete('/leave-requests/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
@@ -3331,8 +5083,8 @@ END:VEVENT`
       res.status(404).json({ error: 'Leave request not found.' });
       return;
     }
-    (await db.prepare('DELETE FROM leave_requests WHERE id = ?').run(id));
-    (await writeAuditLog(db, {
+    await db.prepare('DELETE FROM leave_requests WHERE id = ?').run(id);
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_LEAVE_REQUEST',
@@ -3341,7 +5093,7 @@ END:VEVENT`
       details: `Deleted leave request ${existing.ref}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    }));
+    });
     res.json({ ok: true });
   });
 
@@ -3359,14 +5111,14 @@ END:VEVENT`
       res.status(400).json({ error: 'Pending leave request not found.' });
       return;
     }
-    (await db.exec('BEGIN'));
+    await db.exec('BEGIN');
     try {
-      (await db.prepare('UPDATE leave_requests SET status = ?, reviewed_by = ? WHERE id = ?').run(decision, req.authUser!.email, id));
+      await db.prepare('UPDATE leave_requests SET status = ?, reviewed_by = ? WHERE id = ?').run(decision, req.authUser!.email, id);
       if (decision === 'approved') {
-        (await db.prepare('UPDATE employees SET leave_balance_days = MAX(0, leave_balance_days - ?) WHERE id = ?').run(lr.days, lr.employee_id));
+        await db.prepare('UPDATE employees SET leave_balance_days = MAX(0, leave_balance_days - ?) WHERE id = ?').run(lr.days, lr.employee_id);
       }
-      (await db.exec('COMMIT'));
-      (await writeAuditLog(db, {
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'DECIDE_LEAVE_REQUEST',
@@ -3374,12 +5126,713 @@ END:VEVENT`
         entityRef: lr.ref,
         details: `${decision.toUpperCase()} leave request ${lr.ref} (${lr.days} days)`,
         ipAddress: getClientIp(req),
-      }));
-      res.json((await db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(id)));
+      });
+      res.json(await db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(id));
     } catch (err) {
-      (await db.exec('ROLLBACK'));
+      await db.exec('ROLLBACK');
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to decide leave.' });
     }
+  });
+
+  // --- Attendance & Shift Schedules ---
+  router.post('/hr/attendance/clock-in', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const { employeeId, shiftName = 'Standard Day Shift', status = 'present', notes = '' } = req.body ?? {};
+    if (!employeeId) {
+      res.status(400).json({ error: 'Employee is required to clock in.' });
+      return;
+    }
+    const now = new Date();
+    const workDate = now.toISOString().slice(0, 10);
+    const clockIn = now.toISOString().slice(11, 16);
+    const validStatus = ['present', 'late', 'remote'].includes(status) ? status : 'present';
+    const info = await db
+      .prepare(
+        `INSERT INTO attendance_logs (employee_id, work_date, clock_in, clock_out, shift_name, regular_hours, overtime_hours, status, notes, approved_by)
+         VALUES (?, ?, ?, '', ?, 0, 0, ?, ?, '')`
+      )
+      .run(Number(employeeId), workDate, clockIn, String(shiftName).trim(), validStatus, String(notes).trim());
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'ATTENDANCE_CLOCK_IN',
+      module: 'hr',
+      entityRef: `ATT-${info.lastInsertRowid}`,
+      details: `Clocked in employee #${employeeId} at ${clockIn}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM attendance_logs WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.post('/hr/attendance/:id/clock-out', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM attendance_logs WHERE id = ?').get(id)) as
+      | { id: number; clock_in: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Attendance log not found.' });
+      return;
+    }
+    const clockOut = String(req.body?.clockOut || new Date().toISOString().slice(11, 16));
+    const { regularHours, overtimeHours } = computeClockHours(existing.clock_in, clockOut);
+    await db
+      .prepare(`UPDATE attendance_logs SET clock_out = ?, regular_hours = ?, overtime_hours = ? WHERE id = ?`)
+      .run(clockOut, regularHours, overtimeHours, id);
+    res.json(await db.prepare('SELECT * FROM attendance_logs WHERE id = ?').get(id));
+  });
+
+  router.post('/hr/attendance', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      employeeId,
+      workDate,
+      clockIn = '09:00',
+      clockOut = '17:30',
+      shiftName = 'Standard Day Shift',
+      regularHours,
+      overtimeHours,
+      status = 'present',
+      notes = '',
+    } = req.body ?? {};
+    if (!employeeId || !workDate) {
+      res.status(400).json({ error: 'Employee and work date are required.' });
+      return;
+    }
+    const computed = clockOut ? computeClockHours(String(clockIn), String(clockOut)) : { regularHours: 8, overtimeHours: 0 };
+    const reg = regularHours !== undefined && regularHours !== '' ? Math.max(0, Number(regularHours) || 0) : computed.regularHours;
+    const ot = overtimeHours !== undefined && overtimeHours !== '' ? Math.max(0, Number(overtimeHours) || 0) : computed.overtimeHours;
+    const validStatus = ['present', 'late', 'remote', 'absent', 'approved'].includes(status) ? status : 'present';
+    const info = await db
+      .prepare(
+        `INSERT INTO attendance_logs (employee_id, work_date, clock_in, clock_out, shift_name, regular_hours, overtime_hours, status, notes, approved_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')`
+      )
+      .run(Number(employeeId), String(workDate), String(clockIn), String(clockOut), String(shiftName).trim(), reg, ot, validStatus, String(notes).trim());
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_ATTENDANCE',
+      module: 'hr',
+      entityRef: `ATT-${info.lastInsertRowid}`,
+      details: `Logged attendance for employee #${employeeId} on ${workDate}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM attendance_logs WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/attendance/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id FROM attendance_logs WHERE id = ?').get(id)) as { id: number } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Attendance log not found.' });
+      return;
+    }
+    const { employeeId, workDate, clockIn, clockOut, shiftName, regularHours, overtimeHours, status, notes } = req.body ?? {};
+    const validStatus = ['present', 'late', 'remote', 'absent', 'approved'].includes(status) ? status : null;
+    await db
+      .prepare(
+        `UPDATE attendance_logs
+         SET employee_id = COALESCE(?, employee_id),
+             work_date = COALESCE(?, work_date),
+             clock_in = COALESCE(?, clock_in),
+             clock_out = COALESCE(?, clock_out),
+             shift_name = COALESCE(?, shift_name),
+             regular_hours = COALESCE(?, regular_hours),
+             overtime_hours = COALESCE(?, overtime_hours),
+             status = COALESCE(?, status),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        workDate ? String(workDate) : null,
+        clockIn !== undefined ? String(clockIn) : null,
+        clockOut !== undefined ? String(clockOut) : null,
+        shiftName !== undefined ? String(shiftName).trim() : null,
+        regularHours !== undefined ? Math.max(0, Number(regularHours) || 0) : null,
+        overtimeHours !== undefined ? Math.max(0, Number(overtimeHours) || 0) : null,
+        validStatus,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_ATTENDANCE',
+      module: 'hr',
+      entityRef: `ATT-${id}`,
+      details: `Updated attendance log #${id}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM attendance_logs WHERE id = ?').get(id));
+  });
+
+  router.post('/hr/attendance/:id/approve', authenticate, requirePermission('hr', 'validate'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id FROM attendance_logs WHERE id = ?').get(id)) as { id: number } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Attendance log not found.' });
+      return;
+    }
+    await db.prepare(`UPDATE attendance_logs SET status = 'approved', approved_by = ? WHERE id = ?`).run(req.authUser!.email, id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'APPROVE_ATTENDANCE',
+      module: 'hr',
+      entityRef: `ATT-${id}`,
+      details: `Approved attendance & overtime #${id}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM attendance_logs WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/attendance/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id FROM attendance_logs WHERE id = ?').get(id)) as { id: number } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Attendance log not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM attendance_logs WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_ATTENDANCE',
+      module: 'hr',
+      entityRef: `ATT-${id}`,
+      details: `Deleted attendance log #${id}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  router.post('/hr/shifts', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const { employeeId, shiftName, startTime = '09:00', endTime = '17:30', workDays = 'Mon–Fri', location = 'HQ / Hybrid', status = 'active' } =
+      req.body ?? {};
+    if (!employeeId || !String(shiftName ?? '').trim()) {
+      res.status(400).json({ error: 'Employee and shift name are required.' });
+      return;
+    }
+    const ref = await seqRef('shift_schedules', 'SHF');
+    const info = await db
+      .prepare(
+        `INSERT INTO shift_schedules (ref, employee_id, shift_name, start_time, end_time, work_days, location, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        Number(employeeId),
+        String(shiftName).trim(),
+        String(startTime).trim(),
+        String(endTime).trim(),
+        String(workDays).trim(),
+        String(location).trim(),
+        status === 'inactive' ? 'inactive' : 'active'
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_SHIFT',
+      module: 'hr',
+      entityRef: ref,
+      details: `Assigned shift ${shiftName}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM shift_schedules WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/shifts/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM shift_schedules WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift schedule not found.' });
+      return;
+    }
+    const { employeeId, shiftName, startTime, endTime, workDays, location, status } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE shift_schedules
+         SET employee_id = COALESCE(?, employee_id),
+             shift_name = COALESCE(?, shift_name),
+             start_time = COALESCE(?, start_time),
+             end_time = COALESCE(?, end_time),
+             work_days = COALESCE(?, work_days),
+             location = COALESCE(?, location),
+             status = COALESCE(?, status)
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        shiftName ? String(shiftName).trim() : null,
+        startTime ? String(startTime).trim() : null,
+        endTime ? String(endTime).trim() : null,
+        workDays ? String(workDays).trim() : null,
+        location !== undefined ? String(location).trim() : null,
+        ['active', 'inactive'].includes(status) ? status : null,
+        id
+      );
+    res.json(await db.prepare('SELECT * FROM shift_schedules WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/shifts/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM shift_schedules WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift schedule not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM shift_schedules WHERE id = ?').run(id);
+    res.json({ ok: true });
+  });
+
+  // --- Payroll & Benefits Administration ---
+  router.post('/hr/payroll-runs', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      payPeriod = new Date().toISOString().slice(0, 7),
+      payDate = new Date().toISOString().slice(0, 10),
+      taxRatePct = 15,
+      socialRatePct = 4.5,
+      includeOvertime = true,
+      overtimeMultiplier = 1.5,
+    } = req.body ?? {};
+
+    const cleanPeriod = String(payPeriod).trim();
+    if (!cleanPeriod) {
+      res.status(400).json({ error: 'Pay period is required (e.g. 2026-11).' });
+      return;
+    }
+
+    const activeEmployees = (await db
+      .prepare(`SELECT * FROM employees WHERE status != 'terminated' ORDER BY id ASC`)
+      .all()) as Array<{
+      id: number;
+      ref: string;
+      full_name: string;
+      annual_salary: number;
+      bank_account: string;
+    }>;
+    if (activeEmployees.length === 0) {
+      res.status(400).json({ error: 'No active employees available for payroll processing.' });
+      return;
+    }
+
+    const enrollments = (await db
+      .prepare(
+        `SELECT be.employee_id, bp.employee_contribution
+         FROM benefit_enrollments be
+         JOIN benefit_plans bp ON bp.id = be.plan_id
+         WHERE be.status = 'active'`
+      )
+      .all()) as Array<{ employee_id: number; employee_contribution: number }>;
+
+    const benefitMap = new Map<number, number>();
+    for (const enr of enrollments) {
+      benefitMap.set(enr.employee_id, (benefitMap.get(enr.employee_id) ?? 0) + (Number(enr.employee_contribution) || 0));
+    }
+
+    const otRows = (await db
+      .prepare(
+        `SELECT employee_id, COALESCE(SUM(overtime_hours), 0) AS ot_hours
+         FROM attendance_logs
+         WHERE work_date LIKE ? AND status IN ('approved', 'present', 'remote')
+         GROUP BY employee_id`
+      )
+      .all(`${cleanPeriod}%`)) as Array<{ employee_id: number; ot_hours: number }>;
+    const otMap = new Map<number, number>();
+    for (const row of otRows) {
+      otMap.set(row.employee_id, Number(row.ot_hours) || 0);
+    }
+
+    const runRef = await seqRef('payroll_runs', 'PAY');
+    const taxPct = Math.max(0, Math.min(50, Number(taxRatePct) || 0)) / 100;
+    const socPct = Math.max(0, Math.min(25, Number(socialRatePct) || 0)) / 100;
+    const otMult = Math.max(1, Math.min(3, Number(overtimeMultiplier) || 1.5));
+
+    let totalGross = 0;
+    let totalDeductions = 0;
+    let totalNet = 0;
+
+    const slipDrafts = activeEmployees.map((emp) => {
+      const monthlyBase = Number(emp.annual_salary) / 12;
+      const hourlyRate = Number(emp.annual_salary) / 2080;
+      const otHours = includeOvertime ? otMap.get(emp.id) ?? 0 : 0;
+      const otPay = otHours * hourlyRate * otMult;
+      const grossPay = Number((monthlyBase + otPay).toFixed(2));
+      const taxDeduction = Number((grossPay * taxPct).toFixed(2));
+      const socialDeduction = Number((grossPay * socPct).toFixed(2));
+      const healthDeduction = Number((benefitMap.get(emp.id) ?? 0).toFixed(2));
+      const otherDeductions = 0;
+      const ded = taxDeduction + socialDeduction + healthDeduction + otherDeductions;
+      const netPay = Number(Math.max(0, grossPay - ded).toFixed(2));
+
+      totalGross += grossPay;
+      totalDeductions += ded;
+      totalNet += netPay;
+
+      return {
+        employeeId: emp.id,
+        grossPay,
+        taxDeduction,
+        socialDeduction,
+        healthDeduction,
+        otherDeductions,
+        netPay,
+        depositRef: `ACH-${emp.ref}-${cleanPeriod.replace('-', '')}`,
+      };
+    });
+
+    const runInfo = await db
+      .prepare(
+        `INSERT INTO payroll_runs (ref, pay_period, pay_date, total_gross, total_deductions, total_net, employee_count, status, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'processed', ?)`
+      )
+      .run(
+        runRef,
+        cleanPeriod,
+        String(payDate),
+        Number(totalGross.toFixed(2)),
+        Number(totalDeductions.toFixed(2)),
+        Number(totalNet.toFixed(2)),
+        activeEmployees.length,
+        req.authUser!.email
+      );
+
+    const runId = Number(runInfo.lastInsertRowid);
+    const baseSlipRef = await seqRef('payslips', 'SLP');
+    const prefixPart = baseSlipRef.slice(0, baseSlipRef.lastIndexOf('-') + 1);
+    let slipSeq = Number(baseSlipRef.split('-').pop()) || 1;
+
+    for (const s of slipDrafts) {
+      const slipRef = `${prefixPart}${String(slipSeq).padStart(4, '0')}`;
+      slipSeq += 1;
+      await db
+        .prepare(
+          `INSERT INTO payslips (ref, payroll_run_id, employee_id, pay_period, gross_pay, tax_deduction, social_deduction, health_deduction, other_deductions, net_pay, direct_deposit_ref, payment_method, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Direct Deposit', 'generated')`
+        )
+        .run(
+          slipRef,
+          runId,
+          s.employeeId,
+          cleanPeriod,
+          s.grossPay,
+          s.taxDeduction,
+          s.socialDeduction,
+          s.healthDeduction,
+          s.otherDeductions,
+          s.netPay,
+          s.depositRef
+        );
+    }
+
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'RUN_PAYROLL',
+      module: 'hr',
+      entityRef: runRef,
+      details: `Processed payroll ${runRef} for ${activeEmployees.length} staff (${cleanPeriod})`,
+      ipAddress: getClientIp(req),
+    });
+
+    res.status(201).json(await db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(runId));
+  });
+
+  router.put('/hr/payroll-runs/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM payroll_runs WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Payroll run not found.' });
+      return;
+    }
+    const { payPeriod, payDate, status } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE payroll_runs
+         SET pay_period = COALESCE(?, pay_period),
+             pay_date = COALESCE(?, pay_date),
+             status = COALESCE(?, status)
+         WHERE id = ?`
+      )
+      .run(
+        payPeriod ? String(payPeriod).trim() : null,
+        payDate ? String(payDate) : null,
+        ['draft', 'processed', 'paid'].includes(status) ? status : null,
+        id
+      );
+    res.json(await db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(id));
+  });
+
+  router.post('/hr/payroll-runs/:id/mark-paid', authenticate, requirePermission('hr', 'validate'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM payroll_runs WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Payroll run not found.' });
+      return;
+    }
+    await db.prepare(`UPDATE payroll_runs SET status = 'paid' WHERE id = ?`).run(id);
+    await db.prepare(`UPDATE payslips SET status = 'paid' WHERE payroll_run_id = ?`).run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'MARK_PAYROLL_PAID',
+      module: 'hr',
+      entityRef: existing.ref,
+      details: `Disbursed direct deposits for payroll ${existing.ref}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/payroll-runs/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM payroll_runs WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Payroll run not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM payroll_runs WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_PAYROLL_RUN',
+      module: 'hr',
+      entityRef: existing.ref,
+      details: `Deleted payroll run ${existing.ref}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  router.put('/hr/payslips/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM payslips WHERE id = ?').get(id)) as
+      | {
+          id: number;
+          ref: string;
+          payroll_run_id: number;
+          gross_pay: number;
+          tax_deduction: number;
+          social_deduction: number;
+          health_deduction: number;
+          other_deductions: number;
+        }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Payslip not found.' });
+      return;
+    }
+    const { grossPay, taxDeduction, socialDeduction, healthDeduction, otherDeductions, directDepositRef, paymentMethod, status } = req.body ?? {};
+    const gross = grossPay !== undefined ? Math.max(0, Number(grossPay) || 0) : existing.gross_pay;
+    const tax = taxDeduction !== undefined ? Math.max(0, Number(taxDeduction) || 0) : existing.tax_deduction;
+    const soc = socialDeduction !== undefined ? Math.max(0, Number(socialDeduction) || 0) : existing.social_deduction;
+    const hlth = healthDeduction !== undefined ? Math.max(0, Number(healthDeduction) || 0) : existing.health_deduction;
+    const other = otherDeductions !== undefined ? Math.max(0, Number(otherDeductions) || 0) : existing.other_deductions;
+    const net = Number(Math.max(0, gross - tax - soc - hlth - other).toFixed(2));
+    await db
+      .prepare(
+        `UPDATE payslips
+         SET gross_pay = ?, tax_deduction = ?, social_deduction = ?, health_deduction = ?, other_deductions = ?, net_pay = ?,
+             direct_deposit_ref = COALESCE(?, direct_deposit_ref),
+             payment_method = COALESCE(?, payment_method),
+             status = COALESCE(?, status)
+         WHERE id = ?`
+      )
+      .run(
+        gross,
+        tax,
+        soc,
+        hlth,
+        other,
+        net,
+        directDepositRef !== undefined ? String(directDepositRef).trim() : null,
+        paymentMethod ? String(paymentMethod).trim() : null,
+        ['generated', 'paid'].includes(status) ? status : null,
+        id
+      );
+
+    // Recalculate parent payroll run totals
+    const agg = (await db
+      .prepare(
+        `SELECT COUNT(*) AS cnt,
+                COALESCE(SUM(gross_pay), 0) AS tg,
+                COALESCE(SUM(tax_deduction + social_deduction + health_deduction + other_deductions), 0) AS td,
+                COALESCE(SUM(net_pay), 0) AS tn
+         FROM payslips WHERE payroll_run_id = ?`
+      )
+      .get(existing.payroll_run_id)) as { cnt: number; tg: number; td: number; tn: number };
+    await db
+      .prepare(`UPDATE payroll_runs SET total_gross = ?, total_deductions = ?, total_net = ?, employee_count = ? WHERE id = ?`)
+      .run(Number(agg.tg.toFixed(2)), Number(agg.td.toFixed(2)), Number(agg.tn.toFixed(2)), agg.cnt, existing.payroll_run_id);
+
+    res.json(await db.prepare('SELECT * FROM payslips WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/payslips/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref, payroll_run_id FROM payslips WHERE id = ?').get(id)) as
+      | { ref: string; payroll_run_id: number }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Payslip not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM payslips WHERE id = ?').run(id);
+    const agg = (await db
+      .prepare(
+        `SELECT COUNT(*) AS cnt,
+                COALESCE(SUM(gross_pay), 0) AS tg,
+                COALESCE(SUM(tax_deduction + social_deduction + health_deduction + other_deductions), 0) AS td,
+                COALESCE(SUM(net_pay), 0) AS tn
+         FROM payslips WHERE payroll_run_id = ?`
+      )
+      .get(existing.payroll_run_id)) as { cnt: number; tg: number; td: number; tn: number };
+    await db
+      .prepare(`UPDATE payroll_runs SET total_gross = ?, total_deductions = ?, total_net = ?, employee_count = ? WHERE id = ?`)
+      .run(Number(agg.tg.toFixed(2)), Number(agg.td.toFixed(2)), Number(agg.tn.toFixed(2)), agg.cnt, existing.payroll_run_id);
+    res.json({ ok: true });
+  });
+
+  router.post('/hr/benefit-plans', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      name,
+      provider = '',
+      category = 'Health Insurance',
+      employerContribution = 0,
+      employeeContribution = 0,
+      description = '',
+      status = 'active',
+    } = req.body ?? {};
+    if (!String(name ?? '').trim()) {
+      res.status(400).json({ error: 'Benefit plan name is required.' });
+      return;
+    }
+    const ref = await seqRef('benefit_plans', 'BEN');
+    const info = await db
+      .prepare(
+        `INSERT INTO benefit_plans (ref, name, provider, category, employer_contribution, employee_contribution, description, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        String(name).trim(),
+        String(provider).trim(),
+        String(category).trim(),
+        Math.max(0, Number(employerContribution) || 0),
+        Math.max(0, Number(employeeContribution) || 0),
+        String(description).trim(),
+        status === 'archived' ? 'archived' : 'active'
+      );
+    res.status(201).json(await db.prepare('SELECT * FROM benefit_plans WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/benefit-plans/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM benefit_plans WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Benefit plan not found.' });
+      return;
+    }
+    const { name, provider, category, employerContribution, employeeContribution, description, status } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE benefit_plans
+         SET name = COALESCE(?, name),
+             provider = COALESCE(?, provider),
+             category = COALESCE(?, category),
+             employer_contribution = COALESCE(?, employer_contribution),
+             employee_contribution = COALESCE(?, employee_contribution),
+             description = COALESCE(?, description),
+             status = COALESCE(?, status)
+         WHERE id = ?`
+      )
+      .run(
+        name ? String(name).trim() : null,
+        provider !== undefined ? String(provider).trim() : null,
+        category ? String(category).trim() : null,
+        employerContribution !== undefined ? Math.max(0, Number(employerContribution) || 0) : null,
+        employeeContribution !== undefined ? Math.max(0, Number(employeeContribution) || 0) : null,
+        description !== undefined ? String(description).trim() : null,
+        ['active', 'archived'].includes(status) ? status : null,
+        id
+      );
+    res.json(await db.prepare('SELECT * FROM benefit_plans WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/benefit-plans/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM benefit_plans WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Benefit plan not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM benefit_plans WHERE id = ?').run(id);
+    res.json({ ok: true });
+  });
+
+  router.post('/hr/benefit-enrollments', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const { employeeId, planId, coverageTier = 'Employee Only', enrollmentDate, status = 'active', notes = '' } = req.body ?? {};
+    if (!employeeId || !planId) {
+      res.status(400).json({ error: 'Employee and benefit plan are required.' });
+      return;
+    }
+    const info = await db
+      .prepare(
+        `INSERT INTO benefit_enrollments (employee_id, plan_id, coverage_tier, enrollment_date, status, notes)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        Number(employeeId),
+        Number(planId),
+        String(coverageTier).trim(),
+        String(enrollmentDate || new Date().toISOString().slice(0, 10)),
+        ['pending', 'active', 'cancelled'].includes(status) ? status : 'active',
+        String(notes).trim()
+      );
+    res.status(201).json(await db.prepare('SELECT * FROM benefit_enrollments WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/benefit-enrollments/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id FROM benefit_enrollments WHERE id = ?').get(id)) as { id: number } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Benefit enrollment not found.' });
+      return;
+    }
+    const { employeeId, planId, coverageTier, enrollmentDate, status, notes } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE benefit_enrollments
+         SET employee_id = COALESCE(?, employee_id),
+             plan_id = COALESCE(?, plan_id),
+             coverage_tier = COALESCE(?, coverage_tier),
+             enrollment_date = COALESCE(?, enrollment_date),
+             status = COALESCE(?, status),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        planId !== undefined ? Number(planId) : null,
+        coverageTier ? String(coverageTier).trim() : null,
+        enrollmentDate ? String(enrollmentDate) : null,
+        ['pending', 'active', 'cancelled'].includes(status) ? status : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    res.json(await db.prepare('SELECT * FROM benefit_enrollments WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/benefit-enrollments/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id FROM benefit_enrollments WHERE id = ?').get(id)) as { id: number } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Benefit enrollment not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM benefit_enrollments WHERE id = ?').run(id);
+    res.json({ ok: true });
   });
 
   router.post('/expense-reports', authenticate, requirePermission('hr', 'write'), async (req, res) => {
@@ -3389,14 +5842,14 @@ END:VEVENT`
       res.status(400).json({ error: 'Employee and positive expense amount are required.' });
       return;
     }
-    const ref = (await seqRef('expense_reports', 'EXP'));
-    const info = (await db
+    const ref = await seqRef('expense_reports', 'EXP');
+    const info = await db
       .prepare(
         `INSERT INTO expense_reports (ref, employee_id, category, expense_date, amount, tax_amount, description, status, approved_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'submitted', '')`
       )
-      .run(ref, Number(employeeId), String(category).trim(), String(expenseDate || new Date().toISOString().slice(0, 10)), amt, Number(taxAmount) || 0, String(description).trim()));
-    res.status(201).json((await db.prepare('SELECT * FROM expense_reports WHERE id = ?').get(info.lastInsertRowid)));
+      .run(ref, Number(employeeId), String(category).trim(), String(expenseDate || new Date().toISOString().slice(0, 10)), amt, Number(taxAmount) || 0, String(description).trim());
+    res.status(201).json(await db.prepare('SELECT * FROM expense_reports WHERE id = ?').get(info.lastInsertRowid));
   });
 
   router.put('/expense-reports/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
@@ -3407,25 +5860,27 @@ END:VEVENT`
       return;
     }
     const { employeeId, category, expenseDate, amount, taxAmount, description } = req.body ?? {};
-    (await db.prepare(
-      `UPDATE expense_reports
-       SET employee_id = COALESCE(?, employee_id),
-           category = COALESCE(?, category),
-           expense_date = COALESCE(?, expense_date),
-           amount = COALESCE(?, amount),
-           tax_amount = COALESCE(?, tax_amount),
-           description = COALESCE(?, description)
-       WHERE id = ?`
-    ).run(
-      employeeId !== undefined ? Number(employeeId) : null,
-      category ? String(category).trim() : null,
-      expenseDate ? String(expenseDate) : null,
-      amount !== undefined ? Number(amount) : null,
-      taxAmount !== undefined ? Number(taxAmount) : null,
-      description !== undefined ? String(description).trim() : null,
-      id
-    ));
-    (await writeAuditLog(db, {
+    await db
+      .prepare(
+        `UPDATE expense_reports
+         SET employee_id = COALESCE(?, employee_id),
+             category = COALESCE(?, category),
+             expense_date = COALESCE(?, expense_date),
+             amount = COALESCE(?, amount),
+             tax_amount = COALESCE(?, tax_amount),
+             description = COALESCE(?, description)
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        category ? String(category).trim() : null,
+        expenseDate ? String(expenseDate) : null,
+        amount !== undefined ? Number(amount) : null,
+        taxAmount !== undefined ? Number(taxAmount) : null,
+        description !== undefined ? String(description).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_EXPENSE_REPORT',
@@ -3433,8 +5888,8 @@ END:VEVENT`
       entityRef: existing.ref,
       details: `Updated expense report ${existing.ref}`,
       ipAddress: getClientIp(req),
-    }));
-    res.json((await db.prepare('SELECT * FROM expense_reports WHERE id = ?').get(id)));
+    });
+    res.json(await db.prepare('SELECT * FROM expense_reports WHERE id = ?').get(id));
   });
 
   router.delete('/expense-reports/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
@@ -3444,8 +5899,8 @@ END:VEVENT`
       res.status(404).json({ error: 'Expense report not found.' });
       return;
     }
-    (await db.prepare('DELETE FROM expense_reports WHERE id = ?').run(id));
-    (await writeAuditLog(db, {
+    await db.prepare('DELETE FROM expense_reports WHERE id = ?').run(id);
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_EXPENSE_REPORT',
@@ -3454,7 +5909,7 @@ END:VEVENT`
       details: `Deleted expense report ${existing.ref}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    }));
+    });
     res.json({ ok: true });
   });
 
@@ -3465,8 +5920,8 @@ END:VEVENT`
       res.status(400).json({ error: 'Invalid expense status.' });
       return;
     }
-    (await db.prepare('UPDATE expense_reports SET status = ?, approved_by = ? WHERE id = ?').run(status, req.authUser!.email, id));
-    res.json((await db.prepare('SELECT * FROM expense_reports WHERE id = ?').get(id)));
+    await db.prepare('UPDATE expense_reports SET status = ?, approved_by = ? WHERE id = ?').run(status, req.authUser!.email, id);
+    res.json(await db.prepare('SELECT * FROM expense_reports WHERE id = ?').get(id));
   });
 
   router.post('/recruitment/jobs', authenticate, requirePermission('hr', 'write'), async (req, res) => {
@@ -3475,14 +5930,14 @@ END:VEVENT`
       res.status(400).json({ error: 'Job title is required.' });
       return;
     }
-    const ref = (await seqRef('job_postings', 'JOB'));
-    const info = (await db
+    const ref = await seqRef('job_postings', 'JOB');
+    const info = await db
       .prepare(
         `INSERT INTO job_postings (ref, title, department, location, contract_type, status, description)
          VALUES (?, ?, ?, ?, ?, 'open', ?)`
       )
-      .run(ref, String(title).trim(), String(department).trim(), String(location).trim(), String(contractType).trim(), String(description).trim()));
-    res.status(201).json((await db.prepare('SELECT * FROM job_postings WHERE id = ?').get(info.lastInsertRowid)));
+      .run(ref, String(title).trim(), String(department).trim(), String(location).trim(), String(contractType).trim(), String(description).trim());
+    res.status(201).json(await db.prepare('SELECT * FROM job_postings WHERE id = ?').get(info.lastInsertRowid));
   });
 
   router.put('/recruitment/jobs/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
@@ -3493,25 +5948,27 @@ END:VEVENT`
       return;
     }
     const { title, department, location, contractType, status, description } = req.body ?? {};
-    (await db.prepare(
-      `UPDATE job_postings
-       SET title = COALESCE(?, title),
-           department = COALESCE(?, department),
-           location = COALESCE(?, location),
-           contract_type = COALESCE(?, contract_type),
-           status = COALESCE(?, status),
-           description = COALESCE(?, description)
-       WHERE id = ?`
-    ).run(
-      title ? String(title).trim() : null,
-      department ? String(department).trim() : null,
-      location !== undefined ? String(location).trim() : null,
-      contractType ? String(contractType).trim() : null,
-      ['draft', 'open', 'closed'].includes(status) ? status : null,
-      description !== undefined ? String(description).trim() : null,
-      id
-    ));
-    (await writeAuditLog(db, {
+    await db
+      .prepare(
+        `UPDATE job_postings
+         SET title = COALESCE(?, title),
+             department = COALESCE(?, department),
+             location = COALESCE(?, location),
+             contract_type = COALESCE(?, contract_type),
+             status = COALESCE(?, status),
+             description = COALESCE(?, description)
+         WHERE id = ?`
+      )
+      .run(
+        title ? String(title).trim() : null,
+        department ? String(department).trim() : null,
+        location !== undefined ? String(location).trim() : null,
+        contractType ? String(contractType).trim() : null,
+        ['draft', 'open', 'closed'].includes(status) ? status : null,
+        description !== undefined ? String(description).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_JOB_POSTING',
@@ -3519,8 +5976,8 @@ END:VEVENT`
       entityRef: existing.ref,
       details: `Updated job posting ${existing.ref}`,
       ipAddress: getClientIp(req),
-    }));
-    res.json((await db.prepare('SELECT * FROM job_postings WHERE id = ?').get(id)));
+    });
+    res.json(await db.prepare('SELECT * FROM job_postings WHERE id = ?').get(id));
   });
 
   router.delete('/recruitment/jobs/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
@@ -3532,8 +5989,8 @@ END:VEVENT`
       res.status(404).json({ error: 'Job posting not found.' });
       return;
     }
-    (await db.prepare('DELETE FROM job_postings WHERE id = ?').run(id));
-    (await writeAuditLog(db, {
+    await db.prepare('DELETE FROM job_postings WHERE id = ?').run(id);
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_JOB_POSTING',
@@ -3542,7 +5999,7 @@ END:VEVENT`
       details: `Deleted job posting ${existing.title}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    }));
+    });
     res.json({ ok: true });
   });
 
@@ -3552,10 +6009,10 @@ END:VEVENT`
       res.status(400).json({ error: 'Job posting, candidate name, and email are required.' });
       return;
     }
-    const info = (await db
+    const info = await db
       .prepare(`INSERT INTO candidates (job_id, full_name, email, phone, stage, notes) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(Number(jobId), String(fullName).trim(), String(email).trim(), String(phone).trim(), stage, String(notes).trim()));
-    res.status(201).json((await db.prepare('SELECT * FROM candidates WHERE id = ?').get(info.lastInsertRowid)));
+      .run(Number(jobId), String(fullName).trim(), String(email).trim(), String(phone).trim(), stage, String(notes).trim());
+    res.status(201).json(await db.prepare('SELECT * FROM candidates WHERE id = ?').get(info.lastInsertRowid));
   });
 
   router.put('/recruitment/candidates/:id', authenticate, async (req: AuthenticatedReq, res) => {
@@ -3574,25 +6031,27 @@ END:VEVENT`
       res.status(400).json({ error: 'Invalid candidate stage.' });
       return;
     }
-    (await db.prepare(
-      `UPDATE candidates
-       SET job_id = COALESCE(?, job_id),
-           full_name = COALESCE(?, full_name),
-           email = COALESCE(?, email),
-           phone = COALESCE(?, phone),
-           stage = COALESCE(?, stage),
-           notes = COALESCE(?, notes)
-       WHERE id = ?`
-    ).run(
-      jobId !== undefined ? Number(jobId) : null,
-      fullName ? String(fullName).trim() : null,
-      email ? String(email).trim() : null,
-      phone !== undefined ? String(phone).trim() : null,
-      stage ?? null,
-      notes !== undefined ? String(notes).trim() : null,
-      id
-    ));
-    (await writeAuditLog(db, {
+    await db
+      .prepare(
+        `UPDATE candidates
+         SET job_id = COALESCE(?, job_id),
+             full_name = COALESCE(?, full_name),
+             email = COALESCE(?, email),
+             phone = COALESCE(?, phone),
+             stage = COALESCE(?, stage),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        jobId !== undefined ? Number(jobId) : null,
+        fullName ? String(fullName).trim() : null,
+        email ? String(email).trim() : null,
+        phone !== undefined ? String(phone).trim() : null,
+        stage ?? null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_CANDIDATE',
@@ -3600,8 +6059,8 @@ END:VEVENT`
       entityRef: `CND-${id}`,
       details: `Updated candidate ${fullName ?? existing.full_name}`,
       ipAddress: getClientIp(req),
-    }));
-    res.json((await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)));
+    });
+    res.json(await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id));
   });
 
   router.delete('/recruitment/candidates/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
@@ -3611,8 +6070,8 @@ END:VEVENT`
       res.status(404).json({ error: 'Candidate not found.' });
       return;
     }
-    (await db.prepare('DELETE FROM candidates WHERE id = ?').run(id));
-    (await writeAuditLog(db, {
+    await db.prepare('DELETE FROM candidates WHERE id = ?').run(id);
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_CANDIDATE',
@@ -3621,8 +6080,407 @@ END:VEVENT`
       details: `Deleted candidate ${existing.full_name}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    }));
+    });
     res.json({ ok: true });
+  });
+
+  // --- Onboarding Checklists ---
+  router.post('/hr/onboarding', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      employeeId = null,
+      candidateId = null,
+      taskTitle,
+      category = 'Identity & Tax Forms',
+      dueDate,
+      assigneeName = 'HR Operations',
+      status = 'pending',
+      notes = '',
+    } = req.body ?? {};
+    if (!String(taskTitle ?? '').trim()) {
+      res.status(400).json({ error: 'Onboarding task title is required.' });
+      return;
+    }
+    const ref = await seqRef('onboarding_tasks', 'ONB');
+    const info = await db
+      .prepare(
+        `INSERT INTO onboarding_tasks (ref, employee_id, candidate_id, task_title, category, due_date, assignee_name, status, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        employeeId ? Number(employeeId) : null,
+        candidateId ? Number(candidateId) : null,
+        String(taskTitle).trim(),
+        String(category).trim(),
+        String(dueDate || new Date().toISOString().slice(0, 10)),
+        String(assigneeName).trim(),
+        ['pending', 'in_progress', 'completed'].includes(status) ? status : 'pending',
+        String(notes).trim()
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_ONBOARDING_TASK',
+      module: 'hr',
+      entityRef: ref,
+      details: `Created onboarding task ${taskTitle}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM onboarding_tasks WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/onboarding/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref, employee_id, candidate_id FROM onboarding_tasks WHERE id = ?').get(id)) as
+      | { ref: string; employee_id: number | null; candidate_id: number | null }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Onboarding task not found.' });
+      return;
+    }
+    const { employeeId, candidateId, taskTitle, category, dueDate, assigneeName, status, notes } = req.body ?? {};
+    const nextEmpId = employeeId === '' || employeeId === null ? null : employeeId !== undefined ? Number(employeeId) : existing.employee_id;
+    const nextCandId = candidateId === '' || candidateId === null ? null : candidateId !== undefined ? Number(candidateId) : existing.candidate_id;
+    await db
+      .prepare(
+        `UPDATE onboarding_tasks
+         SET employee_id = ?,
+             candidate_id = ?,
+             task_title = COALESCE(?, task_title),
+             category = COALESCE(?, category),
+             due_date = COALESCE(?, due_date),
+             assignee_name = COALESCE(?, assignee_name),
+             status = COALESCE(?, status),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        nextEmpId,
+        nextCandId,
+        taskTitle ? String(taskTitle).trim() : null,
+        category ? String(category).trim() : null,
+        dueDate ? String(dueDate) : null,
+        assigneeName ? String(assigneeName).trim() : null,
+        ['pending', 'in_progress', 'completed'].includes(status) ? status : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    res.json(await db.prepare('SELECT * FROM onboarding_tasks WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/onboarding/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM onboarding_tasks WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Onboarding task not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM onboarding_tasks WHERE id = ?').run(id);
+    res.json({ ok: true });
+  });
+
+  // --- KPI Evaluations ---
+  router.post('/hr/kpi-evaluations', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      employeeId,
+      evaluatorName = req.authUser!.full_name || req.authUser!.email,
+      reviewPeriod = '2026-Q4',
+      periodStart = '',
+      periodEnd = '',
+      metrics = [],
+      strengths = '',
+      improvementPlan = '',
+      employeeComments = '',
+      status = 'draft',
+    } = req.body ?? {};
+    if (!employeeId || !String(reviewPeriod).trim()) {
+      res.status(400).json({ error: 'Employee and review period are required.' });
+      return;
+    }
+    const { metricsJson, overallScore, ratingLabel } = computeKpiSummary(metrics);
+    const validStatus = ['draft', 'self_review', 'submitted', 'approved'].includes(status) ? status : 'draft';
+    const ref = await seqRef('kpi_evaluations', 'KPI');
+    const info = await db
+      .prepare(
+        `INSERT INTO kpi_evaluations (ref, employee_id, evaluator_name, review_period, period_start, period_end, metrics_json, overall_score, rating_label, strengths, improvement_plan, employee_comments, status, reviewed_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        Number(employeeId),
+        String(evaluatorName).trim(),
+        String(reviewPeriod).trim(),
+        String(periodStart),
+        String(periodEnd),
+        metricsJson,
+        overallScore,
+        ratingLabel,
+        String(strengths).trim(),
+        String(improvementPlan).trim(),
+        String(employeeComments).trim(),
+        validStatus,
+        validStatus === 'approved' ? req.authUser!.email : ''
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_KPI_EVALUATION',
+      module: 'hr',
+      entityRef: ref,
+      details: `Created KPI scorecard ${ref} (${overallScore}%) for employee #${employeeId}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM kpi_evaluations WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/kpi-evaluations/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM kpi_evaluations WHERE id = ?').get(id)) as
+      | { ref: string; metrics_json: string; overall_score: number; rating_label: string; status: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'KPI evaluation not found.' });
+      return;
+    }
+    const {
+      employeeId,
+      evaluatorName,
+      reviewPeriod,
+      periodStart,
+      periodEnd,
+      metrics,
+      strengths,
+      improvementPlan,
+      employeeComments,
+      status,
+    } = req.body ?? {};
+    const summary =
+      metrics !== undefined
+        ? computeKpiSummary(metrics)
+        : {
+            metricsJson: existing.metrics_json,
+            overallScore: existing.overall_score,
+            ratingLabel: existing.rating_label,
+          };
+    const nextStatus = ['draft', 'self_review', 'submitted', 'approved'].includes(status) ? status : existing.status;
+    await db
+      .prepare(
+        `UPDATE kpi_evaluations
+         SET employee_id = COALESCE(?, employee_id),
+             evaluator_name = COALESCE(?, evaluator_name),
+             review_period = COALESCE(?, review_period),
+             period_start = COALESCE(?, period_start),
+             period_end = COALESCE(?, period_end),
+             metrics_json = ?,
+             overall_score = ?,
+             rating_label = ?,
+             strengths = COALESCE(?, strengths),
+             improvement_plan = COALESCE(?, improvement_plan),
+             employee_comments = COALESCE(?, employee_comments),
+             status = ?,
+             updated_at = datetime('now')
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        evaluatorName !== undefined ? String(evaluatorName).trim() : null,
+        reviewPeriod ? String(reviewPeriod).trim() : null,
+        periodStart !== undefined ? String(periodStart) : null,
+        periodEnd !== undefined ? String(periodEnd) : null,
+        summary.metricsJson,
+        summary.overallScore,
+        summary.ratingLabel,
+        strengths !== undefined ? String(strengths).trim() : null,
+        improvementPlan !== undefined ? String(improvementPlan).trim() : null,
+        employeeComments !== undefined ? String(employeeComments).trim() : null,
+        nextStatus,
+        id
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_KPI_EVALUATION',
+      module: 'hr',
+      entityRef: existing.ref,
+      details: `Updated KPI evaluation ${existing.ref} (${summary.overallScore}%)`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM kpi_evaluations WHERE id = ?').get(id));
+  });
+
+  router.post('/hr/kpi-evaluations/:id/decide', authenticate, requirePermission('hr', 'validate'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const { status = 'approved' } = req.body ?? {};
+    if (!['self_review', 'submitted', 'approved'].includes(status)) {
+      res.status(400).json({ error: 'Invalid KPI evaluation status.' });
+      return;
+    }
+    const existing = (await db.prepare('SELECT ref FROM kpi_evaluations WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'KPI evaluation not found.' });
+      return;
+    }
+    await db
+      .prepare(`UPDATE kpi_evaluations SET status = ?, reviewed_by = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(status, status === 'approved' ? req.authUser!.email : '', id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'FINALIZE_KPI_EVALUATION',
+      module: 'hr',
+      entityRef: existing.ref,
+      details: `Marked KPI evaluation ${existing.ref} as ${status}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM kpi_evaluations WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/kpi-evaluations/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM kpi_evaluations WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'KPI evaluation not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM kpi_evaluations WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_KPI_EVALUATION',
+      module: 'hr',
+      entityRef: existing.ref,
+      details: `Deleted KPI evaluation ${existing.ref}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  // --- HR Compliance & Reporting ---
+  router.post('/hr/compliance', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      title,
+      category = 'Labor Law',
+      jurisdiction = 'Federal / State',
+      dueDate,
+      ownerName = 'HR Compliance',
+      complianceRate = 100,
+      status = 'compliant',
+      notes = '',
+    } = req.body ?? {};
+    if (!String(title ?? '').trim()) {
+      res.status(400).json({ error: 'Compliance item title is required.' });
+      return;
+    }
+    const ref = await seqRef('hr_compliance_records', 'CMP');
+    const info = await db
+      .prepare(
+        `INSERT INTO hr_compliance_records (ref, title, category, jurisdiction, due_date, owner_name, compliance_rate, status, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        String(title).trim(),
+        String(category).trim(),
+        String(jurisdiction).trim(),
+        String(dueDate || new Date().toISOString().slice(0, 10)),
+        String(ownerName).trim(),
+        Math.max(0, Math.min(100, Number(complianceRate) || 0)),
+        ['compliant', 'due_soon', 'action_required'].includes(status) ? status : 'compliant',
+        String(notes).trim()
+      );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_HR_COMPLIANCE',
+      module: 'hr',
+      entityRef: ref,
+      details: `Created HR compliance item ${title}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM hr_compliance_records WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/hr/compliance/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM hr_compliance_records WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Compliance record not found.' });
+      return;
+    }
+    const { title, category, jurisdiction, dueDate, ownerName, complianceRate, status, notes } = req.body ?? {};
+    await db
+      .prepare(
+        `UPDATE hr_compliance_records
+         SET title = COALESCE(?, title),
+             category = COALESCE(?, category),
+             jurisdiction = COALESCE(?, jurisdiction),
+             due_date = COALESCE(?, due_date),
+             owner_name = COALESCE(?, owner_name),
+             compliance_rate = COALESCE(?, compliance_rate),
+             status = COALESCE(?, status),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`
+      )
+      .run(
+        title ? String(title).trim() : null,
+        category ? String(category).trim() : null,
+        jurisdiction ? String(jurisdiction).trim() : null,
+        dueDate ? String(dueDate) : null,
+        ownerName ? String(ownerName).trim() : null,
+        complianceRate !== undefined ? Math.max(0, Math.min(100, Number(complianceRate) || 0)) : null,
+        ['compliant', 'due_soon', 'action_required'].includes(status) ? status : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+    res.json(await db.prepare('SELECT * FROM hr_compliance_records WHERE id = ?').get(id));
+  });
+
+  router.delete('/hr/compliance/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref FROM hr_compliance_records WHERE id = ?').get(id)) as { ref: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Compliance record not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM hr_compliance_records WHERE id = ?').run(id);
+    res.json({ ok: true });
+  });
+
+  router.get('/hr/compliance/export', authenticate, requirePermission('hr', 'read'), async (req: AuthenticatedReq, res) => {
+    const rows = (await db.prepare('SELECT * FROM hr_compliance_records ORDER BY due_date ASC').all()) as Array<{
+      ref: string;
+      title: string;
+      category: string;
+      jurisdiction: string;
+      due_date: string;
+      owner_name: string;
+      compliance_rate: number;
+      status: string;
+      notes: string;
+    }>;
+    const header = ['Ref', 'Title', 'Category', 'Jurisdiction', 'Due Date', 'Owner', 'Compliance %', 'Status', 'Notes']
+      .map(sanitizeCsvCell)
+      .join(',');
+    const lines = rows.map((r) =>
+      [r.ref, r.title, r.category, r.jurisdiction, r.due_date, r.owner_name, r.compliance_rate, r.status, r.notes]
+        .map(sanitizeCsvCell)
+        .join(',')
+    );
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'EXPORT_HR_COMPLIANCE',
+      module: 'hr',
+      entityRef: 'hr_compliance_records',
+      details: `Exported ${rows.length} HR compliance record(s)`,
+      ipAddress: getClientIp(req),
+    });
+    res.json({
+      count: rows.length,
+      filename: 'hr-compliance-report.csv',
+      csv: [header, ...lines].join('\r\n'),
+    });
   });
 
   router.post('/timesheets', authenticate, requirePermission('hr', 'write'), async (req, res) => {
@@ -3631,7 +6489,7 @@ END:VEVENT`
       res.status(400).json({ error: 'Employee and positive hours are required.' });
       return;
     }
-    const info = (await db
+    const info = await db
       .prepare(`INSERT INTO timesheets (employee_id, project_id, work_date, hours, task_label, billable) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(
         Number(employeeId),
@@ -3640,8 +6498,8 @@ END:VEVENT`
         Number(hours),
         String(taskLabel).trim(),
         billable ? 1 : 0
-      ));
-    res.status(201).json((await db.prepare('SELECT * FROM timesheets WHERE id = ?').get(info.lastInsertRowid)));
+      );
+    res.status(201).json(await db.prepare('SELECT * FROM timesheets WHERE id = ?').get(info.lastInsertRowid));
   });
 
   router.put('/timesheets/:id', authenticate, requirePermission('hr', 'write'), async (req: AuthenticatedReq, res) => {
@@ -3660,25 +6518,27 @@ END:VEVENT`
         : projectId !== undefined
           ? Number(projectId)
           : existing.project_id;
-    (await db.prepare(
-      `UPDATE timesheets
-       SET employee_id = COALESCE(?, employee_id),
-           project_id = ?,
-           work_date = COALESCE(?, work_date),
-           hours = COALESCE(?, hours),
-           task_label = COALESCE(?, task_label),
-           billable = COALESCE(?, billable)
-       WHERE id = ?`
-    ).run(
-      employeeId !== undefined ? Number(employeeId) : null,
-      nextProjectId,
-      workDate ? String(workDate) : null,
-      hours !== undefined ? Math.max(0.25, Number(hours) || 1) : null,
-      taskLabel !== undefined ? String(taskLabel).trim() : null,
-      billable !== undefined ? (billable ? 1 : 0) : null,
-      id
-    ));
-    (await writeAuditLog(db, {
+    await db
+      .prepare(
+        `UPDATE timesheets
+         SET employee_id = COALESCE(?, employee_id),
+             project_id = ?,
+             work_date = COALESCE(?, work_date),
+             hours = COALESCE(?, hours),
+             task_label = COALESCE(?, task_label),
+             billable = COALESCE(?, billable)
+         WHERE id = ?`
+      )
+      .run(
+        employeeId !== undefined ? Number(employeeId) : null,
+        nextProjectId,
+        workDate ? String(workDate) : null,
+        hours !== undefined ? Math.max(0.25, Number(hours) || 1) : null,
+        taskLabel !== undefined ? String(taskLabel).trim() : null,
+        billable !== undefined ? (billable ? 1 : 0) : null,
+        id
+      );
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'UPDATE_TIMESHEET',
@@ -3686,8 +6546,8 @@ END:VEVENT`
       entityRef: `TS-${id}`,
       details: `Updated timesheet entry #${id}`,
       ipAddress: getClientIp(req),
-    }));
-    res.json((await db.prepare('SELECT * FROM timesheets WHERE id = ?').get(id)));
+    });
+    res.json(await db.prepare('SELECT * FROM timesheets WHERE id = ?').get(id));
   });
 
   router.delete('/timesheets/:id', authenticate, requirePermission('hr', 'delete'), async (req: AuthenticatedReq, res) => {
@@ -3697,8 +6557,8 @@ END:VEVENT`
       res.status(404).json({ error: 'Timesheet entry not found.' });
       return;
     }
-    (await db.prepare('DELETE FROM timesheets WHERE id = ?').run(id));
-    (await writeAuditLog(db, {
+    await db.prepare('DELETE FROM timesheets WHERE id = ?').run(id);
+    await writeAuditLog(db, {
       userId: req.authUser!.id,
       userEmail: req.authUser!.email,
       action: 'DELETE_TIMESHEET',
@@ -3707,7 +6567,7 @@ END:VEVENT`
       details: `Deleted timesheet entry #${id}`,
       ipAddress: getClientIp(req),
       severity: 'warning',
-    }));
+    });
     res.json({ ok: true });
   });
 

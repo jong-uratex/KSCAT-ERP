@@ -452,6 +452,11 @@ export interface Invoice {
   third_party_id: number;
   party_name: string;
   party_ref: string;
+  project_id?: number | null;
+  project_ref?: string | null;
+  project_title?: string | null;
+  currency?: string;
+  exchange_rate?: number;
   source_ref: string;
   issue_date: string;
   due_date: string;
@@ -487,6 +492,9 @@ export interface BankTransaction {
   amount: number;
   direction: 'credit' | 'debit';
   invoice_ref: string;
+  reconciled?: number;
+  reconciled_at?: string;
+  statement_ref?: string;
   created_by: string;
 }
 
@@ -509,6 +517,7 @@ export interface AccountingAccount {
   label: string;
   account_class: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
   balance: number;
+  is_active?: number;
 }
 
 export interface JournalEntry {
@@ -521,6 +530,11 @@ export interface JournalEntry {
   credit_account_code: string;
   amount: number;
   source_ref: string;
+  project_id?: number | null;
+  project_ref?: string | null;
+  project_title?: string | null;
+  is_reversal?: number;
+  reversed_entry_ref?: string;
   created_by: string;
 }
 
@@ -547,6 +561,163 @@ export interface LoanItem {
   term_months: number;
   start_date: string;
   status: 'active' | 'paid_off';
+}
+
+export interface FiscalPeriodItem {
+  id: number;
+  code: string;
+  name: string;
+  start_date: string;
+  end_date: string;
+  status: 'open' | 'closed';
+  closed_by: string;
+  closed_at: string;
+}
+
+export interface CurrencyRateItem {
+  id: number;
+  code: string;
+  name: string;
+  symbol: string;
+  exchange_rate: number;
+  is_base: number;
+  updated_at?: string;
+}
+
+export interface TaxRateItem {
+  id: number;
+  code: string;
+  name: string;
+  rate: number;
+  tax_type: 'sales' | 'purchase' | 'both';
+  applies_to: string;
+  is_active: number;
+  notes: string;
+}
+
+export interface ProjectBudgetItem {
+  id: number;
+  project_id: number;
+  project_ref: string;
+  project_title: string;
+  project_status: string;
+  cost_code: string;
+  category: string;
+  description: string;
+  planned_budget: number;
+  committed_amount: number;
+  hourly_cost_rate: number;
+  hourly_bill_rate: number;
+}
+
+export interface ProjectProfitabilityRow {
+  project_id: number;
+  project_ref: string;
+  project_title: string;
+  customer_name: string;
+  status: string;
+  progress: number;
+  planned_budget: number;
+  committed_cost: number;
+  invoiced_revenue: number;
+  billable_hours: number;
+  non_billable_hours: number;
+  labor_cost: number;
+  billable_labor_value: number;
+  supplier_costs: number;
+  gl_direct_costs: number;
+  total_actual_cost: number;
+  effective_revenue: number;
+  gross_profit: number;
+  margin_pct: number;
+  budget_utilization_pct: number;
+}
+
+export interface FixedAssetItem {
+  id: number;
+  ref: string;
+  name: string;
+  category: string;
+  acquisition_date: string;
+  purchase_cost: number;
+  salvage_value: number;
+  useful_life_months: number;
+  depreciation_method: 'straight_line' | 'declining_balance';
+  accumulated_depreciation: number;
+  last_depreciation_date: string;
+  location: string;
+  status: 'active' | 'fully_depreciated' | 'disposed';
+  notes: string;
+  net_book_value: number;
+  monthly_depreciation: number;
+}
+
+export interface RecurringInvoiceItem {
+  id: number;
+  ref: string;
+  invoice_type: 'customer' | 'supplier';
+  third_party_id: number;
+  party_name: string;
+  party_ref: string;
+  project_id: number | null;
+  project_ref: string | null;
+  project_title: string | null;
+  title: string;
+  frequency: 'monthly' | 'quarterly' | 'annual';
+  next_run_date: string;
+  currency: string;
+  lines_json: string;
+  total_ttc: number;
+  status: 'active' | 'paused' | 'ended';
+  last_generated_ref: string;
+  notes: string;
+}
+
+export interface AgingBuckets {
+  current: number;
+  days_1_30: number;
+  days_31_60: number;
+  days_61_plus: number;
+  total: number;
+}
+
+export interface AgingBucketSummary {
+  ar: AgingBuckets;
+  ap: AgingBuckets;
+}
+
+export interface FinancialStatementsPayload {
+  trialBalance: {
+    rows: Array<{
+      code: string;
+      label: string;
+      account_class: AccountingAccount['account_class'];
+      debit: number;
+      credit: number;
+    }>;
+    totalDebits: number;
+    totalCredits: number;
+    isBalanced: boolean;
+  };
+  profitAndLoss: {
+    revenueItems: Array<{ code: string; label: string; amount: number }>;
+    expenseItems: Array<{ code: string; label: string; amount: number }>;
+    totalRevenue: number;
+    totalExpenses: number;
+    netIncome: number;
+    netMarginPct: number;
+  };
+  balanceSheet: {
+    assetItems: Array<{ code: string; label: string; amount: number }>;
+    liabilityItems: Array<{ code: string; label: string; amount: number }>;
+    equityItems: Array<{ code: string; label: string; amount: number }>;
+    totalAssets: number;
+    totalLiabilities: number;
+    totalEquity: number;
+    netIncome: number;
+    totalLiabilitiesAndEquity: number;
+    isBalanced: boolean;
+  };
 }
 
 export interface TicketItem {
@@ -637,6 +808,22 @@ export interface SurveyItem {
   status: 'open' | 'closed';
 }
 
+export interface JobHistoryEntry {
+  role: string;
+  department: string;
+  startDate: string;
+  endDate: string;
+  notes?: string;
+}
+
+export interface TaxDocumentEntry {
+  title: string;
+  year: string;
+  formType: string;
+  status: string;
+  uploadedAt: string;
+}
+
 export interface EmployeeItem {
   id: number;
   ref: string;
@@ -645,9 +832,15 @@ export interface EmployeeItem {
   phone: string;
   department: string;
   job_title: string;
+  employment_type?: string;
   hire_date: string;
   annual_salary: number;
   leave_balance_days: number;
+  tax_id?: string;
+  bank_account?: string;
+  emergency_contact?: string;
+  job_history_json?: string;
+  tax_documents_json?: string;
   status: 'active' | 'on_leave' | 'terminated';
 }
 
@@ -715,6 +908,180 @@ export interface TimesheetItem {
   hours: number;
   task_label: string;
   billable: number;
+}
+
+export interface AttendanceLogItem {
+  id: number;
+  employee_id: number;
+  employee_name: string;
+  department: string;
+  work_date: string;
+  clock_in: string;
+  clock_out: string;
+  shift_name: string;
+  regular_hours: number;
+  overtime_hours: number;
+  status: 'present' | 'late' | 'remote' | 'absent' | 'approved';
+  notes: string;
+  approved_by: string;
+}
+
+export interface ShiftScheduleItem {
+  id: number;
+  ref: string;
+  employee_id: number;
+  employee_name: string;
+  department: string;
+  shift_name: string;
+  start_time: string;
+  end_time: string;
+  work_days: string;
+  location: string;
+  status: 'active' | 'inactive';
+}
+
+export interface PayrollRunItem {
+  id: number;
+  ref: string;
+  pay_period: string;
+  pay_date: string;
+  total_gross: number;
+  total_deductions: number;
+  total_net: number;
+  employee_count: number;
+  status: 'draft' | 'processed' | 'paid';
+  created_by: string;
+}
+
+export interface PayslipItem {
+  id: number;
+  ref: string;
+  payroll_run_id: number;
+  employee_id: number;
+  employee_name: string;
+  employee_ref?: string;
+  department?: string;
+  job_title?: string;
+  tax_id?: string;
+  bank_account?: string;
+  pay_period: string;
+  gross_pay: number;
+  tax_deduction: number;
+  social_deduction: number;
+  health_deduction: number;
+  other_deductions: number;
+  net_pay: number;
+  direct_deposit_ref: string;
+  payment_method: string;
+  status: 'generated' | 'paid';
+}
+
+export interface BenefitPlanItem {
+  id: number;
+  ref: string;
+  name: string;
+  provider: string;
+  category: string;
+  employer_contribution: number;
+  employee_contribution: number;
+  description: string;
+  status: 'active' | 'archived';
+}
+
+export interface BenefitEnrollmentItem {
+  id: number;
+  employee_id: number;
+  employee_name: string;
+  department: string;
+  plan_id: number;
+  plan_name: string;
+  plan_ref: string;
+  plan_category: string;
+  employee_contribution: number;
+  employer_contribution: number;
+  coverage_tier: string;
+  enrollment_date: string;
+  status: 'pending' | 'active' | 'cancelled';
+  notes: string;
+}
+
+export interface OnboardingTaskItem {
+  id: number;
+  ref: string;
+  employee_id: number | null;
+  employee_name: string | null;
+  candidate_id: number | null;
+  candidate_name: string | null;
+  task_title: string;
+  category: string;
+  due_date: string;
+  assignee_name: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  notes: string;
+}
+
+export interface KpiMetricItem {
+  id: string;
+  kpiName: string;
+  category: string;
+  weightPct: number;
+  targetValue: string;
+  actualValue: string;
+  unit: string;
+  score: number;
+}
+
+export interface KpiEvaluationItem {
+  id: number;
+  ref: string;
+  employee_id: number;
+  employee_name: string;
+  department: string;
+  job_title: string;
+  evaluator_name: string;
+  review_period: string;
+  period_start: string;
+  period_end: string;
+  metrics_json: string;
+  overall_score: number;
+  rating_label: string;
+  strengths: string;
+  improvement_plan: string;
+  employee_comments: string;
+  status: 'draft' | 'self_review' | 'submitted' | 'approved';
+  reviewed_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HrComplianceItem {
+  id: number;
+  ref: string;
+  title: string;
+  category: string;
+  jurisdiction: string;
+  due_date: string;
+  owner_name: string;
+  compliance_rate: number;
+  status: 'compliant' | 'due_soon' | 'action_required';
+  notes: string;
+}
+
+export interface HrAnalyticsSummary {
+  totalHeadcount: number;
+  activeHeadcount: number;
+  onLeaveCount: number;
+  terminatedCount: number;
+  turnoverRatePct: number;
+  totalAnnualPayroll: number;
+  monthlyPayrollEstimate: number;
+  latestPayrollNet: number;
+  totalOvertimeHours: number;
+  pendingLeaveCount: number;
+  onboardingCompletionPct: number;
+  avgKpiScore: number;
+  complianceRatePct: number;
+  departmentBreakdown: Array<{ department: string; headcount: number; payroll: number }>;
 }
 
 export interface EdmDocument {
