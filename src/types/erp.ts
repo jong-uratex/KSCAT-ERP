@@ -529,6 +529,9 @@ export interface JournalEntry {
   debit_account_code: string;
   credit_account_code: string;
   amount: number;
+  currency?: string;
+  exchange_rate?: number;
+  original_amount?: number;
   source_ref: string;
   project_id?: number | null;
   project_ref?: string | null;
@@ -717,6 +720,391 @@ export interface FinancialStatementsPayload {
     netIncome: number;
     totalLiabilitiesAndEquity: number;
     isBalanced: boolean;
+  };
+}
+
+export type GeneralLedgerEntryStatus = 'posted' | 'reversal' | 'reversed' | 'locked';
+
+export interface GeneralLedgerEntryRow extends JournalEntry {
+  debit_account_label: string;
+  debit_account_class: AccountingAccount['account_class'];
+  credit_account_label: string;
+  credit_account_class: AccountingAccount['account_class'];
+  entry_status: GeneralLedgerEntryStatus;
+  fiscal_period_code: string;
+  fiscal_period_status: 'open' | 'closed';
+}
+
+export interface GeneralLedgerLineRow {
+  line_id: string;
+  entry_id: number;
+  ref: string;
+  entry_date: string;
+  journal_code: string;
+  account_code: string;
+  account_label: string;
+  account_class: AccountingAccount['account_class'];
+  counterpart_code: string;
+  counterpart_label: string;
+  description: string;
+  source_ref: string;
+  project_ref: string | null;
+  debit: number;
+  credit: number;
+  entry_status: GeneralLedgerEntryStatus;
+  fiscal_period_code: string;
+  reversed_entry_ref: string;
+  created_by: string;
+}
+
+export interface GeneralLedgerAccountSummary {
+  code: string;
+  label: string;
+  account_class: AccountingAccount['account_class'];
+  current_balance: number;
+  period_debits: number;
+  period_credits: number;
+  net_change: number;
+  tx_count: number;
+}
+
+export interface GeneralLedgerReportPayload {
+  entries: GeneralLedgerEntryRow[];
+  lines: GeneralLedgerLineRow[];
+  accountSummary: GeneralLedgerAccountSummary[];
+  accounts: AccountingAccount[];
+  fiscalPeriods: FiscalPeriodItem[];
+  summary: {
+    entryCount: number;
+    lineCount: number;
+    totalDebits: number;
+    totalCredits: number;
+    netMovement: number;
+    isBalanced: boolean;
+  };
+}
+
+export interface BankStatementItem {
+  id: number;
+  ref: string;
+  bank_account_id: number;
+  statement_name: string;
+  statement_date: string;
+  period_start: string;
+  period_end: string;
+  opening_balance: number;
+  closing_balance: number;
+  currency: string;
+  source_type: 'manual' | 'csv';
+  status: 'open' | 'in_progress' | 'reconciled';
+  notes: string;
+  created_by: string;
+  created_at: string;
+  account_ref: string;
+  account_name: string;
+  bank_name: string;
+  account_book_balance: number;
+  line_count: number;
+  matched_count: number;
+  unmatched_count: number;
+  ignored_count: number;
+  matched_net: number;
+  unmatched_volume: number;
+}
+
+export interface BankStatementLineItem {
+  id: number;
+  statement_id: number;
+  tx_date: string;
+  description: string;
+  reference: string;
+  direction: 'credit' | 'debit';
+  amount: number;
+  running_balance: number | null;
+  match_status: 'unmatched' | 'matched' | 'ignored';
+  matched_journal_entry_id: number | null;
+  matched_journal_ref: string;
+  matched_at: string;
+  matched_by: string;
+  match_note: string;
+  journal_date?: string | null;
+  journal_code?: string | null;
+  journal_description?: string | null;
+  debit_account_code?: string | null;
+  credit_account_code?: string | null;
+  journal_amount?: number | null;
+  journal_source_ref?: string | null;
+}
+
+export interface ReconcilableJournalEntry extends JournalEntry {
+  debit_account_label: string;
+  credit_account_label: string;
+  is_matched: boolean;
+  matched_line_id: number | null;
+  matched_statement_ref: string;
+}
+
+export interface BankReconciliationSummary {
+  totalStatements: number;
+  totalLines: number;
+  matchedCount: number;
+  unmatchedCount: number;
+  ignoredCount: number;
+  totalInflows: number;
+  totalOutflows: number;
+  statementNetFlow: number;
+  matchedNet: number;
+  unmatchedVolume: number;
+  openingBalance: number;
+  closingBalance: number;
+  computedEndingBalance: number;
+  reconciledEndingBalance: number;
+  reconciliationGap: number;
+}
+
+export interface BankReconciliationPayload {
+  bankAccounts: BankAccount[];
+  statements: BankStatementItem[];
+  activeStatement: BankStatementItem | null;
+  lines: BankStatementLineItem[];
+  journalEntries: ReconcilableJournalEntry[];
+  accounts: AccountingAccount[];
+  summary: BankReconciliationSummary;
+}
+
+export type TaxComplianceBucket = 'output' | 'input_recognized' | 'input_pending_po';
+
+export interface TaxComplianceDocumentLineDetail {
+  label: string;
+  ref: string;
+  qty: number;
+  netBaseUsd: number;
+  taxRate: number;
+  taxAmountUsd: number;
+}
+
+export interface TaxComplianceDocumentRow {
+  uid: string;
+  id: number;
+  source: 'invoice' | 'purchase_order';
+  doc_type_label: string;
+  ref: string;
+  source_ref: string;
+  party_name: string;
+  party_tax_id: string;
+  doc_date: string;
+  due_or_expected_date: string;
+  status: string;
+  currency: string;
+  exchange_rate: number;
+  taxable_base_usd: number;
+  tax_amount_usd: number;
+  signed_tax_usd: number;
+  liability_impact_usd: number;
+  vat_bucket: TaxComplianceBucket;
+  effective_rate_pct: number;
+  line_details: TaxComplianceDocumentLineDetail[];
+}
+
+export interface TaxComplianceRateBucket {
+  rate: number;
+  tax_code: string;
+  tax_name: string;
+  tax_type: string;
+  sales_base_usd: number;
+  output_vat_usd: number;
+  purchases_base_usd: number;
+  recognized_input_vat_usd: number;
+  pending_po_base_usd: number;
+  pending_po_input_vat_usd: number;
+  net_vat_usd: number;
+  projected_net_vat_usd: number;
+  doc_count: number;
+}
+
+export interface TaxCompliancePeriodRow {
+  period_month: string;
+  output_vat_usd: number;
+  recognized_input_vat_usd: number;
+  pending_po_input_vat_usd: number;
+  net_payable_usd: number;
+  projected_payable_usd: number;
+  doc_count: number;
+}
+
+export interface TaxComplianceSummary {
+  baseCurrency: string;
+  grossOutputVat: number;
+  creditNoteOutputOffset: number;
+  netOutputVat: number;
+  recognizedInputVat: number;
+  pendingPoInputVat: number;
+  totalPotentialInputVat: number;
+  netStatutoryPayable: number;
+  projectedNetLiability: number;
+  glVatPayableBalance: number;
+  glVariance: number;
+  taxableSalesBase: number;
+  taxablePurchasesBase: number;
+  pendingPoBase: number;
+  customerInvoiceCount: number;
+  supplierBillCount: number;
+  openPoCount: number;
+  billedPoExcludedCount: number;
+  draftExcludedCount: number;
+}
+
+export interface TaxCompliancePayload {
+  summary: TaxComplianceSummary;
+  documents: TaxComplianceDocumentRow[];
+  rateBreakdown: TaxComplianceRateBucket[];
+  monthlyTimeline: TaxCompliancePeriodRow[];
+  fiscalPeriods: FiscalPeriodItem[];
+  taxRates: TaxRateItem[];
+}
+
+export type FiscalBudgetAlertStatus = 'on_track' | 'warning' | 'over_budget';
+export type FiscalBudgetSpendSource =
+  | 'auto'
+  | 'gl_account'
+  | 'supplier_bills'
+  | 'payroll'
+  | 'bank_debits'
+  | 'expenses'
+  | 'manual';
+
+export interface FiscalBudgetSpendLine {
+  sourceLabel: string;
+  ref: string;
+  date: string;
+  description: string;
+  amount: number;
+}
+
+export interface FiscalBudgetItem {
+  id: number;
+  ref: string;
+  fiscal_period_id: number;
+  period_code: string;
+  period_name: string;
+  period_start: string;
+  period_end: string;
+  period_status: 'open' | 'closed';
+  name: string;
+  category: string;
+  department: string;
+  account_code: string;
+  account_label: string;
+  planned_amount: number;
+  warning_threshold_pct: number;
+  critical_threshold_pct: number;
+  spend_source: FiscalBudgetSpendSource;
+  manual_actual_amount: number;
+  actual_amount: number;
+  remaining_amount: number;
+  variance_amount: number;
+  utilization_pct: number;
+  alert_status: FiscalBudgetAlertStatus;
+  actual_breakdown: FiscalBudgetSpendLine[];
+  notes: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FiscalBudgetsSummary {
+  totalBudgets: number;
+  totalPlanned: number;
+  totalActual: number;
+  totalRemaining: number;
+  totalVariance: number;
+  overallUtilizationPct: number;
+  overBudgetCount: number;
+  warningCount: number;
+  onTrackCount: number;
+  alertCount: number;
+}
+
+export interface FiscalBudgetsPayload {
+  budgets: FiscalBudgetItem[];
+  alerts: FiscalBudgetItem[];
+  summary: FiscalBudgetsSummary;
+  fiscalPeriods: FiscalPeriodItem[];
+  accounts: AccountingAccount[];
+  categories: string[];
+}
+
+export interface CurrencyPeriodRateItem {
+  id: number;
+  currency_code: string;
+  currency_name?: string;
+  currency_symbol?: string;
+  fiscal_period_id: number | null;
+  period_code: string;
+  period_name?: string;
+  period_status?: 'open' | 'closed';
+  effective_from: string;
+  effective_to: string;
+  exchange_rate: number;
+  closing_rate: number;
+  inverse_rate: number;
+  rate_source: string;
+  notes: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CurrencyConversionResult {
+  originalAmount: number;
+  fromCurrency: string;
+  toCurrency: string;
+  baseCurrencyCode: string;
+  baseAmount: number;
+  convertedAmount: number;
+  fromRate: number;
+  toRate: number;
+  crossRate: number;
+  inverseCrossRate: number;
+  rateSource: 'base' | 'period_rate' | 'spot_fallback' | 'explicit_override';
+  periodCode: string;
+  effectiveFrom: string;
+  effectiveTo: string;
+  txDate: string;
+}
+
+export interface FxExposureRow {
+  docType: 'customer_invoice' | 'supplier_bill' | 'bank_account';
+  id: number;
+  ref: string;
+  partyOrBank: string;
+  currency: string;
+  issueDate: string;
+  foreignBalance: number;
+  bookedRate: number;
+  bookedBaseAmount: number;
+  closingRate: number;
+  revaluedBaseAmount: number;
+  unrealizedFxGainLoss: number;
+  rateSource: 'base' | 'period_rate' | 'spot_fallback' | 'explicit_override';
+  periodCode: string;
+}
+
+export interface MultiCurrencyWorkspacePayload {
+  baseCurrency: CurrencyRateItem;
+  currencies: CurrencyRateItem[];
+  fiscalPeriods: FiscalPeriodItem[];
+  periodRates: CurrencyPeriodRateItem[];
+  revaluationPeriod: FiscalPeriodItem | null;
+  exposures: FxExposureRow[];
+  summary: {
+    totalCurrencies: number;
+    periodRatesCount: number;
+    foreignExposureBaseTotal: number;
+    netUnrealizedFxGainLoss: number;
+    activeForeignInvoicesCount: number;
+    foreignJournalEntriesCount: number;
+    foreignJournalEntriesBaseTotal: number;
   };
 }
 

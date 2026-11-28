@@ -9,6 +9,7 @@ import {
   type PermissionModule,
 } from './rbac.ts';
 import { createExtraApiRouter } from './routes_extra.ts';
+import { createCurrencyService, round2 } from './services/currencyService.ts';
 import { WebRouter, type ApiRequest, type ApiResponse, type NextFunction } from './web_router.ts';
 import {
   buildOtpAuthUri,
@@ -2522,13 +2523,19 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
     const cleanType = invoiceType === 'supplier' ? 'supplier' : 'customer';
     const cleanKind = invoiceKind === 'credit_note' ? 'credit_note' : 'standard';
     const cleanProjId = projectId !== null && projectId !== '' && Number(projectId) > 0 ? Number(projectId) : null;
-    const cleanCurrency = String(currency || 'USD').trim().toUpperCase().slice(0, 8) || 'USD';
+    const currencyService = createCurrencyService(db);
+    const baseCurr = await currencyService.getBaseCurrency();
+    const cleanCurrency = String(currency || baseCurr.code).trim().toUpperCase().slice(0, 8) || baseCurr.code;
+    const today = new Date().toISOString().slice(0, 10);
+    const effectiveIssueDate = String(issueDate || today);
     let fxRate = Number(exchangeRate);
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
-      const currRow = (await db.prepare('SELECT exchange_rate FROM currencies WHERE code = ?').get(cleanCurrency)) as
-        | { exchange_rate: number }
-        | undefined;
-      fxRate = currRow?.exchange_rate && currRow.exchange_rate > 0 ? currRow.exchange_rate : 1;
+      try {
+        const resolved = await currencyService.resolveExchangeRate(cleanCurrency, { txDate: effectiveIssueDate });
+        fxRate = resolved.exchangeRate;
+      } catch {
+        fxRate = 1;
+      }
     }
     try {
       const totals = computeLineTotals(lines);
@@ -2549,7 +2556,7 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
           cleanProjId,
           cleanCurrency,
           fxRate,
-          String(issueDate || today),
+          effectiveIssueDate,
           String(dueDate || due),
           JSON.stringify(totals.sanitized),
           totals.subtotalHt,
@@ -2592,15 +2599,22 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
           : Number(projectId);
     const nextCurrency =
       isDraft && currency ? String(currency).trim().toUpperCase().slice(0, 8) || existing.currency : existing.currency;
+    const currencyService = createCurrencyService(db);
     let nextFx = existing.exchange_rate || 1;
     if (isDraft) {
+      const targetIssueDate = issueDate ? String(issueDate) : undefined;
       if (exchangeRate !== undefined && Number(exchangeRate) > 0) {
         nextFx = Number(exchangeRate);
-      } else if (currency && nextCurrency !== existing.currency) {
-        const currRow = (await db.prepare('SELECT exchange_rate FROM currencies WHERE code = ?').get(nextCurrency)) as
-          | { exchange_rate: number }
-          | undefined;
-        nextFx = currRow?.exchange_rate && currRow.exchange_rate > 0 ? currRow.exchange_rate : 1;
+      } else if ((currency && nextCurrency !== existing.currency) || targetIssueDate) {
+        try {
+          const invDateRow = targetIssueDate
+            ? { issue_date: targetIssueDate }
+            : ((await db.prepare('SELECT issue_date FROM invoices WHERE id = ?').get(id)) as { issue_date: string } | undefined);
+          const resolved = await currencyService.resolveExchangeRate(nextCurrency, { txDate: invDateRow?.issue_date });
+          nextFx = resolved.exchangeRate;
+        } catch {
+          nextFx = 1;
+        }
       }
     }
     try {
@@ -2695,10 +2709,13 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
           id: number;
           ref: string;
           invoice_type: 'customer' | 'supplier';
+          currency: string;
+          exchange_rate: number;
           status: string;
           total_ttc: number;
           amount_paid: number;
           party_name: string;
+          project_id: number | null;
         }
       | undefined;
     if (!inv) {
@@ -2709,20 +2726,58 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
       res.status(400).json({ error: 'Validate the invoice before recording a payment.' });
       return;
     }
+    const bankAccount = (await db
+      .prepare('SELECT id, ref, currency, balance FROM bank_accounts WHERE id = ?')
+      .get(Number(bankAccountId))) as { id: number; ref: string; currency: string; balance: number } | undefined;
+    if (!bankAccount) {
+      res.status(404).json({ error: 'Bank account not found.' });
+      return;
+    }
+
     const remaining = Math.round((inv.total_ttc - inv.amount_paid) * 100) / 100;
     if (payAmount > remaining + 0.01) {
-      res.status(400).json({ error: `Payment exceeds remaining balance ($${remaining.toFixed(2)}).` });
+      res.status(400).json({ error: `Payment exceeds remaining balance (${inv.currency} ${remaining.toFixed(2)}).` });
       return;
+    }
+
+    const currencyService = createCurrencyService(db);
+    const txDate = String(paymentDate || new Date().toISOString().slice(0, 10));
+    const fxImpact = await currencyService.computeSettlementFxImpact({
+      invoiceType: inv.invoice_type,
+      invoiceCurrency: inv.currency || 'USD',
+      invoiceRate: inv.exchange_rate || 1,
+      settlementAmount: payAmount,
+      paymentDate: txDate,
+    });
+
+    const invCcy = (inv.currency || fxImpact.baseCurrencyCode).toUpperCase();
+    const bankCcy = (bankAccount.currency || fxImpact.baseCurrencyCode).toUpperCase();
+    let bankSettlementAmount = payAmount;
+    if (bankCcy !== invCcy) {
+      if (bankCcy === fxImpact.baseCurrencyCode) {
+        bankSettlementAmount = fxImpact.settledBaseAmount;
+      } else {
+        const conv = await currencyService.convertAmount({
+          amount: payAmount,
+          fromCurrency: invCcy,
+          toCurrency: bankCcy,
+          txDate,
+        });
+        bankSettlementAmount = conv.convertedAmount;
+      }
     }
 
     const nextPaid = Math.min(inv.total_ttc, Math.round((inv.amount_paid + payAmount) * 100) / 100);
     const nextStatus = nextPaid >= inv.total_ttc - 0.01 ? 'paid' : 'partial';
     const direction = inv.invoice_type === 'customer' ? 'credit' : 'debit';
-    const balanceDelta = direction === 'credit' ? payAmount : -payAmount;
-    const txDate = String(paymentDate || new Date().toISOString().slice(0, 10));
+    const balanceDelta = direction === 'credit' ? bankSettlementAmount : -bankSettlementAmount;
+    const fxTag =
+      invCcy !== fxImpact.baseCurrencyCode
+        ? ` [${invCcy} ${payAmount.toFixed(2)} @ ${fxImpact.settlementRate.toFixed(4)} = ${fxImpact.baseCurrencyCode} ${fxImpact.settledBaseAmount.toFixed(2)}]`
+        : '';
     const txLabel =
       String(label ?? '').trim() ||
-      `${inv.invoice_type === 'customer' ? 'Payment' : 'Bill Settlement'} ${inv.ref} — ${inv.party_name}`;
+      `${inv.invoice_type === 'customer' ? 'Payment' : 'Bill Settlement'} ${inv.ref} — ${inv.party_name}${fxTag}`;
 
     (await db.exec('BEGIN'));
     try {
@@ -2736,11 +2791,50 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
         txDate,
         txLabel,
         inv.invoice_type === 'customer' ? 'Customer Payment' : 'Supplier Payment',
-        payAmount,
+        bankSettlementAmount,
         direction,
         inv.ref,
         req.authUser!.email
       ));
+
+      if (Math.abs(fxImpact.fxGainLoss) >= 0.01) {
+        const fxAbs = round2(Math.abs(fxImpact.fxGainLoss));
+        const isGain = fxImpact.fxGainLoss > 0;
+        const debitCode = isGain ? (inv.invoice_type === 'customer' ? '1200' : '2000') : '6350';
+        const creditCode = isGain ? '4300' : (inv.invoice_type === 'customer' ? '1200' : '2000');
+        const fxJrnRef = await nextDocRef('journal_entries', 'FX');
+        await db
+          .prepare(
+            `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, currency, exchange_rate, original_amount, source_ref, project_id, created_by)
+             VALUES (?, ?, 'FX', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+          )
+          .run(
+            fxJrnRef,
+            txDate,
+            `Realized FX ${isGain ? 'Gain' : 'Loss'} on ${inv.ref} (${invCcy} @ ${fxImpact.bookedRate.toFixed(4)} → ${fxImpact.settlementRate.toFixed(4)})`,
+            debitCode,
+            creditCode,
+            fxAbs,
+            fxImpact.baseCurrencyCode,
+            fxAbs,
+            inv.ref,
+            inv.project_id ?? null,
+            req.authUser!.email
+          );
+
+        const adjustAcct = async (code: string, side: 'debit' | 'credit', amt: number) => {
+          const acct = (await db.prepare('SELECT account_class FROM accounting_accounts WHERE code = ?').get(code)) as
+            | { account_class: string }
+            | undefined;
+          if (!acct) return;
+          const isDebitNormal = acct.account_class === 'asset' || acct.account_class === 'expense';
+          const delta = (side === 'debit' && isDebitNormal) || (side === 'credit' && !isDebitNormal) ? amt : -amt;
+          await db.prepare('UPDATE accounting_accounts SET balance = ROUND(balance + ?, 2) WHERE code = ?').run(delta, code);
+        };
+        await adjustAcct(debitCode, 'debit', fxAbs);
+        await adjustAcct(creditCode, 'credit', fxAbs);
+      }
+
       (await db.exec('COMMIT'));
       (await writeAuditLog(db, {
         userId: req.authUser!.id,
@@ -2748,10 +2842,11 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
         action: 'RECORD_PAYMENT',
         module: 'billing',
         entityRef: inv.ref,
-        details: `Recorded $${payAmount.toFixed(2)} (${nextStatus}) on ${inv.ref}`,
+        details: `Recorded ${invCcy} ${payAmount.toFixed(2)} (${bankCcy} ${bankSettlementAmount.toFixed(2)}, ${nextStatus}) on ${inv.ref}`,
         ipAddress: getClientIp(req),
       }));
-      res.json((await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id)));
+      const updatedInv = await db.prepare('SELECT * FROM invoices WHERE id = ?').get(id);
+      res.json({ ...(updatedInv as Record<string, unknown>), fxImpact });
     } catch (err) {
       (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Payment recording failed.' });
@@ -3779,25 +3874,33 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
     res.json({ settings: (await getSystemSettings()) });
   });
 
+  const AUDIT_AUTH_ACTIONS_SQL = `'LOGIN_SUCCESS', 'LOGIN_FAILED', 'LOGIN_MFA_SUCCESS', 'MFA_FAILED', 'MFA_RECOVERY_USED', 'MFA_RECOVERY_FAILED', 'MFA_ENROLLED', 'MFA_DISABLED', 'MFA_RECOVERY_REGENERATED', 'ACCOUNT_LOCKED', 'LOGOUT', 'SESSION_REVOKED', 'CHANGE_PASSWORD'`;
+  const AUDIT_CONFIG_ACTIONS_SQL = `'UPDATE_SYSTEM_SETTINGS', 'UPDATE_SECURITY_POLICY', 'ENABLE_MODULE', 'DISABLE_MODULE', 'UPDATE_INTEGRATION', 'CREATE_ROLE', 'UPDATE_ROLE_PERMISSIONS', 'DELETE_ROLE', 'WORKSPACE_BOOTSTRAP', 'CREATE_CURRENCY', 'UPDATE_CURRENCY', 'DELETE_CURRENCY', 'CREATE_TAX_RATE', 'UPDATE_TAX_RATE', 'DELETE_TAX_RATE', 'CREATE_FISCAL_PERIOD', 'TOGGLE_FISCAL_PERIOD', 'DELETE_FISCAL_PERIOD'`;
+  const AUDIT_PERM_ACTIONS_SQL = `'CREATE_ROLE', 'UPDATE_ROLE_PERMISSIONS', 'DELETE_ROLE', 'UPDATE_SECURITY_POLICY', 'PERMISSION_DENIED', 'CREATE_USER', 'UPDATE_USER', 'DELETE_USER', 'ADMIN_UNLOCK_USER', 'ADMIN_RESET_MFA', 'WORKSPACE_BOOTSTRAP'`;
+
   function buildAuditFilterClause(query: Record<string, unknown>) {
     const conditions: string[] = [];
     const params: (string | number)[] = [];
 
     const category = String(query.category ?? 'all');
     if (category === 'authentication') {
-      conditions.push(
-        `action IN ('LOGIN_SUCCESS', 'LOGIN_FAILED', 'LOGIN_MFA_SUCCESS', 'MFA_FAILED', 'MFA_RECOVERY_USED', 'MFA_RECOVERY_FAILED', 'MFA_ENROLLED', 'MFA_DISABLED', 'ACCOUNT_LOCKED', 'LOGOUT', 'SESSION_REVOKED')`
-      );
+      conditions.push(`action IN (${AUDIT_AUTH_ACTIONS_SQL})`);
+    } else if (category === 'config' || category === 'configuration') {
+      conditions.push(`action IN (${AUDIT_CONFIG_ACTIONS_SQL})`);
     } else if (category === 'permissions') {
-      conditions.push(
-        `action IN ('CREATE_ROLE', 'UPDATE_ROLE_PERMISSIONS', 'DELETE_ROLE', 'UPDATE_SECURITY_POLICY', 'PERMISSION_DENIED', 'CREATE_USER', 'UPDATE_USER', 'ADMIN_UNLOCK_USER', 'ADMIN_RESET_MFA', 'WORKSPACE_BOOTSTRAP')`
-      );
+      conditions.push(`action IN (${AUDIT_PERM_ACTIONS_SQL})`);
     } else if (category === 'deletions') {
       conditions.push(`action LIKE 'DELETE_%'`);
     } else if (category === 'operations') {
       conditions.push(
-        `action NOT IN ('LOGIN_SUCCESS', 'LOGIN_FAILED', 'LOGIN_MFA_SUCCESS', 'MFA_FAILED', 'MFA_RECOVERY_USED', 'MFA_RECOVERY_FAILED', 'MFA_ENROLLED', 'MFA_DISABLED', 'ACCOUNT_LOCKED', 'LOGOUT', 'SESSION_REVOKED', 'CREATE_ROLE', 'UPDATE_ROLE_PERMISSIONS', 'DELETE_ROLE', 'UPDATE_SECURITY_POLICY', 'PERMISSION_DENIED', 'CREATE_USER', 'UPDATE_USER', 'ADMIN_UNLOCK_USER', 'ADMIN_RESET_MFA', 'WORKSPACE_BOOTSTRAP') AND action NOT LIKE 'DELETE_%'`
+        `action NOT IN (${AUDIT_AUTH_ACTIONS_SQL}, ${AUDIT_CONFIG_ACTIONS_SQL}, ${AUDIT_PERM_ACTIONS_SQL}) AND action NOT LIKE 'DELETE_%'`
       );
+    }
+
+    const moduleFilter = String(query.module ?? 'all').trim();
+    if (moduleFilter && moduleFilter !== 'all') {
+      conditions.push('module = ?');
+      params.push(moduleFilter);
     }
 
     const severity = String(query.severity ?? 'all');
@@ -3828,12 +3931,21 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
       .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY created_at ${orderDir}, id ${orderDir} LIMIT ?`)
       .all(...params, limit));
 
+    const filteredCountRow = (await db
+      .prepare(`SELECT COUNT(*) AS cnt FROM audit_logs ${whereClause}`)
+      .get(...params)) as { cnt: number };
+
+    const moduleRows = (await db
+      .prepare(`SELECT DISTINCT module FROM audit_logs ORDER BY module ASC`)
+      .all()) as Array<{ module: string }>;
+
     const summary = (await db
       .prepare(
         `SELECT
            COUNT(*) AS total,
-           COALESCE(SUM(CASE WHEN action IN ('LOGIN_SUCCESS', 'LOGIN_FAILED', 'LOGIN_MFA_SUCCESS', 'MFA_FAILED', 'MFA_RECOVERY_USED', 'MFA_RECOVERY_FAILED', 'MFA_ENROLLED', 'MFA_DISABLED', 'ACCOUNT_LOCKED', 'LOGOUT', 'SESSION_REVOKED') THEN 1 ELSE 0 END), 0) AS auth_count,
-           COALESCE(SUM(CASE WHEN action IN ('CREATE_ROLE', 'UPDATE_ROLE_PERMISSIONS', 'DELETE_ROLE', 'UPDATE_SECURITY_POLICY', 'PERMISSION_DENIED', 'CREATE_USER', 'UPDATE_USER', 'ADMIN_UNLOCK_USER', 'ADMIN_RESET_MFA', 'WORKSPACE_BOOTSTRAP') THEN 1 ELSE 0 END), 0) AS permission_count,
+           COALESCE(SUM(CASE WHEN action IN (${AUDIT_AUTH_ACTIONS_SQL}) THEN 1 ELSE 0 END), 0) AS auth_count,
+           COALESCE(SUM(CASE WHEN action IN (${AUDIT_CONFIG_ACTIONS_SQL}) THEN 1 ELSE 0 END), 0) AS config_count,
+           COALESCE(SUM(CASE WHEN action IN (${AUDIT_PERM_ACTIONS_SQL}) THEN 1 ELSE 0 END), 0) AS permission_count,
            COALESCE(SUM(CASE WHEN action LIKE 'DELETE_%' THEN 1 ELSE 0 END), 0) AS deletion_count,
            COALESCE(SUM(CASE WHEN severity IN ('warning', 'critical') THEN 1 ELSE 0 END), 0) AS alert_count
          FROM audit_logs`
@@ -3841,12 +3953,18 @@ export function createApiRouter(db: DbClient, env: AppEnv): WebRouter {
       .get()) as {
       total: number;
       auth_count: number;
+      config_count: number;
       permission_count: number;
       deletion_count: number;
       alert_count: number;
     };
 
-    res.json({ logs, summary });
+    res.json({
+      logs,
+      totalFiltered: filteredCountRow?.cnt ?? logs.length,
+      modules: moduleRows.map((m) => m.module).filter(Boolean),
+      summary,
+    });
   });
 
   router.get('/admin/audit-logs/export', authenticate, requirePermission('audit', 'export'), async (req: AuthenticatedRequest, res) => {

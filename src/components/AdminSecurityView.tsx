@@ -55,7 +55,7 @@ export function AdminSecurityView({
 
   const [tab, setTab] = useState<
     'users' | 'system' | 'roles' | 'policy' | 'modules' | 'integrations' | 'audit'
-  >('users');
+  >(canAdminRead ? 'users' : 'audit');
 
   // Admin state
   const [users, setUsers] = useState<UserProfile[]>([]);
@@ -525,14 +525,14 @@ export function AdminSecurityView({
             <button
               type="button"
               onClick={() => setTab('audit')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap ${
+              className={`px-3 py-1.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                 tab === 'audit'
                   ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-xs'
                   : 'text-zinc-600 dark:text-zinc-400'
               }`}
             >
-              <ScrollText className="w-3.5 h-3.5" />
-              <span>System Audit Log</span>
+              <ScrollText className="w-3.5 h-3.5 shrink-0" />
+              <span>Audit Logs</span>
             </button>
           )}
         </div>

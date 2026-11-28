@@ -4,6 +4,7 @@ import type { AppEnv, DbClient } from './db_adapter.ts';
 import { getEnabledModulesMap, writeAuditLog } from './db.ts';
 import { hasPermission, type PermissionAction, type PermissionMap, type PermissionModule } from './rbac.ts';
 import type { AuthenticatedRequest } from './routes.ts';
+import { createCurrencyService } from './services/currencyService.ts';
 import { WebRouter, type ApiRequest, type ApiResponse, type NextFunction } from './web_router.ts';
 
 export type AuthenticatedReq = AuthenticatedRequest;
@@ -1901,6 +1902,8 @@ export function createExtraApiRouter(db: DbClient, env: AppEnv, deps: ExtraRoute
     await db.prepare('UPDATE accounting_accounts SET balance = balance + ? WHERE code = ?').run(delta, accountCode);
   }
 
+  const currencyService = createCurrencyService(db);
+
   async function getClosedPeriodForDate(dateStr: string): Promise<{ code: string; name: string } | undefined> {
     return (await db
       .prepare(`SELECT code, name FROM fiscal_periods WHERE status = 'closed' AND start_date <= ? AND end_date >= ? LIMIT 1`)
@@ -2263,6 +2266,8 @@ export function createExtraApiRouter(db: DbClient, env: AppEnv, deps: ExtraRoute
       marginStats,
       fiscalPeriods,
       currencies,
+      baseCurrency: await currencyService.getBaseCurrency(),
+      periodRates: (await currencyService.getMultiCurrencyWorkspace()).periodRates,
       taxRates,
       projectBudgets,
       projectProfitability,
@@ -2552,6 +2557,375 @@ ${txBlocks}
     res.json({ ok: true });
   });
 
+  type GlFilterParams = {
+    dateFrom?: string;
+    dateTo?: string;
+    accountType?: string;
+    accountCode?: string;
+    entryStatus?: string;
+    search?: string;
+    sort?: string;
+  };
+
+  async function queryGeneralLedgerReport(q: GlFilterParams) {
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+
+    const dateFrom = String(q.dateFrom ?? '').trim();
+    const dateTo = String(q.dateTo ?? '').trim();
+    const accountType = String(q.accountType ?? 'all').trim().toLowerCase();
+    const accountCode = String(q.accountCode ?? 'all').trim();
+    const entryStatusFilter = String(q.entryStatus ?? 'all').trim().toLowerCase();
+    const search = String(q.search ?? '').trim().toLowerCase();
+    const sortDir = String(q.sort ?? 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    if (dateFrom) {
+      conditions.push('je.entry_date >= ?');
+      params.push(dateFrom);
+    }
+    if (dateTo) {
+      conditions.push('je.entry_date <= ?');
+      params.push(dateTo);
+    }
+    if (['asset', 'liability', 'equity', 'revenue', 'expense'].includes(accountType)) {
+      conditions.push('(da.account_class = ? OR ca.account_class = ?)');
+      params.push(accountType, accountType);
+    }
+    if (accountCode && accountCode !== 'all') {
+      conditions.push('(je.debit_account_code = ? OR je.credit_account_code = ?)');
+      params.push(accountCode, accountCode);
+    }
+    if (search) {
+      const pattern = `%${search}%`;
+      conditions.push(
+        `(LOWER(je.ref) LIKE ? OR LOWER(je.description) LIKE ? OR LOWER(je.journal_code) LIKE ? OR LOWER(je.source_ref) LIKE ? OR LOWER(je.debit_account_code) LIKE ? OR LOWER(je.credit_account_code) LIKE ? OR LOWER(COALESCE(p.ref, '')) LIKE ? OR LOWER(je.created_by) LIKE ?)`
+      );
+      params.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rawEntries = (await db
+      .prepare(
+        `SELECT je.*,
+                da.label AS debit_account_label,
+                da.account_class AS debit_account_class,
+                ca.label AS credit_account_label,
+                ca.account_class AS credit_account_class,
+                p.ref AS project_ref,
+                p.title AS project_title
+         FROM journal_entries je
+         LEFT JOIN accounting_accounts da ON da.code = je.debit_account_code
+         LEFT JOIN accounting_accounts ca ON ca.code = je.credit_account_code
+         LEFT JOIN projects p ON p.id = je.project_id
+         ${whereClause}
+         ORDER BY je.entry_date ${sortDir}, je.id ${sortDir}
+         LIMIT 500`
+      )
+      .all(...params)) as Array<{
+      id: number;
+      ref: string;
+      entry_date: string;
+      journal_code: string;
+      description: string;
+      debit_account_code: string;
+      credit_account_code: string;
+      amount: number;
+      currency: string;
+      exchange_rate: number;
+      original_amount: number;
+      source_ref: string;
+      project_id: number | null;
+      is_reversal: number;
+      reversed_entry_ref: string;
+      created_by: string;
+      created_at: string;
+      debit_account_label: string | null;
+      debit_account_class: string | null;
+      credit_account_label: string | null;
+      credit_account_class: string | null;
+      project_ref: string | null;
+      project_title: string | null;
+    }>;
+
+    const reversedRows = (await db
+      .prepare(`SELECT DISTINCT reversed_entry_ref FROM journal_entries WHERE reversed_entry_ref != ''`)
+      .all()) as Array<{ reversed_entry_ref: string }>;
+    const reversedRefs = new Set(reversedRows.map((r) => r.reversed_entry_ref));
+
+    const fiscalPeriods = (await db
+      .prepare('SELECT * FROM fiscal_periods ORDER BY start_date DESC, id DESC')
+      .all()) as Array<{
+      id: number;
+      code: string;
+      name: string;
+      start_date: string;
+      end_date: string;
+      status: 'open' | 'closed';
+    }>;
+
+    const accounts = (await db
+      .prepare('SELECT * FROM accounting_accounts ORDER BY code ASC')
+      .all()) as Array<{
+      id: number;
+      code: string;
+      label: string;
+      account_class: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+      balance: number;
+      is_active: number;
+    }>;
+
+    const enriched = rawEntries
+      .map((e) => {
+        const matchedPeriod = fiscalPeriods.find(
+          (fp) => e.entry_date >= fp.start_date && e.entry_date <= fp.end_date
+        );
+        let entryStatus: 'posted' | 'reversal' | 'reversed' | 'locked' = 'posted';
+        if (reversedRefs.has(e.ref)) {
+          entryStatus = 'reversed';
+        } else if (e.is_reversal === 1 || Boolean(e.reversed_entry_ref)) {
+          entryStatus = 'reversal';
+        } else if (matchedPeriod?.status === 'closed') {
+          entryStatus = 'locked';
+        }
+        return {
+          ...e,
+          debit_account_label: e.debit_account_label ?? e.debit_account_code,
+          debit_account_class: e.debit_account_class ?? 'expense',
+          credit_account_label: e.credit_account_label ?? e.credit_account_code,
+          credit_account_class: e.credit_account_class ?? 'asset',
+          entry_status: entryStatus,
+          fiscal_period_code: matchedPeriod?.code ?? '',
+          fiscal_period_status: matchedPeriod?.status ?? 'open',
+        };
+      })
+      .filter((e) => entryStatusFilter === 'all' || e.entry_status === entryStatusFilter);
+
+    type LedgerLine = {
+      line_id: string;
+      entry_id: number;
+      ref: string;
+      entry_date: string;
+      journal_code: string;
+      account_code: string;
+      account_label: string;
+      account_class: string;
+      counterpart_code: string;
+      counterpart_label: string;
+      description: string;
+      source_ref: string;
+      project_ref: string | null;
+      debit: number;
+      credit: number;
+      currency: string;
+      exchange_rate: number;
+      original_amount: number;
+      entry_status: 'posted' | 'reversal' | 'reversed' | 'locked';
+      fiscal_period_code: string;
+      reversed_entry_ref: string;
+      created_by: string;
+    };
+
+    const lines: LedgerLine[] = [];
+    const acctStats = new Map<
+      string,
+      {
+        code: string;
+        label: string;
+        account_class: string;
+        current_balance: number;
+        period_debits: number;
+        period_credits: number;
+        tx_ids: Set<number>;
+      }
+    >();
+
+    for (const a of accounts) {
+      if (['asset', 'liability', 'equity', 'revenue', 'expense'].includes(accountType) && a.account_class !== accountType) {
+        continue;
+      }
+      if (accountCode && accountCode !== 'all' && a.code !== accountCode) {
+        continue;
+      }
+      acctStats.set(a.code, {
+        code: a.code,
+        label: a.label,
+        account_class: a.account_class,
+        current_balance: Math.round(a.balance * 100) / 100,
+        period_debits: 0,
+        period_credits: 0,
+        tx_ids: new Set<number>(),
+      });
+    }
+
+    const matchesAccountLeg = (code: string, cls: string): boolean => {
+      if (['asset', 'liability', 'equity', 'revenue', 'expense'].includes(accountType) && cls !== accountType) {
+        return false;
+      }
+      if (accountCode && accountCode !== 'all' && code !== accountCode) {
+        return false;
+      }
+      return true;
+    };
+
+    let totalDebits = 0;
+    let totalCredits = 0;
+
+    for (const e of enriched) {
+      if (matchesAccountLeg(e.debit_account_code, e.debit_account_class)) {
+        const amt = Math.round(Number(e.amount) * 100) / 100;
+        totalDebits += amt;
+        lines.push({
+          line_id: `${e.id}-DR`,
+          entry_id: e.id,
+          ref: e.ref,
+          entry_date: e.entry_date,
+          journal_code: e.journal_code,
+          account_code: e.debit_account_code,
+          account_label: e.debit_account_label,
+          account_class: e.debit_account_class,
+          counterpart_code: e.credit_account_code,
+          counterpart_label: e.credit_account_label,
+          description: e.description,
+          source_ref: e.source_ref,
+          project_ref: e.project_ref,
+          debit: amt,
+          credit: 0,
+          currency: e.currency || 'USD',
+          exchange_rate: e.exchange_rate || 1,
+          original_amount: e.original_amount > 0 ? e.original_amount : amt,
+          entry_status: e.entry_status,
+          fiscal_period_code: e.fiscal_period_code,
+          reversed_entry_ref: e.reversed_entry_ref,
+          created_by: e.created_by,
+        });
+        const st = acctStats.get(e.debit_account_code);
+        if (st) {
+          st.period_debits += amt;
+          st.tx_ids.add(e.id);
+        }
+      }
+
+      if (matchesAccountLeg(e.credit_account_code, e.credit_account_class)) {
+        const amt = Math.round(Number(e.amount) * 100) / 100;
+        totalCredits += amt;
+        lines.push({
+          line_id: `${e.id}-CR`,
+          entry_id: e.id,
+          ref: e.ref,
+          entry_date: e.entry_date,
+          journal_code: e.journal_code,
+          account_code: e.credit_account_code,
+          account_label: e.credit_account_label,
+          account_class: e.credit_account_class,
+          counterpart_code: e.debit_account_code,
+          counterpart_label: e.debit_account_label,
+          description: e.description,
+          source_ref: e.source_ref,
+          project_ref: e.project_ref,
+          debit: 0,
+          credit: amt,
+          currency: e.currency || 'USD',
+          exchange_rate: e.exchange_rate || 1,
+          original_amount: e.original_amount > 0 ? e.original_amount : amt,
+          entry_status: e.entry_status,
+          fiscal_period_code: e.fiscal_period_code,
+          reversed_entry_ref: e.reversed_entry_ref,
+          created_by: e.created_by,
+        });
+        const st = acctStats.get(e.credit_account_code);
+        if (st) {
+          st.period_credits += amt;
+          st.tx_ids.add(e.id);
+        }
+      }
+    }
+
+    totalDebits = Math.round(totalDebits * 100) / 100;
+    totalCredits = Math.round(totalCredits * 100) / 100;
+
+    const accountSummary = Array.from(acctStats.values()).map((st) => ({
+      code: st.code,
+      label: st.label,
+      account_class: st.account_class,
+      current_balance: st.current_balance,
+      period_debits: Math.round(st.period_debits * 100) / 100,
+      period_credits: Math.round(st.period_credits * 100) / 100,
+      net_change: Math.round((st.period_debits - st.period_credits) * 100) / 100,
+      tx_count: st.tx_ids.size,
+    }));
+
+    return {
+      entries: enriched,
+      lines,
+      accountSummary,
+      accounts,
+      fiscalPeriods,
+      summary: {
+        entryCount: enriched.length,
+        lineCount: lines.length,
+        totalDebits,
+        totalCredits,
+        netMovement: Math.round((totalDebits - totalCredits) * 100) / 100,
+        isBalanced: Math.abs(totalDebits - totalCredits) < 0.02,
+      },
+    };
+  }
+
+  router.get('/accounting/general-ledger', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const q = req.query as GlFilterParams;
+    const result = await queryGeneralLedgerReport(q);
+    res.json(result);
+  });
+
+  router.get('/accounting/general-ledger/export', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const q = req.query as GlFilterParams;
+    const result = await queryGeneralLedgerReport(q);
+    const headers = [
+      'Date',
+      'Journal Ref',
+      'Journal Code',
+      'Account Code',
+      'Account Label',
+      'Account Type',
+      'Counterpart Account',
+      'Description',
+      'Source Ref',
+      'Project',
+      'Period',
+      'Status',
+      'Debit',
+      'Credit',
+    ];
+    const csvLines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...result.lines.map((l) =>
+        [
+          l.entry_date,
+          l.ref,
+          l.journal_code,
+          l.account_code,
+          l.account_label,
+          l.account_class,
+          `${l.counterpart_code} ${l.counterpart_label}`,
+          l.description,
+          l.source_ref,
+          l.project_ref ?? '',
+          l.fiscal_period_code,
+          l.entry_status,
+          l.debit.toFixed(2),
+          l.credit.toFixed(2),
+        ]
+          .map(sanitizeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: result.lines.length,
+      filename: `kscat-general-ledger-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: csvLines.join('\n'),
+    });
+  });
+
   router.post('/accounting/journal', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
     const {
       entryDate,
@@ -2560,11 +2934,14 @@ ${txBlocks}
       debitAccountCode,
       creditAccountCode,
       amount,
+      originalAmount,
+      currency,
+      exchangeRate,
       sourceRef = '',
       projectId = null,
     } = req.body ?? {};
-    const amt = Number(amount);
-    if (!String(description ?? '').trim() || !debitAccountCode || !creditAccountCode || !Number.isFinite(amt) || amt <= 0) {
+    const rawOriginal = originalAmount !== undefined && Number(originalAmount) > 0 ? Number(originalAmount) : Number(amount);
+    if (!String(description ?? '').trim() || !debitAccountCode || !creditAccountCode || !Number.isFinite(rawOriginal) || rawOriginal <= 0) {
       res.status(400).json({ error: 'Description, debit/credit accounts, and positive amount are required.' });
       return;
     }
@@ -2578,14 +2955,27 @@ ${txBlocks}
       res.status(409).json({ error: `Fiscal period ${closedPeriod.code} (${closedPeriod.name}) is closed for ${cleanDate}.` });
       return;
     }
+    let normalized: Awaited<ReturnType<typeof currencyService.normalizeTransactionToBase>>;
+    try {
+      normalized = await currencyService.normalizeTransactionToBase({
+        currency,
+        originalAmount: rawOriginal,
+        txDate: cleanDate,
+        explicitRate: exchangeRate !== undefined ? Number(exchangeRate) : null,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid currency conversion parameters.' });
+      return;
+    }
+    const amt = normalized.baseAmount;
     const cleanProjId = projectId !== null && projectId !== '' && Number(projectId) > 0 ? Number(projectId) : null;
     const ref = (await seqRef('journal_entries', 'JRN'));
     (await db.exec('BEGIN'));
     try {
       const info = (await db
         .prepare(
-          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, project_id, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, currency, exchange_rate, original_amount, source_ref, project_id, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           ref,
@@ -2595,6 +2985,9 @@ ${txBlocks}
           String(debitAccountCode),
           String(creditAccountCode),
           amt,
+          normalized.currency,
+          normalized.exchangeRate,
+          normalized.originalAmount,
           String(sourceRef).trim(),
           cleanProjId,
           req.authUser!.email
@@ -2602,13 +2995,17 @@ ${txBlocks}
       await applyAccountPosting(String(debitAccountCode), 'debit', amt);
       await applyAccountPosting(String(creditAccountCode), 'credit', amt);
       (await db.exec('COMMIT'));
+      const fxNote =
+        normalized.currency !== normalized.baseCurrencyCode
+          ? ` (${normalized.currency} ${normalized.originalAmount.toFixed(2)} @ ${normalized.exchangeRate.toFixed(4)} → ${normalized.baseCurrencyCode} ${amt.toFixed(2)})`
+          : ` ($${amt.toFixed(2)})`;
       (await writeAuditLog(db, {
         userId: req.authUser!.id,
         userEmail: req.authUser!.email,
         action: 'POST_JOURNAL_ENTRY',
         module: 'billing',
         entityRef: ref,
-        details: `Posted ${journalCode} entry ${ref}: DR ${debitAccountCode} / CR ${creditAccountCode} $${amt.toFixed(2)}`,
+        details: `Posted ${journalCode} entry ${ref}: DR ${debitAccountCode} / CR ${creditAccountCode}${fxNote}`,
         ipAddress: getClientIp(req),
       }));
       res.status(201).json((await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(info.lastInsertRowid)));
@@ -2630,6 +3027,9 @@ ${txBlocks}
           debit_account_code: string;
           credit_account_code: string;
           amount: number;
+          currency: string;
+          exchange_rate: number;
+          original_amount: number;
           source_ref: string;
           project_id: number | null;
         }
@@ -2643,7 +3043,19 @@ ${txBlocks}
       res.status(409).json({ error: `Cannot modify entry inside closed period ${existingLocked.code}. Use Reversal instead.` });
       return;
     }
-    const { entryDate, journalCode, description, debitAccountCode, creditAccountCode, amount, sourceRef, projectId } = req.body ?? {};
+    const {
+      entryDate,
+      journalCode,
+      description,
+      debitAccountCode,
+      creditAccountCode,
+      amount,
+      originalAmount,
+      currency,
+      exchangeRate,
+      sourceRef,
+      projectId,
+    } = req.body ?? {};
     const nextDate = entryDate ? String(entryDate) : existing.entry_date;
     const nextLocked = await getClosedPeriodForDate(nextDate);
     if (nextLocked) {
@@ -2652,11 +3064,32 @@ ${txBlocks}
     }
     const nextDebit = debitAccountCode ? String(debitAccountCode) : existing.debit_account_code;
     const nextCredit = creditAccountCode ? String(creditAccountCode) : existing.credit_account_code;
-    const nextAmt = amount !== undefined ? Number(amount) : existing.amount;
-    if (!Number.isFinite(nextAmt) || nextAmt <= 0 || nextDebit === nextCredit) {
+    const nextCurrency = currency ? String(currency).trim().toUpperCase().slice(0, 8) : existing.currency || 'USD';
+    const rawOriginal =
+      originalAmount !== undefined
+        ? Number(originalAmount)
+        : amount !== undefined
+          ? Number(amount)
+          : existing.original_amount > 0
+            ? existing.original_amount
+            : existing.amount;
+    if (!Number.isFinite(rawOriginal) || rawOriginal <= 0 || nextDebit === nextCredit) {
       res.status(400).json({ error: 'Distinct debit/credit accounts and positive amount are required.' });
       return;
     }
+    let normalized: Awaited<ReturnType<typeof currencyService.normalizeTransactionToBase>>;
+    try {
+      normalized = await currencyService.normalizeTransactionToBase({
+        currency: nextCurrency,
+        originalAmount: rawOriginal,
+        txDate: nextDate,
+        explicitRate: exchangeRate !== undefined ? Number(exchangeRate) : null,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid currency conversion parameters.' });
+      return;
+    }
+    const nextAmt = normalized.baseAmount;
     const nextProjId =
       projectId === undefined
         ? existing.project_id
@@ -2675,6 +3108,9 @@ ${txBlocks}
              debit_account_code = ?,
              credit_account_code = ?,
              amount = ?,
+             currency = ?,
+             exchange_rate = ?,
+             original_amount = ?,
              source_ref = ?,
              project_id = ?
          WHERE id = ?`
@@ -2685,6 +3121,9 @@ ${txBlocks}
         nextDebit,
         nextCredit,
         nextAmt,
+        normalized.currency,
+        normalized.exchangeRate,
+        normalized.originalAmount,
         sourceRef !== undefined ? String(sourceRef).trim() : existing.source_ref,
         nextProjId,
         id
@@ -2719,6 +3158,9 @@ ${txBlocks}
           debit_account_code: string;
           credit_account_code: string;
           amount: number;
+          currency: string;
+          exchange_rate: number;
+          original_amount: number;
           project_id: number | null;
         }
       | undefined;
@@ -2737,8 +3179,8 @@ ${txBlocks}
     try {
       const info = await db
         .prepare(
-          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, project_id, is_reversal, reversed_entry_ref, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, currency, exchange_rate, original_amount, source_ref, project_id, is_reversal, reversed_entry_ref, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
         )
         .run(
           revRef,
@@ -2748,6 +3190,9 @@ ${txBlocks}
           existing.credit_account_code,
           existing.debit_account_code,
           existing.amount,
+          existing.currency || 'USD',
+          existing.exchange_rate || 1,
+          existing.original_amount > 0 ? existing.original_amount : existing.amount,
           existing.ref,
           existing.project_id ?? null,
           existing.ref,
@@ -2807,6 +3252,1048 @@ ${txBlocks}
       (await db.exec('ROLLBACK'));
       res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to delete journal entry.' });
     }
+  });
+
+  // ========================
+  // BANK RECONCILIATION
+  // ========================
+  type ParsedBankLineInput = {
+    txDate: string;
+    description: string;
+    reference: string;
+    direction: 'credit' | 'debit';
+    amount: number;
+    runningBalance: number | null;
+  };
+
+  function normalizeStatementDate(raw: string): string | null {
+    const clean = String(raw ?? '').trim();
+    if (!clean) return null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) return clean;
+    const slashIso = clean.match(/^(\d{4})[/.](\d{1,2})[/.](\d{1,2})$/);
+    if (slashIso) {
+      return `${slashIso[1]}-${slashIso[2].padStart(2, '0')}-${slashIso[3].padStart(2, '0')}`;
+    }
+    const usDate = clean.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+    if (usDate) {
+      const m = Number(usDate[1]);
+      const d = Number(usDate[2]);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        return `${usDate[3]}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+    }
+    return null;
+  }
+
+  function parseNumericAmount(raw: unknown): number | null {
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+    const str = String(raw ?? '').trim();
+    if (!str) return null;
+    const isParenNegative = /^\(.*\)$/.test(str);
+    const cleaned = str.replace(/[(),$\s€£₱¥]/g, '');
+    if (!cleaned || !/^[+-]?\d+(\.\d+)?$/.test(cleaned)) return null;
+    const val = Number(cleaned);
+    if (!Number.isFinite(val)) return null;
+    return isParenNegative ? -Math.abs(val) : val;
+  }
+
+  function splitCsvRow(line: string, delimiter: string): string[] {
+    const cells: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === delimiter && !inQuotes) {
+        cells.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    cells.push(current.trim());
+    return cells;
+  }
+
+  function parseBankStatementCsv(csvText: string): { lines: ParsedBankLineInput[]; error?: string } {
+    if (csvText.length > 512_000) {
+      return { lines: [], error: 'CSV statement exceeds 512 KB limit.' };
+    }
+    const rawLines = csvText
+      .replace(/^\uFEFF/, '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+
+    if (rawLines.length < 2) {
+      return { lines: [], error: 'CSV must include a header row and at least one transaction row.' };
+    }
+    if (rawLines.length > 501) {
+      return { lines: [], error: 'CSV statements are limited to 500 lines per upload.' };
+    }
+
+    const headerRaw = rawLines[0];
+    const delimiter =
+      headerRaw.split(';').length > headerRaw.split(',').length
+        ? ';'
+        : headerRaw.split('\t').length > headerRaw.split(',').length
+          ? '\t'
+          : ',';
+
+    const headers = splitCsvRow(headerRaw, delimiter).map((h) => h.toLowerCase().replace(/[^a-z0-9]+/g, '_'));
+    const findCol = (candidates: string[]) => headers.findIndex((h) => candidates.some((c) => h === c || h.includes(c)));
+
+    const dateIdx = findCol(['tx_date', 'transaction_date', 'posting_date', 'value_date', 'date']);
+    const descIdx = findCol(['description', 'memo', 'label', 'narrative', 'details', 'particulars', 'payee']);
+    const refIdx = findCol(['reference', 'ref', 'check', 'tx_id', 'transaction_id', 'doc_ref']);
+    const debitIdx = findCol(['debit', 'withdrawal', 'outflow']);
+    const creditIdx = findCol(['credit', 'deposit', 'inflow']);
+    const amtIdx = findCol(['amount', 'net', 'value']);
+    const dirIdx = findCol(['direction', 'type', 'dr_cr', 'side']);
+    const balIdx = findCol(['running_balance', 'balance']);
+
+    if (dateIdx === -1 || descIdx === -1 || (amtIdx === -1 && debitIdx === -1 && creditIdx === -1)) {
+      return {
+        lines: [],
+        error: 'CSV headers must include Date, Description, and either Amount or Debit/Credit columns.',
+      };
+    }
+
+    const parsed: ParsedBankLineInput[] = [];
+    for (let r = 1; r < rawLines.length; r++) {
+      const row = splitCsvRow(rawLines[r], delimiter);
+      if (row.every((cell) => !cell)) continue;
+      const txDate = normalizeStatementDate(row[dateIdx] ?? '');
+      const description = String(row[descIdx] ?? '').trim();
+      if (!txDate || !description) {
+        return { lines: [], error: `Row ${r + 1}: valid date and description are required.` };
+      }
+
+      let direction: 'credit' | 'debit' = 'debit';
+      let amount = 0;
+
+      const drVal = debitIdx >= 0 ? parseNumericAmount(row[debitIdx]) : null;
+      const crVal = creditIdx >= 0 ? parseNumericAmount(row[creditIdx]) : null;
+
+      if (drVal !== null && Math.abs(drVal) > 0) {
+        direction = 'debit';
+        amount = Math.abs(drVal);
+      } else if (crVal !== null && Math.abs(crVal) > 0) {
+        direction = 'credit';
+        amount = Math.abs(crVal);
+      } else if (amtIdx >= 0) {
+        const rawAmt = parseNumericAmount(row[amtIdx]);
+        if (rawAmt === null || Math.abs(rawAmt) <= 0) {
+          return { lines: [], error: `Row ${r + 1}: positive transaction amount is required.` };
+        }
+        const dirText = dirIdx >= 0 ? String(row[dirIdx] ?? '').trim().toLowerCase() : '';
+        if (['credit', 'cr', 'deposit', 'inflow', 'in'].includes(dirText)) {
+          direction = 'credit';
+        } else if (['debit', 'dr', 'withdrawal', 'outflow', 'out'].includes(dirText)) {
+          direction = 'debit';
+        } else {
+          direction = rawAmt >= 0 ? 'credit' : 'debit';
+        }
+        amount = Math.abs(rawAmt);
+      } else {
+        return { lines: [], error: `Row ${r + 1}: missing debit, credit, or amount value.` };
+      }
+
+      const runningBal = balIdx >= 0 ? parseNumericAmount(row[balIdx]) : null;
+      parsed.push({
+        txDate,
+        description: description.slice(0, 240),
+        reference: refIdx >= 0 ? String(row[refIdx] ?? '').trim().slice(0, 80) : '',
+        direction,
+        amount: Math.round(amount * 100) / 100,
+        runningBalance: runningBal !== null ? Math.round(runningBal * 100) / 100 : null,
+      });
+    }
+
+    if (parsed.length === 0) {
+      return { lines: [], error: 'No valid transaction rows found in CSV.' };
+    }
+    return { lines: parsed };
+  }
+
+  async function recomputeBankStatementStatus(statementId: number): Promise<'open' | 'in_progress' | 'reconciled'> {
+    const counts = (await db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN match_status = 'matched' THEN 1 ELSE 0 END) AS matched_cnt,
+                SUM(CASE WHEN match_status = 'ignored' THEN 1 ELSE 0 END) AS ignored_cnt
+         FROM bank_statement_lines
+         WHERE statement_id = ?`
+      )
+      .get(statementId)) as { total: number; matched_cnt: number | null; ignored_cnt: number | null } | undefined;
+
+    const total = Number(counts?.total ?? 0);
+    const matched = Number(counts?.matched_cnt ?? 0);
+    const ignored = Number(counts?.ignored_cnt ?? 0);
+    let status: 'open' | 'in_progress' | 'reconciled' = 'open';
+    if (total > 0 && matched + ignored >= total) {
+      status = 'reconciled';
+    } else if (matched > 0 || ignored > 0) {
+      status = 'in_progress';
+    }
+    await db.prepare('UPDATE bank_statements SET status = ? WHERE id = ?').run(status, statementId);
+    return status;
+  }
+
+  router.get('/bank-reconciliation', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const requestedStmtId = Number(req.query.statementId ?? 0);
+    const bankAccountFilter = Number(req.query.bankAccountId ?? 0);
+    const matchStatusFilter = String(req.query.matchStatus ?? 'all').trim().toLowerCase();
+    const search = String(req.query.search ?? '').trim().toLowerCase();
+    const journalScope = String(req.query.journalScope ?? 'all').trim().toLowerCase();
+
+    const bankAccounts = await db.prepare('SELECT * FROM bank_accounts ORDER BY id ASC').all();
+    const stmtConditions: string[] = [];
+    const stmtParams: (string | number)[] = [];
+    if (bankAccountFilter > 0) {
+      stmtConditions.push('bs.bank_account_id = ?');
+      stmtParams.push(bankAccountFilter);
+    }
+    const stmtWhere = stmtConditions.length ? `WHERE ${stmtConditions.join(' AND ')}` : '';
+
+    const statements = (await db
+      .prepare(
+        `SELECT bs.*,
+                ba.ref AS account_ref,
+                ba.name AS account_name,
+                ba.bank_name AS bank_name,
+                ba.balance AS account_book_balance,
+                COUNT(bsl.id) AS line_count,
+                COALESCE(SUM(CASE WHEN bsl.match_status = 'matched' THEN 1 ELSE 0 END), 0) AS matched_count,
+                COALESCE(SUM(CASE WHEN bsl.match_status = 'unmatched' THEN 1 ELSE 0 END), 0) AS unmatched_count,
+                COALESCE(SUM(CASE WHEN bsl.match_status = 'ignored' THEN 1 ELSE 0 END), 0) AS ignored_count,
+                COALESCE(SUM(CASE WHEN bsl.match_status = 'matched' THEN (CASE WHEN bsl.direction = 'credit' THEN bsl.amount ELSE -bsl.amount END) ELSE 0 END), 0) AS matched_net,
+                COALESCE(SUM(CASE WHEN bsl.match_status = 'unmatched' THEN bsl.amount ELSE 0 END), 0) AS unmatched_volume
+         FROM bank_statements bs
+         JOIN bank_accounts ba ON ba.id = bs.bank_account_id
+         LEFT JOIN bank_statement_lines bsl ON bsl.statement_id = bs.id
+         ${stmtWhere}
+         GROUP BY bs.id
+         ORDER BY bs.statement_date DESC, bs.id DESC`
+      )
+      .all(...stmtParams)) as Array<{
+      id: number;
+      ref: string;
+      bank_account_id: number;
+      statement_name: string;
+      statement_date: string;
+      period_start: string;
+      period_end: string;
+      opening_balance: number;
+      closing_balance: number;
+      currency: string;
+      source_type: 'manual' | 'csv';
+      status: 'open' | 'in_progress' | 'reconciled';
+      notes: string;
+      created_by: string;
+      created_at: string;
+      account_ref: string;
+      account_name: string;
+      bank_name: string;
+      account_book_balance: number;
+      line_count: number;
+      matched_count: number;
+      unmatched_count: number;
+      ignored_count: number;
+      matched_net: number;
+      unmatched_volume: number;
+    }>;
+
+    const activeStatement =
+      (requestedStmtId > 0 ? statements.find((s) => s.id === requestedStmtId) : undefined) ?? statements[0] ?? null;
+
+    let lines: Array<Record<string, unknown>> = [];
+    let allActiveStatementLines: Array<{
+      id: number;
+      direction: 'credit' | 'debit';
+      amount: number;
+      match_status: string;
+    }> = [];
+
+    if (activeStatement) {
+      allActiveStatementLines = (await db
+        .prepare('SELECT id, direction, amount, match_status FROM bank_statement_lines WHERE statement_id = ?')
+        .all(activeStatement.id)) as Array<{
+        id: number;
+        direction: 'credit' | 'debit';
+        amount: number;
+        match_status: string;
+      }>;
+
+      const lineConditions: string[] = ['bsl.statement_id = ?'];
+      const lineParams: (string | number)[] = [activeStatement.id];
+      if (['unmatched', 'matched', 'ignored'].includes(matchStatusFilter)) {
+        lineConditions.push('bsl.match_status = ?');
+        lineParams.push(matchStatusFilter);
+      }
+      if (search) {
+        const pattern = `%${search}%`;
+        lineConditions.push(
+          `(LOWER(bsl.description) LIKE ? OR LOWER(bsl.reference) LIKE ? OR LOWER(bsl.matched_journal_ref) LIKE ? OR LOWER(COALESCE(je.description, '')) LIKE ?)`
+        );
+        lineParams.push(pattern, pattern, pattern, pattern);
+      }
+
+      lines = await db
+        .prepare(
+          `SELECT bsl.*,
+                  je.entry_date AS journal_date,
+                  je.journal_code AS journal_code,
+                  je.description AS journal_description,
+                  je.debit_account_code AS debit_account_code,
+                  je.credit_account_code AS credit_account_code,
+                  je.amount AS journal_amount,
+                  je.source_ref AS journal_source_ref
+           FROM bank_statement_lines bsl
+           LEFT JOIN journal_entries je ON je.id = bsl.matched_journal_entry_id
+           WHERE ${lineConditions.join(' AND ')}
+           ORDER BY bsl.tx_date ASC, bsl.id ASC`
+        )
+        .all(...lineParams);
+    }
+
+    const matchedLinks = (await db
+      .prepare(
+        `SELECT bsl.id AS line_id,
+                bsl.matched_journal_entry_id AS journal_entry_id,
+                bs.ref AS statement_ref
+         FROM bank_statement_lines bsl
+         JOIN bank_statements bs ON bs.id = bsl.statement_id
+         WHERE bsl.match_status = 'matched' AND bsl.matched_journal_entry_id IS NOT NULL`
+      )
+      .all()) as Array<{ line_id: number; journal_entry_id: number; statement_ref: string }>;
+    const matchedByJeId = new Map(matchedLinks.map((m) => [m.journal_entry_id, m]));
+
+    const rawJournals = (await db
+      .prepare(
+        `SELECT je.*,
+                da.label AS debit_account_label,
+                ca.label AS credit_account_label,
+                p.ref AS project_ref
+         FROM journal_entries je
+         LEFT JOIN accounting_accounts da ON da.code = je.debit_account_code
+         LEFT JOIN accounting_accounts ca ON ca.code = je.credit_account_code
+         LEFT JOIN projects p ON p.id = je.project_id
+         ORDER BY je.entry_date DESC, je.id DESC
+         LIMIT 300`
+      )
+      .all()) as Array<{
+      id: number;
+      ref: string;
+      entry_date: string;
+      journal_code: string;
+      description: string;
+      debit_account_code: string;
+      credit_account_code: string;
+      amount: number;
+      source_ref: string;
+      project_id: number | null;
+      is_reversal: number;
+      reversed_entry_ref: string;
+      created_by: string;
+      debit_account_label: string | null;
+      credit_account_label: string | null;
+      project_ref: string | null;
+    }>;
+
+    const journalEntries = rawJournals
+      .map((je) => {
+        const link = matchedByJeId.get(je.id);
+        return {
+          ...je,
+          debit_account_label: je.debit_account_label ?? je.debit_account_code,
+          credit_account_label: je.credit_account_label ?? je.credit_account_code,
+          is_matched: Boolean(link),
+          matched_line_id: link?.line_id ?? null,
+          matched_statement_ref: link?.statement_ref ?? '',
+        };
+      })
+      .filter((je) => (journalScope === 'unmatched' ? !je.is_matched : true));
+
+    const accounts = await db.prepare('SELECT * FROM accounting_accounts WHERE is_active = 1 ORDER BY code ASC').all();
+
+    let totalInflows = 0;
+    let totalOutflows = 0;
+    let matchedNet = 0;
+    let unmatchedVolume = 0;
+    let matchedCount = 0;
+    let unmatchedCount = 0;
+    let ignoredCount = 0;
+
+    for (const l of allActiveStatementLines) {
+      const amt = Number(l.amount) || 0;
+      if (l.direction === 'credit') totalInflows += amt;
+      else totalOutflows += amt;
+      if (l.match_status === 'matched') {
+        matchedCount++;
+        matchedNet += l.direction === 'credit' ? amt : -amt;
+      } else if (l.match_status === 'ignored') {
+        ignoredCount++;
+      } else {
+        unmatchedCount++;
+        unmatchedVolume += amt;
+      }
+    }
+
+    const openingBalance = Number(activeStatement?.opening_balance ?? 0);
+    const closingBalance = Number(activeStatement?.closing_balance ?? 0);
+    const statementNetFlow = Math.round((totalInflows - totalOutflows) * 100) / 100;
+    const computedEndingBalance = Math.round((openingBalance + statementNetFlow) * 100) / 100;
+    const reconciledEndingBalance = Math.round((openingBalance + matchedNet) * 100) / 100;
+    const reconciliationGap = activeStatement ? Math.round((closingBalance - reconciledEndingBalance) * 100) / 100 : 0;
+
+    res.json({
+      bankAccounts,
+      statements,
+      activeStatement,
+      lines,
+      journalEntries,
+      accounts,
+      summary: {
+        totalStatements: statements.length,
+        totalLines: allActiveStatementLines.length,
+        matchedCount,
+        unmatchedCount,
+        ignoredCount,
+        totalInflows: Math.round(totalInflows * 100) / 100,
+        totalOutflows: Math.round(totalOutflows * 100) / 100,
+        statementNetFlow,
+        matchedNet: Math.round(matchedNet * 100) / 100,
+        unmatchedVolume: Math.round(unmatchedVolume * 100) / 100,
+        openingBalance,
+        closingBalance,
+        computedEndingBalance,
+        reconciledEndingBalance,
+        reconciliationGap,
+      },
+    });
+  });
+
+  router.post('/bank-reconciliation/statements', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      bankAccountId,
+      statementName,
+      statementDate,
+      periodStart,
+      periodEnd,
+      openingBalance = 0,
+      closingBalance,
+      sourceType = 'manual',
+      csvText = '',
+      lines: rawManualLines,
+      notes = '',
+    } = req.body ?? {};
+
+    const accountId = Number(bankAccountId);
+    const bankAccount = (await db.prepare('SELECT id, ref, currency FROM bank_accounts WHERE id = ?').get(accountId)) as
+      | { id: number; ref: string; currency: string }
+      | undefined;
+    if (!bankAccount) {
+      res.status(400).json({ error: 'Valid bank account is required.' });
+      return;
+    }
+
+    const cleanName = String(statementName ?? '').trim();
+    if (!cleanName) {
+      res.status(400).json({ error: 'Statement title/name is required.' });
+      return;
+    }
+
+    let parsedLines: ParsedBankLineInput[] = [];
+    const normalizedSource: 'manual' | 'csv' = sourceType === 'csv' || String(csvText ?? '').trim().length > 0 ? 'csv' : 'manual';
+
+    if (normalizedSource === 'csv' && String(csvText ?? '').trim()) {
+      const result = parseBankStatementCsv(String(csvText));
+      if (result.error) {
+        res.status(400).json({ error: result.error });
+        return;
+      }
+      parsedLines = result.lines;
+    } else if (Array.isArray(rawManualLines) && rawManualLines.length > 0) {
+      if (rawManualLines.length > 500) {
+        res.status(400).json({ error: 'Statements are limited to 500 lines.' });
+        return;
+      }
+      for (let i = 0; i < rawManualLines.length; i++) {
+        const item = (rawManualLines[i] ?? {}) as Record<string, unknown>;
+        const txDate = normalizeStatementDate(String(item.txDate ?? ''));
+        const description = String(item.description ?? '').trim();
+        const direction: 'credit' | 'debit' = item.direction === 'credit' ? 'credit' : 'debit';
+        const amount = Number(item.amount);
+        if (!txDate || !description || !Number.isFinite(amount) || amount <= 0 || amount >= 1_000_000_000) {
+          res.status(400).json({ error: `Line ${i + 1}: valid date, description, and positive amount are required.` });
+          return;
+        }
+        const rb = item.runningBalance !== undefined && item.runningBalance !== null && item.runningBalance !== ''
+          ? Number(item.runningBalance)
+          : null;
+        parsedLines.push({
+          txDate,
+          description: description.slice(0, 240),
+          reference: String(item.reference ?? '').trim().slice(0, 80),
+          direction,
+          amount: Math.round(amount * 100) / 100,
+          runningBalance: rb !== null && Number.isFinite(rb) ? Math.round(rb * 100) / 100 : null,
+        });
+      }
+    } else {
+      res.status(400).json({ error: 'Provide either a CSV bank statement or at least one manual statement line.' });
+      return;
+    }
+
+    const sortedDates = [...parsedLines].map((l) => l.txDate).sort();
+    const today = new Date().toISOString().slice(0, 10);
+    const cleanStart = normalizeStatementDate(String(periodStart ?? '')) || sortedDates[0] || today;
+    const cleanEnd = normalizeStatementDate(String(periodEnd ?? '')) || sortedDates[sortedDates.length - 1] || cleanStart;
+    const cleanStmtDate = normalizeStatementDate(String(statementDate ?? '')) || cleanEnd;
+
+    const openBal = Number.isFinite(Number(openingBalance)) ? Math.round(Number(openingBalance) * 100) / 100 : 0;
+    const netLines = parsedLines.reduce((s, l) => s + (l.direction === 'credit' ? l.amount : -l.amount), 0);
+    const closeBal =
+      closingBalance !== undefined && closingBalance !== null && closingBalance !== '' && Number.isFinite(Number(closingBalance))
+        ? Math.round(Number(closingBalance) * 100) / 100
+        : Math.round((openBal + netLines) * 100) / 100;
+
+    const ref = await seqRef('bank_statements', 'BST');
+    await db.exec('BEGIN');
+    try {
+      const info = await db
+        .prepare(
+          `INSERT INTO bank_statements (ref, bank_account_id, statement_name, statement_date, period_start, period_end, opening_balance, closing_balance, currency, source_type, status, notes, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`
+        )
+        .run(
+          ref,
+          accountId,
+          cleanName.slice(0, 160),
+          cleanStmtDate,
+          cleanStart,
+          cleanEnd,
+          openBal,
+          closeBal,
+          bankAccount.currency || 'USD',
+          normalizedSource,
+          String(notes ?? '').trim().slice(0, 500),
+          req.authUser!.email
+        );
+      const statementId = Number(info.lastInsertRowid);
+      const insLine = db.prepare(
+        `INSERT INTO bank_statement_lines (statement_id, tx_date, description, reference, direction, amount, running_balance, match_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'unmatched')`
+      );
+      for (const l of parsedLines) {
+        await insLine.run(statementId, l.txDate, l.description, l.reference, l.direction, l.amount, l.runningBalance);
+      }
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'CREATE_BANK_STATEMENT',
+        module: 'billing',
+        entityRef: ref,
+        details: `Imported ${normalizedSource.toUpperCase()} statement ${ref} for ${bankAccount.ref} with ${parsedLines.length} lines`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json(await db.prepare('SELECT * FROM bank_statements WHERE id = ?').get(statementId));
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to save bank statement.' });
+    }
+  });
+
+  router.post('/bank-reconciliation/statements/:id/lines', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const statementId = Number(req.params.id);
+    const stmt = (await db.prepare('SELECT id, ref FROM bank_statements WHERE id = ?').get(statementId)) as
+      | { id: number; ref: string }
+      | undefined;
+    if (!stmt) {
+      res.status(404).json({ error: 'Bank statement not found.' });
+      return;
+    }
+
+    const { txDate, description, reference = '', direction = 'debit', amount, runningBalance = null } = req.body ?? {};
+    const cleanDate = normalizeStatementDate(String(txDate ?? ''));
+    const cleanDesc = String(description ?? '').trim();
+    const amt = Number(amount);
+    if (!cleanDate || !cleanDesc || !Number.isFinite(amt) || amt <= 0 || amt >= 1_000_000_000) {
+      res.status(400).json({ error: 'Valid date, description, and positive amount are required.' });
+      return;
+    }
+    const dir: 'credit' | 'debit' = direction === 'credit' ? 'credit' : 'debit';
+    const rb =
+      runningBalance !== null && runningBalance !== undefined && runningBalance !== '' && Number.isFinite(Number(runningBalance))
+        ? Math.round(Number(runningBalance) * 100) / 100
+        : null;
+
+    const info = await db
+      .prepare(
+        `INSERT INTO bank_statement_lines (statement_id, tx_date, description, reference, direction, amount, running_balance, match_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'unmatched')`
+      )
+      .run(statementId, cleanDate, cleanDesc.slice(0, 240), String(reference).trim().slice(0, 80), dir, Math.round(amt * 100) / 100, rb);
+    await recomputeBankStatementStatus(statementId);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'ADD_BANK_STATEMENT_LINE',
+      module: 'billing',
+      entityRef: stmt.ref,
+      details: `Added manual ${dir} line ($${amt.toFixed(2)}) to ${stmt.ref}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.post('/bank-reconciliation/lines/:id/match', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedReq, res) => {
+    const lineId = Number(req.params.id);
+    const { journalEntryId, note = '' } = req.body ?? {};
+    const jeId = Number(journalEntryId);
+    if (!jeId) {
+      res.status(400).json({ error: 'Target journal entry is required.' });
+      return;
+    }
+
+    const line = (await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId)) as
+      | { id: number; statement_id: number; description: string; amount: number; match_status: string }
+      | undefined;
+    if (!line) {
+      res.status(404).json({ error: 'Bank statement line not found.' });
+      return;
+    }
+
+    const je = (await db.prepare('SELECT id, ref, amount, description FROM journal_entries WHERE id = ?').get(jeId)) as
+      | { id: number; ref: string; amount: number; description: string }
+      | undefined;
+    if (!je) {
+      res.status(404).json({ error: 'Journal entry not found.' });
+      return;
+    }
+
+    const alreadyMatched = (await db
+      .prepare("SELECT id FROM bank_statement_lines WHERE matched_journal_entry_id = ? AND match_status = 'matched' AND id != ?")
+      .get(jeId, lineId)) as { id: number } | undefined;
+    if (alreadyMatched) {
+      res.status(409).json({ error: `Journal entry ${je.ref} is already matched to statement line #${alreadyMatched.id}.` });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    await db
+      .prepare(
+        `UPDATE bank_statement_lines
+         SET match_status = 'matched',
+             matched_journal_entry_id = ?,
+             matched_journal_ref = ?,
+             matched_at = ?,
+             matched_by = ?,
+             match_note = ?
+         WHERE id = ?`
+      )
+      .run(je.id, je.ref, now, req.authUser!.email, String(note).trim().slice(0, 300), lineId);
+
+    await recomputeBankStatementStatus(line.statement_id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'MATCH_BANK_STATEMENT_LINE',
+      module: 'billing',
+      entityRef: je.ref,
+      details: `Matched statement line #${lineId} ("${line.description}") to journal ${je.ref}`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId));
+  });
+
+  router.post('/bank-reconciliation/lines/:id/unmatch', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedReq, res) => {
+    const lineId = Number(req.params.id);
+    const line = (await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId)) as
+      | { id: number; statement_id: number; matched_journal_ref: string; description: string }
+      | undefined;
+    if (!line) {
+      res.status(404).json({ error: 'Bank statement line not found.' });
+      return;
+    }
+
+    await db
+      .prepare(
+        `UPDATE bank_statement_lines
+         SET match_status = 'unmatched',
+             matched_journal_entry_id = NULL,
+             matched_journal_ref = '',
+             matched_at = '',
+             matched_by = '',
+             match_note = ''
+         WHERE id = ?`
+      )
+      .run(lineId);
+
+    await recomputeBankStatementStatus(line.statement_id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UNMATCH_BANK_STATEMENT_LINE',
+      module: 'billing',
+      entityRef: line.matched_journal_ref || `LINE-${lineId}`,
+      details: `Unmatched statement line #${lineId} ("${line.description}")`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId));
+  });
+
+  router.post('/bank-reconciliation/lines/:id/ignore', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedReq, res) => {
+    const lineId = Number(req.params.id);
+    const { ignored = true } = req.body ?? {};
+    const line = (await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId)) as
+      | { id: number; statement_id: number; description: string }
+      | undefined;
+    if (!line) {
+      res.status(404).json({ error: 'Bank statement line not found.' });
+      return;
+    }
+
+    const nextStatus = ignored ? 'ignored' : 'unmatched';
+    await db
+      .prepare(
+        `UPDATE bank_statement_lines
+         SET match_status = ?,
+             matched_journal_entry_id = NULL,
+             matched_journal_ref = '',
+             matched_at = '',
+             matched_by = ''
+         WHERE id = ?`
+      )
+      .run(nextStatus, lineId);
+
+    await recomputeBankStatementStatus(line.statement_id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: ignored ? 'IGNORE_BANK_STATEMENT_LINE' : 'RESTORE_BANK_STATEMENT_LINE',
+      module: 'billing',
+      entityRef: `LINE-${lineId}`,
+      details: `${ignored ? 'Ignored' : 'Restored'} statement line #${lineId} ("${line.description}")`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId));
+  });
+
+  router.post('/bank-reconciliation/lines/:id/create-journal', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const lineId = Number(req.params.id);
+    const { counterAccountCode, cashAccountCode = '1010', journalCode = 'BNK', description } = req.body ?? {};
+    const cleanCounter = String(counterAccountCode ?? '').trim();
+    const cleanCash = String(cashAccountCode ?? '1010').trim();
+    if (!cleanCounter || !cleanCash || cleanCounter === cleanCash) {
+      res.status(400).json({ error: 'Distinct cash and offset GL accounts are required.' });
+      return;
+    }
+
+    const line = (await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(lineId)) as
+      | {
+          id: number;
+          statement_id: number;
+          tx_date: string;
+          description: string;
+          reference: string;
+          direction: 'credit' | 'debit';
+          amount: number;
+          match_status: string;
+        }
+      | undefined;
+    if (!line) {
+      res.status(404).json({ error: 'Bank statement line not found.' });
+      return;
+    }
+    if (line.match_status === 'matched') {
+      res.status(409).json({ error: 'Statement line is already matched to a journal entry.' });
+      return;
+    }
+
+    const closedPeriod = await getClosedPeriodForDate(line.tx_date);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Fiscal period ${closedPeriod.code} (${closedPeriod.name}) is closed for ${line.tx_date}.` });
+      return;
+    }
+
+    const debitAccountCode = line.direction === 'credit' ? cleanCash : cleanCounter;
+    const creditAccountCode = line.direction === 'credit' ? cleanCounter : cleanCash;
+    const cleanDesc = String(description ?? '').trim() || line.description;
+    const ref = await seqRef('journal_entries', 'JRN');
+    const now = new Date().toISOString();
+
+    await db.exec('BEGIN');
+    try {
+      const jeInfo = await db
+        .prepare(
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          ref,
+          line.tx_date,
+          String(journalCode).trim().toUpperCase() || 'BNK',
+          cleanDesc,
+          debitAccountCode,
+          creditAccountCode,
+          line.amount,
+          line.reference || `BST-LINE-${line.id}`,
+          req.authUser!.email
+        );
+      await applyAccountPosting(debitAccountCode, 'debit', line.amount);
+      await applyAccountPosting(creditAccountCode, 'credit', line.amount);
+      await db
+        .prepare(
+          `UPDATE bank_statement_lines
+           SET match_status = 'matched',
+               matched_journal_entry_id = ?,
+               matched_journal_ref = ?,
+               matched_at = ?,
+               matched_by = ?,
+               match_note = ?
+           WHERE id = ?`
+        )
+        .run(Number(jeInfo.lastInsertRowid), ref, now, req.authUser!.email, 'Posted & matched from Bank Reconciliation', line.id);
+      await db.exec('COMMIT');
+      await recomputeBankStatementStatus(line.statement_id);
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'CREATE_AND_MATCH_BANK_JOURNAL',
+        module: 'billing',
+        entityRef: ref,
+        details: `Created ${ref} (DR ${debitAccountCode} / CR ${creditAccountCode} $${line.amount.toFixed(2)}) for bank line #${line.id}`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json({
+        journalEntry: await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(jeInfo.lastInsertRowid),
+        line: await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(line.id),
+      });
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to create balancing journal entry.' });
+    }
+  });
+
+  router.post('/bank-reconciliation/statements/:id/auto-match', authenticate, requirePermission('billing', 'record_payment'), async (req: AuthenticatedReq, res) => {
+    const statementId = Number(req.params.id);
+    const stmt = (await db.prepare('SELECT id, ref FROM bank_statements WHERE id = ?').get(statementId)) as
+      | { id: number; ref: string }
+      | undefined;
+    if (!stmt) {
+      res.status(404).json({ error: 'Bank statement not found.' });
+      return;
+    }
+
+    const unmatchedLines = (await db
+      .prepare("SELECT * FROM bank_statement_lines WHERE statement_id = ? AND match_status = 'unmatched' ORDER BY tx_date ASC, id ASC")
+      .all(statementId)) as Array<{
+      id: number;
+      tx_date: string;
+      description: string;
+      reference: string;
+      amount: number;
+    }>;
+
+    const usedRows = (await db
+      .prepare("SELECT matched_journal_entry_id FROM bank_statement_lines WHERE match_status = 'matched' AND matched_journal_entry_id IS NOT NULL")
+      .all()) as Array<{ matched_journal_entry_id: number }>;
+    const usedJeIds = new Set(usedRows.map((r) => r.matched_journal_entry_id));
+
+    const availableJes = (await db
+      .prepare('SELECT id, ref, entry_date, description, amount, source_ref FROM journal_entries ORDER BY entry_date DESC, id DESC')
+      .all()) as Array<{
+      id: number;
+      ref: string;
+      entry_date: string;
+      description: string;
+      amount: number;
+      source_ref: string;
+    }>;
+
+    const matches: Array<{ lineId: number; journalEntryId: number; journalRef: string }> = [];
+    const now = new Date().toISOString();
+
+    for (const line of unmatchedLines) {
+      const lineMs = Date.parse(`${line.tx_date}T00:00:00Z`);
+      const candidates = availableJes
+        .filter((je) => !usedJeIds.has(je.id) && Math.abs(je.amount - line.amount) < 0.01)
+        .map((je) => {
+          const jeMs = Date.parse(`${je.entry_date}T00:00:00Z`);
+          const dayDiff = Number.isFinite(lineMs) && Number.isFinite(jeMs) ? Math.abs(lineMs - jeMs) / 86400000 : 999;
+          const refHit =
+            (line.reference && je.source_ref && line.reference.toLowerCase() === je.source_ref.toLowerCase()) ||
+            (je.source_ref && line.description.toLowerCase().includes(je.source_ref.toLowerCase())) ||
+            (line.reference && je.description.toLowerCase().includes(line.reference.toLowerCase()));
+          return { je, dayDiff, refHit };
+        })
+        .filter((c) => c.dayDiff <= 7 || c.refHit)
+        .sort((a, b) => Number(b.refHit) - Number(a.refHit) || a.dayDiff - b.dayDiff);
+
+      if (candidates.length === 1 || (candidates.length > 1 && candidates[0].refHit && !candidates[1].refHit)) {
+        const chosen = candidates[0].je;
+        usedJeIds.add(chosen.id);
+        await db
+          .prepare(
+            `UPDATE bank_statement_lines
+             SET match_status = 'matched',
+                 matched_journal_entry_id = ?,
+                 matched_journal_ref = ?,
+                 matched_at = ?,
+                 matched_by = ?,
+                 match_note = 'Auto-matched by amount and reference/date'
+             WHERE id = ?`
+          )
+          .run(chosen.id, chosen.ref, now, req.authUser!.email, line.id);
+        matches.push({ lineId: line.id, journalEntryId: chosen.id, journalRef: chosen.ref });
+      }
+    }
+
+    await recomputeBankStatementStatus(statementId);
+    if (matches.length > 0) {
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'AUTO_MATCH_BANK_STATEMENT',
+        module: 'billing',
+        entityRef: stmt.ref,
+        details: `Auto-matched ${matches.length} bank statement line(s) on ${stmt.ref}`,
+        ipAddress: getClientIp(req),
+      });
+    }
+    res.json({ matchedCount: matches.length, matches });
+  });
+
+  router.delete('/bank-reconciliation/lines/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const lineId = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id, statement_id, description FROM bank_statement_lines WHERE id = ?').get(lineId)) as
+      | { id: number; statement_id: number; description: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Bank statement line not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM bank_statement_lines WHERE id = ?').run(lineId);
+    await recomputeBankStatementStatus(existing.statement_id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_BANK_STATEMENT_LINE',
+      module: 'billing',
+      entityRef: `LINE-${lineId}`,
+      details: `Deleted statement line #${lineId} ("${existing.description}")`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  router.delete('/bank-reconciliation/statements/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const statementId = Number(req.params.id);
+    const existing = (await db.prepare('SELECT id, ref, statement_name FROM bank_statements WHERE id = ?').get(statementId)) as
+      | { id: number; ref: string; statement_name: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Bank statement not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM bank_statements WHERE id = ?').run(statementId);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_BANK_STATEMENT',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Deleted bank statement ${existing.ref} (${existing.statement_name})`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  router.get('/bank-reconciliation/statements/:id/export', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const statementId = Number(req.params.id);
+    const stmt = (await db.prepare('SELECT * FROM bank_statements WHERE id = ?').get(statementId)) as
+      | { id: number; ref: string; statement_name: string }
+      | undefined;
+    if (!stmt) {
+      res.status(404).json({ error: 'Bank statement not found.' });
+      return;
+    }
+    const rows = (await db
+      .prepare(
+        `SELECT bsl.*, je.entry_date AS journal_date, je.description AS journal_description
+         FROM bank_statement_lines bsl
+         LEFT JOIN journal_entries je ON je.id = bsl.matched_journal_entry_id
+         WHERE bsl.statement_id = ?
+         ORDER BY bsl.tx_date ASC, bsl.id ASC`
+      )
+      .all(statementId)) as Array<{
+      tx_date: string;
+      description: string;
+      reference: string;
+      direction: string;
+      amount: number;
+      running_balance: number | null;
+      match_status: string;
+      matched_journal_ref: string;
+      journal_date: string | null;
+      journal_description: string | null;
+      matched_by: string;
+      match_note: string;
+    }>;
+
+    const headers = [
+      'Statement Ref',
+      'Tx Date',
+      'Description',
+      'Reference',
+      'Direction',
+      'Amount',
+      'Running Balance',
+      'Match Status',
+      'Matched Journal Ref',
+      'Journal Date',
+      'Journal Description',
+      'Matched By',
+      'Note',
+    ];
+    const csvLines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...rows.map((r) =>
+        [
+          stmt.ref,
+          r.tx_date,
+          r.description,
+          r.reference,
+          r.direction,
+          Number(r.amount).toFixed(2),
+          r.running_balance !== null && r.running_balance !== undefined ? Number(r.running_balance).toFixed(2) : '',
+          r.match_status,
+          r.matched_journal_ref,
+          r.journal_date ?? '',
+          r.journal_description ?? '',
+          r.matched_by,
+          r.match_note,
+        ]
+          .map(sanitizeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: rows.length,
+      filename: `${stmt.ref}-reconciliation.csv`,
+      csv: csvLines.join('\n'),
+    });
   });
 
   router.get('/accounting/export', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
@@ -3082,6 +4569,344 @@ ${txBlocks}
     res.json({ ok: true });
   });
 
+  // ========================
+  // MULTI-CURRENCY ACCOUNTING SERVICE
+  // ========================
+  router.get('/finance/currency-service', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const fiscalPeriodId = req.query.fiscalPeriodId ? Number(req.query.fiscalPeriodId) : null;
+    const currencyCode = req.query.currencyCode ? String(req.query.currencyCode) : undefined;
+    const workspace = await currencyService.getMultiCurrencyWorkspace({ fiscalPeriodId, currencyCode });
+    res.json(workspace);
+  });
+
+  router.post('/finance/currency-service/convert', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const { amount, fromCurrency, toCurrency, date, fiscalPeriodId, exchangeRate, preferClosing } = req.body ?? {};
+    const numAmt = Number(amount);
+    if (!Number.isFinite(numAmt) || !fromCurrency) {
+      res.status(400).json({ error: 'Valid numeric amount and source currency code are required.' });
+      return;
+    }
+    try {
+      const result = await currencyService.convertAmount({
+        amount: numAmt,
+        fromCurrency: String(fromCurrency),
+        toCurrency: toCurrency ? String(toCurrency) : undefined,
+        txDate: date ? String(date) : undefined,
+        fiscalPeriodId: fiscalPeriodId ? Number(fiscalPeriodId) : null,
+        explicitRate: exchangeRate !== undefined ? Number(exchangeRate) : null,
+        preferClosing: Boolean(preferClosing),
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Currency conversion failed.' });
+    }
+  });
+
+  router.post('/finance/currency-service/revalue', authenticate, requirePermission('billing', 'validate'), async (req: AuthenticatedReq, res) => {
+    const { fiscalPeriodId, entryDate, postToLedger = true } = req.body ?? {};
+    const reval = await currencyService.computePeriodRevaluation(fiscalPeriodId ? Number(fiscalPeriodId) : null);
+    if (!postToLedger) {
+      res.json({ ...reval, postedEntry: null });
+      return;
+    }
+    const postDate = String(entryDate || reval.targetPeriod?.end_date || new Date().toISOString().slice(0, 10));
+    const closedPeriod = await getClosedPeriodForDate(postDate);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Fiscal period ${closedPeriod.code} is closed for ${postDate}.` });
+      return;
+    }
+    if (Math.abs(reval.netUnrealizedFxGainLoss) < 0.01) {
+      res.json({ ...reval, postedEntry: null, message: 'No material unrealized FX variance to post for this period.' });
+      return;
+    }
+
+    const isGain = reval.netUnrealizedFxGainLoss > 0;
+    const fxAbs = Math.round(Math.abs(reval.netUnrealizedFxGainLoss) * 100) / 100;
+    const debitCode = isGain ? '1200' : '6350';
+    const creditCode = isGain ? '4300' : '1200';
+    const ref = await seqRef('journal_entries', 'FXR');
+
+    await db.exec('BEGIN');
+    try {
+      const info = await db
+        .prepare(
+          `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, currency, exchange_rate, original_amount, source_ref, created_by)
+           VALUES (?, ?, 'FXR', ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+        )
+        .run(
+          ref,
+          postDate,
+          `Period-End FX Revaluation (${reval.targetPeriod?.code || postDate}) — Unrealized FX ${isGain ? 'Gain' : 'Loss'}`,
+          debitCode,
+          creditCode,
+          fxAbs,
+          reval.baseCurrency.code,
+          fxAbs,
+          reval.targetPeriod?.code || 'FX-REVAL',
+          req.authUser!.email
+        );
+      await applyAccountPosting(debitCode, 'debit', fxAbs);
+      await applyAccountPosting(creditCode, 'credit', fxAbs);
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'POST_FX_REVALUATION',
+        module: 'billing',
+        entityRef: ref,
+        details: `Posted period FX revaluation ${ref}: ${reval.baseCurrency.code} ${isGain ? '+' : '-'}${fxAbs.toFixed(2)}`,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json({
+        ...reval,
+        postedEntry: await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(info.lastInsertRowid),
+      });
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to post FX revaluation.' });
+    }
+  });
+
+  router.get('/finance/currency-rates/export', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const fiscalPeriodId = req.query.fiscalPeriodId ? Number(req.query.fiscalPeriodId) : null;
+    const currencyCode = req.query.currencyCode ? String(req.query.currencyCode) : undefined;
+    const workspace = await currencyService.getMultiCurrencyWorkspace({ fiscalPeriodId, currencyCode });
+    const headers = [
+      'Currency',
+      'Period Code',
+      'Effective From',
+      'Effective To',
+      `Rate (per 1 ${workspace.baseCurrency.code})`,
+      `Closing Rate (per 1 ${workspace.baseCurrency.code})`,
+      `Inverse (1 Foreign in ${workspace.baseCurrency.code})`,
+      'Source',
+      'Notes',
+    ];
+    const lines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...workspace.periodRates.map((r) =>
+        [
+          r.currency_code,
+          r.period_code || 'Custom',
+          r.effective_from,
+          r.effective_to,
+          r.exchange_rate.toFixed(4),
+          r.closing_rate.toFixed(4),
+          r.inverse_rate.toFixed(6),
+          r.rate_source,
+          r.notes,
+        ]
+          .map(sanitizeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: workspace.periodRates.length,
+      filename: `kscat-period-fx-rates-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
+  });
+
+  router.post('/finance/currency-rates', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      currencyCode,
+      fiscalPeriodId,
+      effectiveFrom,
+      effectiveTo,
+      exchangeRate,
+      closingRate,
+      rateSource = 'manual',
+      notes = '',
+    } = req.body ?? {};
+    const cleanCode = String(currencyCode ?? '').trim().toUpperCase().slice(0, 8);
+    const base = await currencyService.getBaseCurrency();
+    if (!cleanCode || cleanCode === base.code) {
+      res.status(400).json({ error: `Select a foreign currency other than base currency (${base.code}).` });
+      return;
+    }
+    const currRow = await db.prepare('SELECT code FROM currencies WHERE code = ?').get(cleanCode);
+    if (!currRow) {
+      res.status(404).json({ error: `Currency ${cleanCode} does not exist. Add the currency first.` });
+      return;
+    }
+
+    let periodId: number | null = fiscalPeriodId ? Number(fiscalPeriodId) : null;
+    let periodCode = '';
+    let startDate = String(effectiveFrom ?? '').trim();
+    let endDate = String(effectiveTo ?? '').trim();
+
+    if (periodId) {
+      const fp = (await db
+        .prepare('SELECT id, code, start_date, end_date FROM fiscal_periods WHERE id = ?')
+        .get(periodId)) as { id: number; code: string; start_date: string; end_date: string } | undefined;
+      if (!fp) {
+        res.status(404).json({ error: 'Selected fiscal period not found.' });
+        return;
+      }
+      periodCode = fp.code;
+      if (!startDate) startDate = fp.start_date;
+      if (!endDate) endDate = fp.end_date;
+    }
+
+    if (!startDate || !endDate || endDate < startDate) {
+      res.status(400).json({ error: 'Valid effective start and end dates (end >= start) are required.' });
+      return;
+    }
+
+    const rate = Number(exchangeRate);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      res.status(400).json({ error: 'Positive exchange rate is required.' });
+      return;
+    }
+    const closing = closingRate !== undefined && Number(closingRate) > 0 ? Number(closingRate) : rate;
+    const cleanSource = ['manual', 'ecb', 'bsp', 'fed', 'spot_override'].includes(String(rateSource))
+      ? String(rateSource)
+      : 'manual';
+
+    try {
+      const info = await db
+        .prepare(
+          `INSERT INTO currency_period_rates
+           (currency_code, fiscal_period_id, period_code, effective_from, effective_to, exchange_rate, closing_rate, rate_source, notes, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(cleanCode, periodId, periodCode, startDate, endDate, rate, closing, cleanSource, String(notes).trim(), req.authUser!.email);
+
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'CREATE_PERIOD_FX_RATE',
+        module: 'billing',
+        entityRef: `${cleanCode}:${periodCode || startDate}`,
+        details: `Defined ${cleanCode} rate ${rate.toFixed(4)} (closing ${closing.toFixed(4)}) for ${periodCode || `${startDate}..${endDate}`}`,
+        ipAddress: getClientIp(req),
+      });
+
+      res.status(201).json(await db.prepare('SELECT * FROM currency_period_rates WHERE id = ?').get(info.lastInsertRowid));
+    } catch {
+      res.status(409).json({ error: `A period rate for ${cleanCode} covering ${startDate} to ${endDate} already exists.` });
+    }
+  });
+
+  router.put('/finance/currency-rates/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM currency_period_rates WHERE id = ?').get(id)) as
+      | {
+          id: number;
+          currency_code: string;
+          fiscal_period_id: number | null;
+          period_code: string;
+          effective_from: string;
+          effective_to: string;
+          exchange_rate: number;
+          closing_rate: number;
+        }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Period exchange rate not found.' });
+      return;
+    }
+
+    const { fiscalPeriodId, effectiveFrom, effectiveTo, exchangeRate, closingRate, rateSource, notes } = req.body ?? {};
+    let nextPeriodId = existing.fiscal_period_id;
+    let nextPeriodCode = existing.period_code;
+    if (fiscalPeriodId !== undefined) {
+      if (!fiscalPeriodId) {
+        nextPeriodId = null;
+        nextPeriodCode = '';
+      } else {
+        const fp = (await db.prepare('SELECT id, code FROM fiscal_periods WHERE id = ?').get(Number(fiscalPeriodId))) as
+          | { id: number; code: string }
+          | undefined;
+        if (!fp) {
+          res.status(404).json({ error: 'Selected fiscal period not found.' });
+          return;
+        }
+        nextPeriodId = fp.id;
+        nextPeriodCode = fp.code;
+      }
+    }
+
+    const nextFrom = effectiveFrom ? String(effectiveFrom).trim() : existing.effective_from;
+    const nextTo = effectiveTo ? String(effectiveTo).trim() : existing.effective_to;
+    if (nextTo < nextFrom) {
+      res.status(400).json({ error: 'Effective end date must be on or after effective start date.' });
+      return;
+    }
+
+    const nextRate = exchangeRate !== undefined ? Number(exchangeRate) : existing.exchange_rate;
+    if (!Number.isFinite(nextRate) || nextRate <= 0) {
+      res.status(400).json({ error: 'Exchange rate must be positive.' });
+      return;
+    }
+    const nextClosing = closingRate !== undefined ? (Number(closingRate) > 0 ? Number(closingRate) : nextRate) : existing.closing_rate;
+
+    try {
+      await db
+        .prepare(
+          `UPDATE currency_period_rates
+           SET fiscal_period_id = ?,
+               period_code = ?,
+               effective_from = ?,
+               effective_to = ?,
+               exchange_rate = ?,
+               closing_rate = ?,
+               rate_source = COALESCE(?, rate_source),
+               notes = COALESCE(?, notes),
+               updated_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(
+          nextPeriodId,
+          nextPeriodCode,
+          nextFrom,
+          nextTo,
+          nextRate,
+          nextClosing,
+          rateSource && ['manual', 'ecb', 'bsp', 'fed', 'spot_override'].includes(String(rateSource)) ? String(rateSource) : null,
+          notes !== undefined ? String(notes).trim() : null,
+          id
+        );
+
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'UPDATE_PERIOD_FX_RATE',
+        module: 'billing',
+        entityRef: `${existing.currency_code}:${nextPeriodCode || nextFrom}`,
+        details: `Updated ${existing.currency_code} rate to ${nextRate.toFixed(4)} (${nextFrom} to ${nextTo})`,
+        ipAddress: getClientIp(req),
+      });
+
+      res.json(await db.prepare('SELECT * FROM currency_period_rates WHERE id = ?').get(id));
+    } catch {
+      res.status(409).json({ error: 'Another period rate already covers that exact date range for this currency.' });
+    }
+  });
+
+  router.delete('/finance/currency-rates/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db
+      .prepare('SELECT currency_code, period_code, effective_from, effective_to FROM currency_period_rates WHERE id = ?')
+      .get(id)) as { currency_code: string; period_code: string; effective_from: string; effective_to: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Period exchange rate not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM currency_period_rates WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_PERIOD_FX_RATE',
+      module: 'billing',
+      entityRef: `${existing.currency_code}:${existing.period_code || existing.effective_from}`,
+      details: `Deleted ${existing.currency_code} rate for ${existing.period_code || `${existing.effective_from}..${existing.effective_to}`}`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
   // Tax Rates & Codes
   router.post('/finance/tax-rates', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
     const { code, name, rate = 0, taxType = 'both', appliesTo = 'Standard Goods & Services', isActive = true, notes = '' } = req.body ?? {};
@@ -3210,6 +5035,657 @@ ${txBlocks}
     res.json({
       count: rows.length,
       filename: `kscat-tax-schedule-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
+  });
+
+  // Tax Compliance & Upcoming VAT / Sales Tax Liabilities
+  interface TaxComplianceQuery {
+    dateFrom?: string;
+    dateTo?: string;
+    fiscalPeriod?: string;
+    includeDrafts?: string;
+    sourceFilter?: string;
+    taxBucket?: string;
+    search?: string;
+  }
+
+  async function computeTaxComplianceReport(q: TaxComplianceQuery) {
+    const cleanDate = (val?: string) => {
+      const s = String(val ?? '').trim();
+      return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : '';
+    };
+
+    const fiscalPeriods = (await db
+      .prepare('SELECT * FROM fiscal_periods ORDER BY start_date DESC, id DESC')
+      .all()) as Array<{
+      id: number;
+      code: string;
+      name: string;
+      start_date: string;
+      end_date: string;
+      status: 'open' | 'closed';
+      closed_by: string;
+      closed_at: string;
+    }>;
+
+    const taxRates = (await db
+      .prepare('SELECT * FROM tax_rates ORDER BY rate DESC, code ASC')
+      .all()) as Array<{
+      id: number;
+      code: string;
+      name: string;
+      rate: number;
+      tax_type: 'sales' | 'purchase' | 'both';
+      applies_to: string;
+      is_active: number;
+      notes: string;
+    }>;
+
+    const baseCurrRow = (await db
+      .prepare('SELECT code FROM currencies WHERE is_base = 1 LIMIT 1')
+      .get()) as { code: string } | undefined;
+    const baseCurrency = baseCurrRow?.code || 'USD';
+
+    const glVatRow = (await db
+      .prepare("SELECT balance FROM accounting_accounts WHERE code = '2200' LIMIT 1")
+      .get()) as { balance: number } | undefined;
+    const glVatPayableBalance = Math.round((Number(glVatRow?.balance) || 0) * 100) / 100;
+
+    let dateFrom = cleanDate(q.dateFrom);
+    let dateTo = cleanDate(q.dateTo);
+    const periodCode = String(q.fiscalPeriod ?? '').trim();
+    if (periodCode && periodCode !== 'all') {
+      const matchedPeriod = fiscalPeriods.find((p) => p.code === periodCode);
+      if (matchedPeriod) {
+        if (!dateFrom) dateFrom = matchedPeriod.start_date;
+        if (!dateTo) dateTo = matchedPeriod.end_date;
+      }
+    }
+
+    const includeDrafts = String(q.includeDrafts ?? '').toLowerCase() === 'true';
+    const sourceFilter = ['all', 'invoices', 'purchase_orders'].includes(String(q.sourceFilter ?? 'all'))
+      ? String(q.sourceFilter ?? 'all')
+      : 'all';
+    const taxBucket = ['all', 'output', 'input_recognized', 'input_pending_po'].includes(String(q.taxBucket ?? 'all'))
+      ? String(q.taxBucket ?? 'all')
+      : 'all';
+    const search = String(q.search ?? '').trim().toLowerCase();
+
+    const invWhere: string[] = ["i.status != 'cancelled'"];
+    const invParams: (string | number)[] = [];
+    if (dateFrom) {
+      invWhere.push('i.issue_date >= ?');
+      invParams.push(dateFrom);
+    }
+    if (dateTo) {
+      invWhere.push('i.issue_date <= ?');
+      invParams.push(dateTo);
+    }
+
+    const invRows = (await db
+      .prepare(
+        `SELECT i.id, i.ref, i.invoice_type, i.invoice_kind, i.currency, i.exchange_rate,
+                i.source_ref, i.issue_date, i.due_date, i.status, i.lines_json,
+                i.subtotal_ht, i.tax_total, i.total_ttc,
+                tp.name AS party_name, tp.tax_id AS party_tax_id
+         FROM invoices i
+         JOIN third_parties tp ON tp.id = i.third_party_id
+         WHERE ${invWhere.join(' AND ')}
+         ORDER BY i.issue_date DESC, i.id DESC`
+      )
+      .all(...invParams)) as Array<{
+      id: number;
+      ref: string;
+      invoice_type: 'customer' | 'supplier';
+      invoice_kind: 'standard' | 'credit_note';
+      currency: string;
+      exchange_rate: number;
+      source_ref: string;
+      issue_date: string;
+      due_date: string;
+      status: string;
+      lines_json: string;
+      subtotal_ht: number;
+      tax_total: number;
+      total_ttc: number;
+      party_name: string;
+      party_tax_id: string;
+    }>;
+
+    // Track all PO references already billed via non-cancelled supplier bills to prevent double-counting
+    const billedPoRefsRows = (await db
+      .prepare(
+        `SELECT DISTINCT source_ref
+         FROM invoices
+         WHERE invoice_type = 'supplier' AND status != 'cancelled' AND source_ref != ''`
+      )
+      .all()) as Array<{ source_ref: string }>;
+    const billedPoRefs = new Set(billedPoRefsRows.map((r) => String(r.source_ref).trim().toUpperCase()));
+
+    const poWhere: string[] = ["po.status != 'cancelled'"];
+    const poParams: (string | number)[] = [];
+    if (dateFrom) {
+      poWhere.push('po.order_date >= ?');
+      poParams.push(dateFrom);
+    }
+    if (dateTo) {
+      poWhere.push('po.order_date <= ?');
+      poParams.push(dateTo);
+    }
+
+    const poRows = (await db
+      .prepare(
+        `SELECT po.id, po.ref, po.order_date, po.expected_date, po.status, po.lines_json,
+                po.subtotal_ht, po.tax_total, po.total_ttc,
+                tp.name AS party_name, tp.tax_id AS party_tax_id
+         FROM purchase_orders po
+         JOIN third_parties tp ON tp.id = po.third_party_id
+         WHERE ${poWhere.join(' AND ')}
+         ORDER BY po.order_date DESC, po.id DESC`
+      )
+      .all(...poParams)) as Array<{
+      id: number;
+      ref: string;
+      order_date: string;
+      expected_date: string;
+      status: string;
+      lines_json: string;
+      subtotal_ht: number;
+      tax_total: number;
+      total_ttc: number;
+      party_name: string;
+      party_tax_id: string;
+    }>;
+
+    const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+    type LineDetail = {
+      label: string;
+      ref: string;
+      qty: number;
+      netBaseUsd: number;
+      taxRate: number;
+      taxAmountUsd: number;
+    };
+
+    const parseDocLinesUsd = (rawJson: string, headerBaseUsd: number, headerTaxUsd: number): LineDetail[] => {
+      let parsed: Array<{
+        ref?: string;
+        label?: string;
+        qty?: number;
+        unitPrice?: number;
+        discountPct?: number;
+        taxRate?: number;
+      }> = [];
+      try {
+        const val = JSON.parse(rawJson || '[]');
+        if (Array.isArray(val)) parsed = val;
+      } catch {
+        parsed = [];
+      }
+
+      if (parsed.length === 0) {
+        const effRate = headerBaseUsd > 0 ? round2((headerTaxUsd / headerBaseUsd) * 100) : 0;
+        return [
+          {
+            label: 'Document Summary',
+            ref: '',
+            qty: 1,
+            netBaseUsd: round2(headerBaseUsd),
+            taxRate: effRate,
+            taxAmountUsd: round2(headerTaxUsd),
+          },
+        ];
+      }
+
+      const rawDetails = parsed.map((l) => {
+        const qty = Number(l.qty) || 0;
+        const unitPrice = Number(l.unitPrice) || 0;
+        const discountPct = Number(l.discountPct) || 0;
+        const taxRate = Number(l.taxRate) || 0;
+        const lineHt = qty * unitPrice * (1 - discountPct / 100);
+        const lineTax = lineHt * (taxRate / 100);
+        return {
+          label: String(l.label || 'Line Item'),
+          ref: String(l.ref || ''),
+          qty,
+          rawBase: lineHt,
+          taxRate,
+          rawTax: lineTax,
+        };
+      });
+
+      const sumBase = rawDetails.reduce((s, d) => s + d.rawBase, 0);
+      const sumTax = rawDetails.reduce((s, d) => s + d.rawTax, 0);
+      const baseScale = sumBase > 0 ? headerBaseUsd / sumBase : 1;
+      const taxScale = sumTax > 0 ? headerTaxUsd / sumTax : 1;
+
+      const scaled = rawDetails.map((d) => ({
+        label: d.label,
+        ref: d.ref,
+        qty: d.qty,
+        netBaseUsd: round2(d.rawBase * baseScale),
+        taxRate: round2(d.taxRate),
+        taxAmountUsd: sumTax > 0 ? round2(d.rawTax * taxScale) : 0,
+      }));
+
+      // Reconcile any 1-cent rounding residual on the last line
+      if (scaled.length > 0) {
+        const scaledBaseSum = scaled.reduce((s, d) => s + d.netBaseUsd, 0);
+        const scaledTaxSum = scaled.reduce((s, d) => s + d.taxAmountUsd, 0);
+        scaled[scaled.length - 1].netBaseUsd = round2(scaled[scaled.length - 1].netBaseUsd + (headerBaseUsd - scaledBaseSum));
+        scaled[scaled.length - 1].taxAmountUsd = round2(scaled[scaled.length - 1].taxAmountUsd + (headerTaxUsd - scaledTaxSum));
+      }
+      return scaled;
+    };
+
+    const matchTaxRateMeta = (ratePct: number, scope: 'sales' | 'purchase') => {
+      const exactScope = taxRates.find(
+        (t) => Math.abs(t.rate - ratePct) < 0.01 && (t.tax_type === scope || t.tax_type === 'both')
+      );
+      const anyScope = exactScope || taxRates.find((t) => Math.abs(t.rate - ratePct) < 0.01);
+      if (anyScope) {
+        return {
+          tax_code: anyScope.code,
+          tax_name: anyScope.name,
+          tax_type: anyScope.tax_type,
+        };
+      }
+      return {
+        tax_code: `RATE-${ratePct}`,
+        tax_name: `Custom Rate (${ratePct}%)`,
+        tax_type: scope,
+      };
+    };
+
+    type DocumentRow = {
+      uid: string;
+      id: number;
+      source: 'invoice' | 'purchase_order';
+      doc_type_label: string;
+      ref: string;
+      source_ref: string;
+      party_name: string;
+      party_tax_id: string;
+      doc_date: string;
+      due_or_expected_date: string;
+      status: string;
+      currency: string;
+      exchange_rate: number;
+      taxable_base_usd: number;
+      tax_amount_usd: number;
+      signed_tax_usd: number;
+      liability_impact_usd: number;
+      vat_bucket: 'output' | 'input_recognized' | 'input_pending_po';
+      effective_rate_pct: number;
+      line_details: LineDetail[];
+    };
+
+    const rateBuckets = new Map<
+      number,
+      {
+        rate: number;
+        tax_code: string;
+        tax_name: string;
+        tax_type: string;
+        sales_base_usd: number;
+        output_vat_usd: number;
+        purchases_base_usd: number;
+        recognized_input_vat_usd: number;
+        pending_po_base_usd: number;
+        pending_po_input_vat_usd: number;
+        docUids: Set<string>;
+      }
+    >();
+
+    // Seed rateBuckets with active configured tax rates so configured codes always have context if matched
+    const ensureRateBucket = (ratePct: number, scope: 'sales' | 'purchase') => {
+      const key = round2(ratePct);
+      let bucket = rateBuckets.get(key);
+      if (!bucket) {
+        const meta = matchTaxRateMeta(key, scope);
+        bucket = {
+          rate: key,
+          tax_code: meta.tax_code,
+          tax_name: meta.tax_name,
+          tax_type: meta.tax_type,
+          sales_base_usd: 0,
+          output_vat_usd: 0,
+          purchases_base_usd: 0,
+          recognized_input_vat_usd: 0,
+          pending_po_base_usd: 0,
+          pending_po_input_vat_usd: 0,
+          docUids: new Set<string>(),
+        };
+        rateBuckets.set(key, bucket);
+      }
+      return bucket;
+    };
+
+    const periodBuckets = new Map<
+      string,
+      {
+        period_month: string;
+        output_vat_usd: number;
+        recognized_input_vat_usd: number;
+        pending_po_input_vat_usd: number;
+        doc_count: number;
+      }
+    >();
+
+    const ensurePeriodBucket = (dateStr: string) => {
+      const ym = /^\d{4}-\d{2}/.test(dateStr) ? dateStr.slice(0, 7) : 'Unknown';
+      let p = periodBuckets.get(ym);
+      if (!p) {
+        p = {
+          period_month: ym,
+          output_vat_usd: 0,
+          recognized_input_vat_usd: 0,
+          pending_po_input_vat_usd: 0,
+          doc_count: 0,
+        };
+        periodBuckets.set(ym, p);
+      }
+      return p;
+    };
+
+    let grossOutputVat = 0;
+    let creditNoteOutputOffset = 0;
+    let recognizedInputVat = 0;
+    let pendingPoInputVat = 0;
+    let taxableSalesBase = 0;
+    let taxablePurchasesBase = 0;
+    let pendingPoBase = 0;
+    let customerInvoiceCount = 0;
+    let supplierBillCount = 0;
+    let openPoCount = 0;
+    let billedPoExcludedCount = 0;
+    let draftExcludedCount = 0;
+
+    const allDocs: DocumentRow[] = [];
+
+    for (const inv of invRows) {
+      if (inv.status === 'draft' && !includeDrafts) {
+        draftExcludedCount += 1;
+        continue;
+      }
+      const fx = inv.exchange_rate && inv.exchange_rate > 0 ? inv.exchange_rate : 1;
+      const baseUsd = round2((Number(inv.subtotal_ht) || 0) / fx);
+      const taxUsd = round2((Number(inv.tax_total) || 0) / fx);
+      const isCreditNote = inv.invoice_kind === 'credit_note';
+      const sign = isCreditNote ? -1 : 1;
+      const isCustomer = inv.invoice_type === 'customer';
+      const vatBucket: DocumentRow['vat_bucket'] = isCustomer ? 'output' : 'input_recognized';
+      const signedTaxUsd = round2(taxUsd * sign);
+      const liabilityImpactUsd = isCustomer ? signedTaxUsd : round2(-signedTaxUsd);
+      const docTypeLabel = isCustomer
+        ? isCreditNote
+          ? 'Customer Credit Note'
+          : 'Customer Invoice'
+        : isCreditNote
+          ? 'Supplier Credit Note'
+          : 'Supplier Bill';
+
+      const lineDetails = parseDocLinesUsd(inv.lines_json, baseUsd, taxUsd);
+      const effRate = baseUsd > 0 ? round2((taxUsd / baseUsd) * 100) : lineDetails[0]?.taxRate ?? 0;
+      const uid = `inv-${inv.id}`;
+
+      if (isCustomer) {
+        customerInvoiceCount += 1;
+        taxableSalesBase += baseUsd * sign;
+        if (isCreditNote) {
+          creditNoteOutputOffset += taxUsd;
+        } else {
+          grossOutputVat += taxUsd;
+        }
+      } else {
+        supplierBillCount += 1;
+        taxablePurchasesBase += baseUsd * sign;
+        recognizedInputVat += signedTaxUsd;
+      }
+
+      const period = ensurePeriodBucket(inv.issue_date);
+      period.doc_count += 1;
+      if (isCustomer) period.output_vat_usd += signedTaxUsd;
+      else period.recognized_input_vat_usd += signedTaxUsd;
+
+      for (const line of lineDetails) {
+        const rb = ensureRateBucket(line.taxRate, isCustomer ? 'sales' : 'purchase');
+        rb.docUids.add(uid);
+        if (isCustomer) {
+          rb.sales_base_usd += line.netBaseUsd * sign;
+          rb.output_vat_usd += line.taxAmountUsd * sign;
+        } else {
+          rb.purchases_base_usd += line.netBaseUsd * sign;
+          rb.recognized_input_vat_usd += line.taxAmountUsd * sign;
+        }
+      }
+
+      allDocs.push({
+        uid,
+        id: inv.id,
+        source: 'invoice',
+        doc_type_label: docTypeLabel,
+        ref: inv.ref,
+        source_ref: inv.source_ref || '',
+        party_name: inv.party_name,
+        party_tax_id: inv.party_tax_id || '',
+        doc_date: inv.issue_date,
+        due_or_expected_date: inv.due_date,
+        status: inv.status,
+        currency: inv.currency || baseCurrency,
+        exchange_rate: fx,
+        taxable_base_usd: baseUsd,
+        tax_amount_usd: taxUsd,
+        signed_tax_usd: signedTaxUsd,
+        liability_impact_usd: liabilityImpactUsd,
+        vat_bucket: vatBucket,
+        effective_rate_pct: effRate,
+        line_details: lineDetails,
+      });
+    }
+
+    for (const po of poRows) {
+      if (po.status === 'billed' || billedPoRefs.has(po.ref.trim().toUpperCase())) {
+        billedPoExcludedCount += 1;
+        continue;
+      }
+      if (po.status === 'draft' && !includeDrafts) {
+        draftExcludedCount += 1;
+        continue;
+      }
+
+      const baseUsd = round2(Number(po.subtotal_ht) || 0);
+      const taxUsd = round2(Number(po.tax_total) || 0);
+      const lineDetails = parseDocLinesUsd(po.lines_json, baseUsd, taxUsd);
+      const effRate = baseUsd > 0 ? round2((taxUsd / baseUsd) * 100) : lineDetails[0]?.taxRate ?? 0;
+      const uid = `po-${po.id}`;
+
+      openPoCount += 1;
+      pendingPoBase += baseUsd;
+      pendingPoInputVat += taxUsd;
+
+      const period = ensurePeriodBucket(po.expected_date || po.order_date);
+      period.doc_count += 1;
+      period.pending_po_input_vat_usd += taxUsd;
+
+      for (const line of lineDetails) {
+        const rb = ensureRateBucket(line.taxRate, 'purchase');
+        rb.docUids.add(uid);
+        rb.pending_po_base_usd += line.netBaseUsd;
+        rb.pending_po_input_vat_usd += line.taxAmountUsd;
+      }
+
+      allDocs.push({
+        uid,
+        id: po.id,
+        source: 'purchase_order',
+        doc_type_label: 'Purchase Order',
+        ref: po.ref,
+        source_ref: '',
+        party_name: po.party_name,
+        party_tax_id: po.party_tax_id || '',
+        doc_date: po.order_date,
+        due_or_expected_date: po.expected_date,
+        status: po.status,
+        currency: baseCurrency,
+        exchange_rate: 1,
+        taxable_base_usd: baseUsd,
+        tax_amount_usd: taxUsd,
+        signed_tax_usd: taxUsd,
+        liability_impact_usd: round2(-taxUsd),
+        vat_bucket: 'input_pending_po',
+        effective_rate_pct: effRate,
+        line_details: lineDetails,
+      });
+    }
+
+    allDocs.sort((a, b) => b.doc_date.localeCompare(a.doc_date) || b.id - a.id);
+
+    const filteredDocs = allDocs.filter((d) => {
+      if (sourceFilter === 'invoices' && d.source !== 'invoice') return false;
+      if (sourceFilter === 'purchase_orders' && d.source !== 'purchase_order') return false;
+      if (taxBucket !== 'all' && d.vat_bucket !== taxBucket) return false;
+      if (search) {
+        const hay = `${d.ref} ${d.source_ref} ${d.party_name} ${d.party_tax_id} ${d.doc_type_label} ${d.status}`.toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+
+    const netOutputVat = round2(grossOutputVat - creditNoteOutputOffset);
+    recognizedInputVat = round2(recognizedInputVat);
+    pendingPoInputVat = round2(pendingPoInputVat);
+    const totalPotentialInputVat = round2(recognizedInputVat + pendingPoInputVat);
+    const netStatutoryPayable = round2(netOutputVat - recognizedInputVat);
+    const projectedNetLiability = round2(netStatutoryPayable - pendingPoInputVat);
+    const glVariance = round2(netStatutoryPayable - glVatPayableBalance);
+
+    const rateBreakdown = Array.from(rateBuckets.values())
+      .map((rb) => {
+        const outVat = round2(rb.output_vat_usd);
+        const inVat = round2(rb.recognized_input_vat_usd);
+        const poVat = round2(rb.pending_po_input_vat_usd);
+        return {
+          rate: rb.rate,
+          tax_code: rb.tax_code,
+          tax_name: rb.tax_name,
+          tax_type: rb.tax_type,
+          sales_base_usd: round2(rb.sales_base_usd),
+          output_vat_usd: outVat,
+          purchases_base_usd: round2(rb.purchases_base_usd),
+          recognized_input_vat_usd: inVat,
+          pending_po_base_usd: round2(rb.pending_po_base_usd),
+          pending_po_input_vat_usd: poVat,
+          net_vat_usd: round2(outVat - inVat),
+          projected_net_vat_usd: round2(outVat - inVat - poVat),
+          doc_count: rb.docUids.size,
+        };
+      })
+      .sort((a, b) => b.rate - a.rate);
+
+    const monthlyTimeline = Array.from(periodBuckets.values())
+      .map((p) => {
+        const outVat = round2(p.output_vat_usd);
+        const inVat = round2(p.recognized_input_vat_usd);
+        const poVat = round2(p.pending_po_input_vat_usd);
+        return {
+          period_month: p.period_month,
+          output_vat_usd: outVat,
+          recognized_input_vat_usd: inVat,
+          pending_po_input_vat_usd: poVat,
+          net_payable_usd: round2(outVat - inVat),
+          projected_payable_usd: round2(outVat - inVat - poVat),
+          doc_count: p.doc_count,
+        };
+      })
+      .sort((a, b) => b.period_month.localeCompare(a.period_month));
+
+    return {
+      summary: {
+        baseCurrency,
+        grossOutputVat: round2(grossOutputVat),
+        creditNoteOutputOffset: round2(creditNoteOutputOffset),
+        netOutputVat,
+        recognizedInputVat,
+        pendingPoInputVat,
+        totalPotentialInputVat,
+        netStatutoryPayable,
+        projectedNetLiability,
+        glVatPayableBalance,
+        glVariance,
+        taxableSalesBase: round2(taxableSalesBase),
+        taxablePurchasesBase: round2(taxablePurchasesBase),
+        pendingPoBase: round2(pendingPoBase),
+        customerInvoiceCount,
+        supplierBillCount,
+        openPoCount,
+        billedPoExcludedCount,
+        draftExcludedCount,
+      },
+      documents: filteredDocs,
+      rateBreakdown,
+      monthlyTimeline,
+      fiscalPeriods,
+      taxRates,
+    };
+  }
+
+  router.get('/finance/tax-compliance', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const payload = await computeTaxComplianceReport(req.query as TaxComplianceQuery);
+    res.json(payload);
+  });
+
+  router.get('/finance/tax-compliance/export', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const payload = await computeTaxComplianceReport(req.query as TaxComplianceQuery);
+    const headers = [
+      'Reference',
+      'Document Type',
+      'Tax Bucket',
+      'Counterparty',
+      'Party Tax ID',
+      'Document Date',
+      'Due / Expected Date',
+      'Status',
+      'Currency',
+      'FX Rate',
+      'Taxable Base (USD)',
+      'Effective Rate %',
+      'Tax Amount (USD)',
+      'Liability Impact (USD)',
+    ];
+    const bucketLabels: Record<string, string> = {
+      output: 'Output VAT Collected',
+      input_recognized: 'Recognized Input VAT',
+      input_pending_po: 'Pending PO Input Credit',
+    };
+    const lines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...payload.documents.map((d) =>
+        [
+          d.ref,
+          d.doc_type_label,
+          bucketLabels[d.vat_bucket] || d.vat_bucket,
+          d.party_name,
+          d.party_tax_id,
+          d.doc_date,
+          d.due_or_expected_date,
+          d.status,
+          d.currency,
+          d.exchange_rate,
+          d.taxable_base_usd.toFixed(2),
+          d.effective_rate_pct.toFixed(2),
+          d.tax_amount_usd.toFixed(2),
+          d.liability_impact_usd.toFixed(2),
+        ]
+          .map(sanitizeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: payload.documents.length,
+      filename: `kscat-tax-compliance-${new Date().toISOString().slice(0, 10)}.csv`,
       csv: lines.join('\n'),
     });
   });
@@ -3389,10 +5865,33 @@ ${txBlocks}
       res.status(404).json({ error: 'Fixed asset not found.' });
       return;
     }
-    const { name, category, acquisitionDate, purchaseCost, salvageValue, usefulLifeMonths, depreciationMethod, location, status, notes } =
-      req.body ?? {};
+    const {
+      name,
+      category,
+      acquisitionDate,
+      purchaseCost,
+      salvageValue,
+      usefulLifeMonths,
+      depreciationMethod,
+      accumulatedDepreciation,
+      location,
+      status,
+      notes,
+    } = req.body ?? {};
     const nextCost = purchaseCost !== undefined ? Math.max(1, Number(purchaseCost)) : existing.purchase_cost;
     const nextSalvage = salvageValue !== undefined ? Math.max(0, Math.min(nextCost, Number(salvageValue))) : existing.salvage_value;
+    const maxDepreciable = Math.max(0, nextCost - nextSalvage);
+    const nextAccum =
+      accumulatedDepreciation !== undefined
+        ? Math.max(0, Math.min(maxDepreciable, Number(accumulatedDepreciation) || 0))
+        : Math.min(maxDepreciable, existing.accumulated_depreciation);
+    const explicitStatus = ['active', 'fully_depreciated', 'disposed'].includes(status) ? status : null;
+    const computedStatus =
+      explicitStatus === 'disposed'
+        ? 'disposed'
+        : nextAccum >= maxDepreciable - 0.01 && maxDepreciable > 0
+          ? 'fully_depreciated'
+          : explicitStatus;
     await db
       .prepare(
         `UPDATE fixed_assets
@@ -3403,6 +5902,7 @@ ${txBlocks}
              salvage_value = ?,
              useful_life_months = COALESCE(?, useful_life_months),
              depreciation_method = COALESCE(?, depreciation_method),
+             accumulated_depreciation = ?,
              location = COALESCE(?, location),
              status = COALESCE(?, status),
              notes = COALESCE(?, notes)
@@ -3416,8 +5916,9 @@ ${txBlocks}
         nextSalvage,
         usefulLifeMonths !== undefined ? Math.max(1, Number(usefulLifeMonths)) : null,
         ['straight_line', 'declining_balance'].includes(depreciationMethod) ? depreciationMethod : null,
+        Math.round(nextAccum * 100) / 100,
         location !== undefined ? String(location).trim() : null,
-        ['active', 'fully_depreciated', 'disposed'].includes(status) ? status : null,
+        computedStatus,
         notes !== undefined ? String(notes).trim() : null,
         id
       );
@@ -3508,6 +6009,170 @@ ${txBlocks}
     }
   });
 
+  router.post('/finance/fixed-assets/depreciate-batch', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const rawDate = String(req.body?.postDate || new Date().toISOString().slice(0, 10)).trim();
+    const postDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : new Date().toISOString().slice(0, 10);
+    const closedPeriod = await getClosedPeriodForDate(postDate);
+    if (closedPeriod) {
+      res.status(409).json({ error: `Cannot post depreciation into closed fiscal period ${closedPeriod.code}.` });
+      return;
+    }
+
+    const postMonth = postDate.slice(0, 7);
+    const skipSameMonth = req.body?.skipAlreadyPostedThisMonth !== false;
+    const requestedIds = Array.isArray(req.body?.assetIds)
+      ? new Set((req.body.assetIds as unknown[]).map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0))
+      : null;
+
+    const activeAssets = (await db
+      .prepare("SELECT * FROM fixed_assets WHERE status = 'active' ORDER BY id ASC")
+      .all()) as Array<{
+      id: number;
+      ref: string;
+      name: string;
+      purchase_cost: number;
+      salvage_value: number;
+      useful_life_months: number;
+      depreciation_method: 'straight_line' | 'declining_balance';
+      accumulated_depreciation: number;
+      last_depreciation_date: string;
+    }>;
+
+    const candidates = activeAssets.filter((a) => {
+      if (requestedIds && !requestedIds.has(a.id)) return false;
+      if (skipSameMonth && String(a.last_depreciation_date || '').slice(0, 7) === postMonth) return false;
+      return a.purchase_cost - a.salvage_value - a.accumulated_depreciation > 0.01;
+    });
+
+    if (candidates.length === 0) {
+      res.status(400).json({ error: `No eligible active assets remain to depreciate for ${postMonth}.` });
+      return;
+    }
+
+    const results: Array<{ ref: string; journalRef: string; charge: number }> = [];
+    let totalCharge = 0;
+
+    await db.exec('BEGIN');
+    try {
+      for (const asset of candidates) {
+        const remainingDepreciable = Math.max(0, asset.purchase_cost - asset.salvage_value - asset.accumulated_depreciation);
+        if (remainingDepreciable <= 0.01) continue;
+        const life = Math.max(1, asset.useful_life_months);
+        const rawMonthly =
+          asset.depreciation_method === 'declining_balance'
+            ? remainingDepreciable * (2 / life)
+            : (asset.purchase_cost - asset.salvage_value) / life;
+        const charge = Math.min(remainingDepreciable, Math.max(0.01, Math.round(rawMonthly * 100) / 100));
+        const nextAccum = Math.round((asset.accumulated_depreciation + charge) * 100) / 100;
+        const nextStatus = asset.purchase_cost - asset.salvage_value - nextAccum <= 0.01 ? 'fully_depreciated' : 'active';
+        const jrnRef = await seqRef('journal_entries', 'DEP');
+
+        await db
+          .prepare(`UPDATE fixed_assets SET accumulated_depreciation = ?, last_depreciation_date = ?, status = ? WHERE id = ?`)
+          .run(nextAccum, postDate, nextStatus, asset.id);
+        await db
+          .prepare(
+            `INSERT INTO journal_entries (ref, entry_date, journal_code, description, debit_account_code, credit_account_code, amount, source_ref, created_by)
+             VALUES (?, ?, 'DEP', ?, '6300', '1290', ?, ?, ?)`
+          )
+          .run(jrnRef, postDate, `Monthly Depreciation — ${asset.ref} (${asset.name})`, charge, asset.ref, req.authUser!.email);
+        await applyAccountPosting('6300', 'debit', charge);
+        await applyAccountPosting('1290', 'credit', charge);
+
+        totalCharge = Math.round((totalCharge + charge) * 100) / 100;
+        results.push({ ref: asset.ref, journalRef: jrnRef, charge });
+      }
+      await db.exec('COMMIT');
+      await writeAuditLog(db, {
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'BATCH_DEPRECIATE_FIXED_ASSETS',
+        module: 'billing',
+        entityRef: postMonth,
+        details: `Posted batch depreciation ($${totalCharge.toFixed(2)}) across ${results.length} fixed asset(s)`,
+        ipAddress: getClientIp(req),
+      });
+      res.json({ count: results.length, totalCharge, postDate, items: results });
+    } catch (err) {
+      await db.exec('ROLLBACK');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Unable to run batch depreciation.' });
+    }
+  });
+
+  router.get('/finance/fixed-assets/export', authenticate, requirePermission('billing', 'read'), async (_req, res) => {
+    const rawAssets = (await db.prepare('SELECT * FROM fixed_assets ORDER BY acquisition_date DESC, id DESC').all()) as Array<{
+      ref: string;
+      name: string;
+      category: string;
+      acquisition_date: string;
+      purchase_cost: number;
+      salvage_value: number;
+      useful_life_months: number;
+      depreciation_method: 'straight_line' | 'declining_balance';
+      accumulated_depreciation: number;
+      last_depreciation_date: string;
+      location: string;
+      status: string;
+      notes: string;
+    }>;
+    const headers = [
+      'Asset Ref',
+      'Asset Name',
+      'Category',
+      'Purchase Date',
+      'Location',
+      'Method',
+      'Useful Life (Months)',
+      'Purchase Cost',
+      'Salvage Value',
+      'Accumulated Depreciation',
+      'Current Net Book Value',
+      'Est. Monthly Charge',
+      'Last Depreciation Date',
+      'Status',
+      'Notes',
+    ];
+    const lines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...rawAssets.map((a) => {
+        const nbv = Math.max(0, Math.round((a.purchase_cost - a.accumulated_depreciation) * 100) / 100);
+        const depreciableBase = Math.max(0, a.purchase_cost - a.salvage_value);
+        const life = Math.max(1, a.useful_life_months);
+        const estMonthly =
+          a.status !== 'active'
+            ? 0
+            : a.depreciation_method === 'declining_balance'
+              ? Math.round(Math.max(0, nbv - a.salvage_value) * (2 / life) * 100) / 100
+              : Math.round((depreciableBase / life) * 100) / 100;
+        const boundedMonthly = Math.min(estMonthly, Math.max(0, nbv - a.salvage_value));
+        return [
+          a.ref,
+          a.name,
+          a.category,
+          a.acquisition_date,
+          a.location,
+          a.depreciation_method === 'declining_balance' ? 'Double Declining Balance' : 'Straight-Line',
+          a.useful_life_months,
+          a.purchase_cost.toFixed(2),
+          a.salvage_value.toFixed(2),
+          a.accumulated_depreciation.toFixed(2),
+          nbv.toFixed(2),
+          boundedMonthly.toFixed(2),
+          a.last_depreciation_date || '',
+          a.status,
+          a.notes || '',
+        ]
+          .map(sanitizeCsvCell)
+          .join(',');
+      }),
+    ];
+    res.json({
+      count: rawAssets.length,
+      filename: `kscat-fixed-assets-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
+  });
+
   router.delete('/finance/fixed-assets/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
     const id = Number(req.params.id);
     const existing = (await db.prepare('SELECT ref, name FROM fixed_assets WHERE id = ?').get(id)) as
@@ -3525,6 +6190,665 @@ ${txBlocks}
       module: 'billing',
       entityRef: existing.ref,
       details: `Deleted fixed asset ${existing.ref} (${existing.name})`,
+      ipAddress: getClientIp(req),
+      severity: 'warning',
+    });
+    res.json({ ok: true });
+  });
+
+  // Fiscal Period Budgets, Actual Spend Tracking & Variance Alerts
+  interface FiscalBudgetsQuery {
+    fiscalPeriodId?: string;
+    alertStatus?: string;
+    category?: string;
+    search?: string;
+  }
+
+  const VALID_SPEND_SOURCES = [
+    'auto',
+    'gl_account',
+    'supplier_bills',
+    'payroll',
+    'bank_debits',
+    'expenses',
+    'manual',
+  ] as const;
+
+  async function computeFiscalBudgetsReport(q: FiscalBudgetsQuery) {
+    const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+    const fiscalPeriods = (await db
+      .prepare('SELECT * FROM fiscal_periods ORDER BY start_date DESC, id DESC')
+      .all()) as Array<{
+      id: number;
+      code: string;
+      name: string;
+      start_date: string;
+      end_date: string;
+      status: 'open' | 'closed';
+      closed_by: string;
+      closed_at: string;
+    }>;
+
+    const accounts = (await db
+      .prepare('SELECT * FROM accounting_accounts ORDER BY code ASC')
+      .all()) as Array<{
+      id: number;
+      code: string;
+      label: string;
+      account_class: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+      balance: number;
+      is_active: number;
+    }>;
+    const accountLabelMap = new Map(accounts.map((a) => [a.code, a.label]));
+
+    const rawBudgets = (await db
+      .prepare(
+        `SELECT fb.*, fp.code AS period_code, fp.name AS period_name,
+                fp.start_date AS period_start, fp.end_date AS period_end, fp.status AS period_status
+         FROM fiscal_budgets fb
+         JOIN fiscal_periods fp ON fp.id = fb.fiscal_period_id
+         ORDER BY fp.start_date DESC, fb.id DESC`
+      )
+      .all()) as Array<{
+      id: number;
+      ref: string;
+      fiscal_period_id: number;
+      period_code: string;
+      period_name: string;
+      period_start: string;
+      period_end: string;
+      period_status: 'open' | 'closed';
+      name: string;
+      category: string;
+      department: string;
+      account_code: string;
+      planned_amount: number;
+      warning_threshold_pct: number;
+      critical_threshold_pct: number;
+      spend_source: (typeof VALID_SPEND_SOURCES)[number];
+      manual_actual_amount: number;
+      notes: string;
+      created_by: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    const journalRows = (await db
+      .prepare(
+        `SELECT ref, entry_date, description, debit_account_code, credit_account_code, amount, source_ref
+         FROM journal_entries
+         WHERE is_reversal = 0
+         ORDER BY entry_date DESC, id DESC`
+      )
+      .all()) as Array<{
+      ref: string;
+      entry_date: string;
+      description: string;
+      debit_account_code: string;
+      credit_account_code: string;
+      amount: number;
+      source_ref: string;
+    }>;
+
+    const supplierBillRows = (await db
+      .prepare(
+        `SELECT i.ref, i.issue_date, i.invoice_kind, i.subtotal_ht, i.exchange_rate, tp.name AS party_name
+         FROM invoices i
+         JOIN third_parties tp ON tp.id = i.third_party_id
+         WHERE i.invoice_type = 'supplier' AND i.status != 'cancelled'
+         ORDER BY i.issue_date DESC, i.id DESC`
+      )
+      .all()) as Array<{
+      ref: string;
+      issue_date: string;
+      invoice_kind: 'standard' | 'credit_note';
+      subtotal_ht: number;
+      exchange_rate: number;
+      party_name: string;
+    }>;
+
+    const bankDebitRows = (await db
+      .prepare(
+        `SELECT id, tx_date, label, category, amount
+         FROM bank_transactions
+         WHERE direction = 'debit' AND invoice_ref = ''
+         ORDER BY tx_date DESC, id DESC`
+      )
+      .all()) as Array<{
+      id: number;
+      tx_date: string;
+      label: string;
+      category: string;
+      amount: number;
+    }>;
+
+    const payrollRows = (await db
+      .prepare(
+        `SELECT ref, pay_period, pay_date, total_gross, employee_count
+         FROM payroll_runs
+         WHERE status IN ('processed', 'paid')
+         ORDER BY pay_date DESC, id DESC`
+      )
+      .all()) as Array<{
+      ref: string;
+      pay_period: string;
+      pay_date: string;
+      total_gross: number;
+      employee_count: number;
+    }>;
+
+    const expenseRows = (await db
+      .prepare(
+        `SELECT er.ref, er.category, er.expense_date, er.amount, er.description, e.full_name AS employee_name
+         FROM expense_reports er
+         LEFT JOIN employees e ON e.id = er.employee_id
+         WHERE er.status IN ('approved', 'paid')
+         ORDER BY er.expense_date DESC, er.id DESC`
+      )
+      .all()) as Array<{
+      ref: string;
+      category: string;
+      expense_date: string;
+      amount: number;
+      description: string;
+      employee_name: string | null;
+    }>;
+
+    type SpendLine = {
+      sourceLabel: string;
+      ref: string;
+      date: string;
+      description: string;
+      amount: number;
+    };
+
+    const categoriesSet = new Set<string>();
+
+    const enriched = rawBudgets.map((b) => {
+      if (b.category) categoriesSet.add(b.category);
+      const start = b.period_start;
+      const end = b.period_end;
+      const acct = String(b.account_code || '').trim();
+      const source = b.spend_source || 'auto';
+      const breakdown: SpendLine[] = [];
+      const postedSourceRefs = new Set<string>();
+
+      const addGlMatches = () => {
+        if (!acct) return;
+        for (const je of journalRows) {
+          if (je.entry_date < start || je.entry_date > end) continue;
+          if (je.debit_account_code === acct) {
+            if (je.source_ref) postedSourceRefs.add(je.source_ref.toUpperCase());
+            breakdown.push({
+              sourceLabel: 'General Ledger (DR)',
+              ref: je.ref,
+              date: je.entry_date,
+              description: je.description,
+              amount: round2(Number(je.amount) || 0),
+            });
+          } else if (je.credit_account_code === acct) {
+            if (je.source_ref) postedSourceRefs.add(je.source_ref.toUpperCase());
+            breakdown.push({
+              sourceLabel: 'General Ledger (CR)',
+              ref: je.ref,
+              date: je.entry_date,
+              description: je.description,
+              amount: round2(-(Number(je.amount) || 0)),
+            });
+          }
+        }
+      };
+
+      const addSupplierBills = (avoidDoubleCount: boolean) => {
+        for (const inv of supplierBillRows) {
+          if (inv.issue_date < start || inv.issue_date > end) continue;
+          if (avoidDoubleCount && postedSourceRefs.has(inv.ref.toUpperCase())) continue;
+          const fx = inv.exchange_rate && inv.exchange_rate > 0 ? inv.exchange_rate : 1;
+          const sign = inv.invoice_kind === 'credit_note' ? -1 : 1;
+          const amt = round2(((Number(inv.subtotal_ht) || 0) / fx) * sign);
+          breakdown.push({
+            sourceLabel: inv.invoice_kind === 'credit_note' ? 'Supplier Credit Note' : 'Supplier Bill',
+            ref: inv.ref,
+            date: inv.issue_date,
+            description: `${inv.party_name} (Excl. Tax)`,
+            amount: amt,
+          });
+        }
+      };
+
+      const addPayrollRuns = (avoidDoubleCount: boolean) => {
+        for (const pr of payrollRows) {
+          if (pr.pay_date < start || pr.pay_date > end) continue;
+          if (avoidDoubleCount && postedSourceRefs.has(pr.ref.toUpperCase())) continue;
+          breakdown.push({
+            sourceLabel: 'Payroll Run',
+            ref: pr.ref,
+            date: pr.pay_date,
+            description: `Pay Period ${pr.pay_period} (${pr.employee_count} employees)`,
+            amount: round2(Number(pr.total_gross) || 0),
+          });
+        }
+      };
+
+      const addBankDebits = (matchFacilitiesOnly: boolean) => {
+        const catLower = b.category.toLowerCase();
+        for (const tx of bankDebitRows) {
+          if (tx.tx_date < start || tx.tx_date > end) continue;
+          if (matchFacilitiesOnly) {
+            const txCat = tx.category.toLowerCase();
+            if (!catLower.includes(txCat) && !txCat.includes('facilit')) continue;
+          }
+          breakdown.push({
+            sourceLabel: 'Bank Outflow',
+            ref: `BNK-TX-${tx.id}`,
+            date: tx.tx_date,
+            description: `${tx.label} (${tx.category})`,
+            amount: round2(Number(tx.amount) || 0),
+          });
+        }
+      };
+
+      const addExpenseReports = (avoidDoubleCount: boolean) => {
+        for (const exp of expenseRows) {
+          if (exp.expense_date < start || exp.expense_date > end) continue;
+          if (avoidDoubleCount && postedSourceRefs.has(exp.ref.toUpperCase())) continue;
+          breakdown.push({
+            sourceLabel: 'Expense Report',
+            ref: exp.ref,
+            date: exp.expense_date,
+            description: `${exp.employee_name || 'Employee'} — ${exp.description}`,
+            amount: round2(Number(exp.amount) || 0),
+          });
+        }
+      };
+
+      if (source === 'gl_account') {
+        addGlMatches();
+      } else if (source === 'supplier_bills') {
+        addSupplierBills(false);
+      } else if (source === 'payroll') {
+        addPayrollRuns(false);
+      } else if (source === 'bank_debits') {
+        addBankDebits(false);
+      } else if (source === 'expenses') {
+        addExpenseReports(false);
+      } else if (source === 'auto') {
+        addGlMatches();
+        const catLower = b.category.toLowerCase();
+        if (acct === '5000' || /cogs|cost of goods|purchase|inventory|material/.test(catLower)) {
+          addSupplierBills(true);
+        } else if (acct === '6100' || /facilit|lease|rent|utilities/.test(catLower)) {
+          addBankDebits(true);
+        } else if (acct === '6200' || /payroll|salary|salaries|benefit/.test(catLower)) {
+          addPayrollRuns(true);
+        } else if (/travel|expense/.test(catLower)) {
+          addExpenseReports(true);
+        }
+      }
+
+      const manualAmt = round2(Number(b.manual_actual_amount) || 0);
+      if (manualAmt !== 0 || source === 'manual') {
+        if (manualAmt !== 0) {
+          breakdown.push({
+            sourceLabel: source === 'manual' ? 'Manual Actual Entry' : 'Manual Accrual Adjustment',
+            ref: b.ref,
+            date: b.period_end,
+            description: source === 'manual' ? 'Direct budget actual figure' : 'Controller adjustment',
+            amount: manualAmt,
+          });
+        }
+      }
+
+      const actualAmount = round2(breakdown.reduce((s, item) => s + item.amount, 0));
+      const plannedAmount = round2(Number(b.planned_amount) || 0);
+      const remainingAmount = round2(plannedAmount - actualAmount);
+      const varianceAmount = round2(actualAmount - plannedAmount);
+      const utilizationPct =
+        plannedAmount > 0
+          ? Math.round((actualAmount / plannedAmount) * 1000) / 10
+          : actualAmount > 0
+            ? 100
+            : 0;
+      const warnPct = Number(b.warning_threshold_pct) || 85;
+      const critPct = Number(b.critical_threshold_pct) || 100;
+
+      const alertStatus: 'on_track' | 'warning' | 'over_budget' =
+        (plannedAmount > 0 && actualAmount > plannedAmount) || utilizationPct >= critPct
+          ? 'over_budget'
+          : utilizationPct >= warnPct
+            ? 'warning'
+            : 'on_track';
+
+      return {
+        ...b,
+        account_label: acct ? accountLabelMap.get(acct) || '' : '',
+        planned_amount: plannedAmount,
+        actual_amount: actualAmount,
+        remaining_amount: remainingAmount,
+        variance_amount: varianceAmount,
+        utilization_pct: utilizationPct,
+        alert_status: alertStatus,
+        actual_breakdown: breakdown,
+      };
+    });
+
+    const periodFilter = String(q.fiscalPeriodId ?? 'all').trim();
+    const alertFilter = String(q.alertStatus ?? 'all').trim();
+    const catFilter = String(q.category ?? 'all').trim();
+    const search = String(q.search ?? '').trim().toLowerCase();
+
+    const filtered = enriched.filter((b) => {
+      if (periodFilter !== 'all' && String(b.fiscal_period_id) !== periodFilter) return false;
+      if (alertFilter === 'alerts_only' && b.alert_status === 'on_track') return false;
+      if (
+        alertFilter !== 'all' &&
+        alertFilter !== 'alerts_only' &&
+        b.alert_status !== alertFilter
+      ) {
+        return false;
+      }
+      if (catFilter !== 'all' && b.category !== catFilter) return false;
+      if (search) {
+        const hay = `${b.ref} ${b.name} ${b.category} ${b.department} ${b.account_code} ${b.account_label} ${b.period_code}`.toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+
+    const periodScoped = periodFilter === 'all'
+      ? enriched
+      : enriched.filter((b) => String(b.fiscal_period_id) === periodFilter);
+
+    const alerts = periodScoped
+      .filter((b) => b.alert_status !== 'on_track')
+      .sort((a, b) => {
+        if (a.alert_status !== b.alert_status) {
+          return a.alert_status === 'over_budget' ? -1 : 1;
+        }
+        return b.utilization_pct - a.utilization_pct;
+      });
+
+    const totalPlanned = round2(filtered.reduce((s, b) => s + b.planned_amount, 0));
+    const totalActual = round2(filtered.reduce((s, b) => s + b.actual_amount, 0));
+    const totalRemaining = round2(totalPlanned - totalActual);
+    const totalVariance = round2(totalActual - totalPlanned);
+    const overallUtilizationPct =
+      totalPlanned > 0 ? Math.round((totalActual / totalPlanned) * 1000) / 10 : 0;
+    const overBudgetCount = filtered.filter((b) => b.alert_status === 'over_budget').length;
+    const warningCount = filtered.filter((b) => b.alert_status === 'warning').length;
+    const onTrackCount = filtered.filter((b) => b.alert_status === 'on_track').length;
+
+    return {
+      budgets: filtered,
+      alerts,
+      summary: {
+        totalBudgets: filtered.length,
+        totalPlanned,
+        totalActual,
+        totalRemaining,
+        totalVariance,
+        overallUtilizationPct,
+        overBudgetCount,
+        warningCount,
+        onTrackCount,
+        alertCount: overBudgetCount + warningCount,
+      },
+      fiscalPeriods,
+      accounts,
+      categories: Array.from(categoriesSet).sort(),
+    };
+  }
+
+  router.get('/finance/budgets', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const payload = await computeFiscalBudgetsReport(req.query as FiscalBudgetsQuery);
+    res.json(payload);
+  });
+
+  router.get('/finance/budgets/export', authenticate, requirePermission('billing', 'read'), async (req, res) => {
+    const payload = await computeFiscalBudgetsReport(req.query as FiscalBudgetsQuery);
+    const headers = [
+      'Budget Ref',
+      'Fiscal Period',
+      'Period Start',
+      'Period End',
+      'Budget Name',
+      'Category',
+      'Department',
+      'GL Account',
+      'Spend Source',
+      'Planned Budget',
+      'Actual Spend',
+      'Remaining Headroom',
+      'Variance',
+      'Utilization %',
+      'Warning Threshold %',
+      'Critical Threshold %',
+      'Alert Status',
+      'Notes',
+    ];
+    const lines = [
+      headers.map(sanitizeCsvCell).join(','),
+      ...payload.budgets.map((b) =>
+        [
+          b.ref,
+          b.period_code,
+          b.period_start,
+          b.period_end,
+          b.name,
+          b.category,
+          b.department,
+          b.account_code ? `${b.account_code} ${b.account_label}` : '',
+          b.spend_source,
+          b.planned_amount.toFixed(2),
+          b.actual_amount.toFixed(2),
+          b.remaining_amount.toFixed(2),
+          b.variance_amount.toFixed(2),
+          b.utilization_pct.toFixed(1),
+          b.warning_threshold_pct.toFixed(1),
+          b.critical_threshold_pct.toFixed(1),
+          b.alert_status,
+          b.notes,
+        ]
+          .map(sanitizeCsvCell)
+          .join(',')
+      ),
+    ];
+    res.json({
+      count: payload.budgets.length,
+      filename: `kscat-fiscal-budgets-${new Date().toISOString().slice(0, 10)}.csv`,
+      csv: lines.join('\n'),
+    });
+  });
+
+  router.post('/finance/budgets', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const {
+      fiscalPeriodId,
+      name,
+      category = 'Operating Expenses',
+      department = 'General',
+      accountCode = '',
+      plannedAmount,
+      warningThresholdPct = 85,
+      criticalThresholdPct = 100,
+      spendSource = 'auto',
+      manualActualAmount = 0,
+      notes = '',
+    } = req.body ?? {};
+
+    const periodId = Number(fiscalPeriodId);
+    const cleanName = String(name ?? '').trim();
+    const planned = Number(plannedAmount);
+    const warnPct = Number(warningThresholdPct);
+    const critPct = Number(criticalThresholdPct);
+    const manualAmt = Number(manualActualAmount) || 0;
+
+    if (!Number.isFinite(periodId) || periodId <= 0 || !cleanName || !Number.isFinite(planned) || planned < 0) {
+      res.status(400).json({ error: 'Fiscal period, budget name, and non-negative planned amount are required.' });
+      return;
+    }
+    const period = (await db.prepare('SELECT id, code FROM fiscal_periods WHERE id = ?').get(periodId)) as
+      | { id: number; code: string }
+      | undefined;
+    if (!period) {
+      res.status(404).json({ error: 'Selected fiscal period not found.' });
+      return;
+    }
+
+    const boundedWarn = Number.isFinite(warnPct) ? Math.max(1, Math.min(500, warnPct)) : 85;
+    const boundedCrit = Number.isFinite(critPct) ? Math.max(boundedWarn, Math.min(500, critPct)) : 100;
+    const cleanSource = VALID_SPEND_SOURCES.includes(spendSource) ? spendSource : 'auto';
+    const ref = await seqRef('fiscal_budgets', 'BUD');
+
+    const info = await db
+      .prepare(
+        `INSERT INTO fiscal_budgets
+         (ref, fiscal_period_id, name, category, department, account_code, planned_amount,
+          warning_threshold_pct, critical_threshold_pct, spend_source, manual_actual_amount, notes, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ref,
+        periodId,
+        cleanName,
+        String(category).trim() || 'Operating Expenses',
+        String(department).trim() || 'General',
+        String(accountCode).trim(),
+        Math.round(planned * 100) / 100,
+        boundedWarn,
+        boundedCrit,
+        cleanSource,
+        Math.round(manualAmt * 100) / 100,
+        String(notes).trim(),
+        req.authUser!.email
+      );
+
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'CREATE_FISCAL_BUDGET',
+      module: 'billing',
+      entityRef: ref,
+      details: `Created fiscal budget ${ref} (${cleanName}) for ${period.code}: $${planned.toFixed(2)}`,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(await db.prepare('SELECT * FROM fiscal_budgets WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/finance/budgets/:id', authenticate, requirePermission('billing', 'write'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT * FROM fiscal_budgets WHERE id = ?').get(id)) as
+      | {
+          id: number;
+          ref: string;
+          fiscal_period_id: number;
+          planned_amount: number;
+          warning_threshold_pct: number;
+          critical_threshold_pct: number;
+        }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fiscal budget not found.' });
+      return;
+    }
+
+    const {
+      fiscalPeriodId,
+      name,
+      category,
+      department,
+      accountCode,
+      plannedAmount,
+      warningThresholdPct,
+      criticalThresholdPct,
+      spendSource,
+      manualActualAmount,
+      notes,
+    } = req.body ?? {};
+
+    let nextPeriodId: number | null = null;
+    if (fiscalPeriodId !== undefined) {
+      const pid = Number(fiscalPeriodId);
+      const period = await db.prepare('SELECT id FROM fiscal_periods WHERE id = ?').get(pid);
+      if (!period) {
+        res.status(404).json({ error: 'Selected fiscal period not found.' });
+        return;
+      }
+      nextPeriodId = pid;
+    }
+
+    const nextPlanned =
+      plannedAmount !== undefined ? Math.max(0, Number(plannedAmount) || 0) : existing.planned_amount;
+    const nextWarn =
+      warningThresholdPct !== undefined
+        ? Math.max(1, Math.min(500, Number(warningThresholdPct) || 85))
+        : existing.warning_threshold_pct;
+    const nextCrit =
+      criticalThresholdPct !== undefined
+        ? Math.max(nextWarn, Math.min(500, Number(criticalThresholdPct) || 100))
+        : Math.max(nextWarn, existing.critical_threshold_pct);
+
+    await db
+      .prepare(
+        `UPDATE fiscal_budgets
+         SET fiscal_period_id = COALESCE(?, fiscal_period_id),
+             name = COALESCE(?, name),
+             category = COALESCE(?, category),
+             department = COALESCE(?, department),
+             account_code = COALESCE(?, account_code),
+             planned_amount = ?,
+             warning_threshold_pct = ?,
+             critical_threshold_pct = ?,
+             spend_source = COALESCE(?, spend_source),
+             manual_actual_amount = COALESCE(?, manual_actual_amount),
+             notes = COALESCE(?, notes),
+             updated_at = datetime('now')
+         WHERE id = ?`
+      )
+      .run(
+        nextPeriodId,
+        name ? String(name).trim() : null,
+        category ? String(category).trim() : null,
+        department !== undefined ? String(department).trim() : null,
+        accountCode !== undefined ? String(accountCode).trim() : null,
+        Math.round(nextPlanned * 100) / 100,
+        nextWarn,
+        nextCrit,
+        VALID_SPEND_SOURCES.includes(spendSource) ? spendSource : null,
+        manualActualAmount !== undefined ? Math.round((Number(manualActualAmount) || 0) * 100) / 100 : null,
+        notes !== undefined ? String(notes).trim() : null,
+        id
+      );
+
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'UPDATE_FISCAL_BUDGET',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Updated fiscal budget ${existing.ref} ($${nextPlanned.toFixed(2)})`,
+      ipAddress: getClientIp(req),
+    });
+    res.json(await db.prepare('SELECT * FROM fiscal_budgets WHERE id = ?').get(id));
+  });
+
+  router.delete('/finance/budgets/:id', authenticate, requirePermission('billing', 'delete'), async (req: AuthenticatedReq, res) => {
+    const id = Number(req.params.id);
+    const existing = (await db.prepare('SELECT ref, name FROM fiscal_budgets WHERE id = ?').get(id)) as
+      | { ref: string; name: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Fiscal budget not found.' });
+      return;
+    }
+    await db.prepare('DELETE FROM fiscal_budgets WHERE id = ?').run(id);
+    await writeAuditLog(db, {
+      userId: req.authUser!.id,
+      userEmail: req.authUser!.email,
+      action: 'DELETE_FISCAL_BUDGET',
+      module: 'billing',
+      entityRef: existing.ref,
+      details: `Deleted fiscal budget ${existing.ref} (${existing.name})`,
       ipAddress: getClientIp(req),
       severity: 'warning',
     });
@@ -3670,13 +6994,16 @@ ${txBlocks}
     }
     const parsedLines = JSON.parse(tpl.lines_json || '[]');
     const totals = computeFinanceLinesTotals(parsedLines);
-    const currRow = (await db.prepare('SELECT exchange_rate FROM currencies WHERE code = ?').get(tpl.currency)) as
-      | { exchange_rate: number }
-      | undefined;
-    const fxRate = currRow?.exchange_rate && currRow.exchange_rate > 0 ? currRow.exchange_rate : 1;
+    const issueDate = new Date().toISOString().slice(0, 10);
+    let fxRate = 1;
+    try {
+      const resolved = await currencyService.resolveExchangeRate(tpl.currency || 'USD', { txDate: issueDate });
+      fxRate = resolved.exchangeRate;
+    } catch {
+      fxRate = 1;
+    }
     const prefix = tpl.invoice_type === 'supplier' ? 'SI' : 'IN';
     const invRef = await nextSequenceRef('invoices', prefix);
-    const issueDate = new Date().toISOString().slice(0, 10);
     const dueDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
     const nextRun = advanceRecurringDate(tpl.next_run_date || issueDate, tpl.frequency);
 

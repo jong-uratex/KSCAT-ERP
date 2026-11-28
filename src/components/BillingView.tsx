@@ -1,11 +1,16 @@
 import { useEffect, useState } from 'react';
 import {
+  ArrowLeftRight,
   BookOpen,
   Briefcase,
+  Building2,
   Coins,
+  FileSpreadsheet,
   HeartHandshake,
   Landmark,
   Receipt,
+  Scale,
+  Target,
   Wallet,
 } from 'lucide-react';
 import { apiRequest, can } from '../lib/api';
@@ -36,9 +41,14 @@ import type {
 } from '../types/erp';
 import { ConfirmDeleteModal } from './Modal';
 import { FinanceAccountingSection } from './finance/FinanceAccountingSection';
+import { FinanceBankReconciliation } from './finance/FinanceBankReconciliation';
+import { FinanceBudgetsTab } from './finance/FinanceBudgetsTab';
 import { FinanceDonationsLoansTab } from './finance/FinanceDonationsLoansTab';
+import { FinanceFixedAssetsTab } from './finance/FinanceFixedAssetsTab';
+import { FinanceGeneralLedgerReport } from './finance/FinanceGeneralLedgerReport';
 import { FinanceInvoicesSection } from './finance/FinanceInvoicesSection';
 import { FinanceProjectAccountingSection } from './finance/FinanceProjectAccountingSection';
+import { FinanceTaxComplianceTab } from './finance/FinanceTaxComplianceTab';
 import { FinanceTaxCurrencySection } from './finance/FinanceTaxCurrencySection';
 import { FinanceTreasurySection } from './finance/FinanceTreasurySection';
 
@@ -62,7 +72,12 @@ type BillingTab =
   | 'supplier_bills'
   | 'project_accounting'
   | 'treasury'
+  | 'bank_reconciliation'
+  | 'general_ledger'
   | 'accounting'
+  | 'budgets'
+  | 'fixed_assets'
+  | 'tax_compliance'
   | 'tax_fx'
   | 'donations_loans';
 
@@ -127,6 +142,7 @@ export function BillingView({ permissions, enabledModules, focusHint, onNotify }
   } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState('');
+  const [reconRefreshTick, setReconRefreshTick] = useState(0);
 
   const canWrite = can(permissions, 'billing', 'write');
   const canValidate = can(permissions, 'billing', 'validate');
@@ -200,7 +216,13 @@ export function BillingView({ permissions, enabledModules, focusHint, onNotify }
       focusHint.subTab === 'supplier_bills' ||
       focusHint.subTab === 'project_accounting' ||
       focusHint.subTab === 'treasury' ||
-      focusHint.subTab === 'accounting'
+      focusHint.subTab === 'bank_reconciliation' ||
+      focusHint.subTab === 'general_ledger' ||
+      focusHint.subTab === 'accounting' ||
+      focusHint.subTab === 'budgets' ||
+      focusHint.subTab === 'fixed_assets' ||
+      focusHint.subTab === 'tax_compliance' ||
+      focusHint.subTab === 'tax_fx'
     ) {
       setTab(focusHint.subTab);
     }
@@ -219,6 +241,7 @@ export function BillingView({ permissions, enabledModules, focusHint, onNotify }
       await apiRequest(deleteTarget.url, { method: 'DELETE' });
       onNotify(`${deleteTarget.itemLabel} deleted.`);
       setDeleteTarget(null);
+      setReconRefreshTick((t) => t + 1);
       await loadBilling();
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : 'Unable to delete record.');
@@ -248,7 +271,16 @@ export function BillingView({ permissions, enabledModules, focusHint, onNotify }
             ['supplier_bills', `Supplier Bills & AP (${invoices.filter((i) => i.invoice_type === 'supplier').length})`, Wallet],
             ['project_accounting', `Project Accounting (${projectProfitability.length})`, Briefcase],
             ['treasury', `Treasury & SEPA (${accounts.length})`, Landmark],
-            ...(showAccounting ? ([['accounting', 'GL & Statements', BookOpen]] as const) : []),
+            ...(showAccounting
+              ? ([
+                  ['bank_reconciliation', 'Bank Reconciliation', ArrowLeftRight],
+                  ['general_ledger', 'General Ledger', FileSpreadsheet],
+                  ['accounting', 'GL & Statements', BookOpen],
+                ] as const)
+              : []),
+            ['budgets', 'Budgets', Target],
+            ['fixed_assets', `Fixed Assets (${fixedAssets.length})`, Building2],
+            ['tax_compliance', 'Tax Compliance', Scale],
             ['tax_fx', 'Tax, FX & Margins', Coins],
             ['donations_loans', `Grants & Loans (${donations.length + loans.length})`, HeartHandshake],
           ] as const
@@ -314,6 +346,22 @@ export function BillingView({ permissions, enabledModules, focusHint, onNotify }
           onNotify={onNotify}
           onPromptDelete={promptDelete}
         />
+      ) : tab === 'bank_reconciliation' ? (
+        <FinanceBankReconciliation
+          canWrite={canWrite}
+          canRecordPay={canRecordPay}
+          canDelete={canDelete}
+          refreshTick={reconRefreshTick}
+          onReload={loadBilling}
+          onNotify={onNotify}
+          onPromptDelete={promptDelete}
+        />
+      ) : tab === 'general_ledger' ? (
+        <FinanceGeneralLedgerReport
+          canWrite={canWrite}
+          onReload={loadBilling}
+          onNotify={onNotify}
+        />
       ) : tab === 'accounting' ? (
         <FinanceAccountingSection
           accounts={glAccounts}
@@ -329,6 +377,26 @@ export function BillingView({ permissions, enabledModules, focusHint, onNotify }
           onNotify={onNotify}
           onPromptDelete={promptDelete}
         />
+      ) : tab === 'budgets' ? (
+        <FinanceBudgetsTab
+          canWrite={canWrite}
+          canDelete={canDelete}
+          refreshTick={reconRefreshTick}
+          onNotify={onNotify}
+          onPromptDelete={promptDelete}
+        />
+      ) : tab === 'fixed_assets' ? (
+        <FinanceFixedAssetsTab
+          fixedAssets={fixedAssets}
+          fiscalPeriods={fiscalPeriods}
+          canWrite={canWrite}
+          canDelete={canDelete}
+          onReload={loadBilling}
+          onNotify={onNotify}
+          onPromptDelete={promptDelete}
+        />
+      ) : tab === 'tax_compliance' ? (
+        <FinanceTaxComplianceTab onNotify={onNotify} />
       ) : tab === 'tax_fx' ? (
         <FinanceTaxCurrencySection
           currencies={currencies}

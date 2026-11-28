@@ -80,6 +80,14 @@ const STATUS_MAP: Record<string, { label: string; colorClass: string; Icon: type
   ended: { label: 'Ended', colorClass: 'text-zinc-500 dark:text-zinc-400', Icon: Lock },
   fully_depreciated: { label: 'Fully Depreciated', colorClass: 'text-zinc-600 dark:text-zinc-400', Icon: CheckCircle2 },
   disposed: { label: 'Disposed', colorClass: 'text-red-700 dark:text-red-400', Icon: XCircle },
+  posted: { label: 'Posted', colorClass: 'text-emerald-700 dark:text-emerald-400', Icon: CheckCircle2 },
+  reversal: { label: 'Reversal', colorClass: 'text-amber-700 dark:text-amber-400', Icon: Clock },
+  reversed: { label: 'Reversed', colorClass: 'text-zinc-500 dark:text-zinc-400', Icon: FileEdit },
+  matched: { label: 'Matched', colorClass: 'text-emerald-700 dark:text-emerald-400', Icon: CheckCircle2 },
+  unmatched: { label: 'Unmatched', colorClass: 'text-amber-700 dark:text-amber-400', Icon: Clock },
+  ignored: { label: 'Ignored', colorClass: 'text-zinc-500 dark:text-zinc-400', Icon: XCircle },
+  on_track: { label: 'On Track', colorClass: 'text-emerald-700 dark:text-emerald-400', Icon: CheckCircle2 },
+  over_budget: { label: 'Over Budget', colorClass: 'text-red-700 dark:text-red-400', Icon: AlertCircle },
 };
 
 export function StatusText({ status }: { status: string }) {

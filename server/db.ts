@@ -473,6 +473,42 @@ export const SCHEMA_SQL = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS bank_statements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    bank_account_id INTEGER NOT NULL REFERENCES bank_accounts(id) ON DELETE CASCADE,
+    statement_name TEXT NOT NULL,
+    statement_date TEXT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    opening_balance REAL NOT NULL DEFAULT 0,
+    closing_balance REAL NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    source_type TEXT NOT NULL DEFAULT 'manual' CHECK (source_type IN ('manual', 'csv')),
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'reconciled')),
+    notes TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS bank_statement_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    statement_id INTEGER NOT NULL REFERENCES bank_statements(id) ON DELETE CASCADE,
+    tx_date TEXT NOT NULL,
+    description TEXT NOT NULL,
+    reference TEXT NOT NULL DEFAULT '',
+    direction TEXT NOT NULL CHECK (direction IN ('credit', 'debit')),
+    amount REAL NOT NULL,
+    running_balance REAL,
+    match_status TEXT NOT NULL DEFAULT 'unmatched' CHECK (match_status IN ('unmatched', 'matched', 'ignored')),
+    matched_journal_entry_id INTEGER REFERENCES journal_entries(id) ON DELETE SET NULL,
+    matched_journal_ref TEXT NOT NULL DEFAULT '',
+    matched_at TEXT NOT NULL DEFAULT '',
+    matched_by TEXT NOT NULL DEFAULT '',
+    match_note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS accounting_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT NOT NULL UNIQUE,
@@ -491,6 +527,9 @@ export const SCHEMA_SQL = `
     debit_account_code TEXT NOT NULL,
     credit_account_code TEXT NOT NULL,
     amount REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    exchange_rate REAL NOT NULL DEFAULT 1,
+    original_amount REAL NOT NULL DEFAULT 0,
     source_ref TEXT NOT NULL DEFAULT '',
     project_id INTEGER,
     is_reversal INTEGER NOT NULL DEFAULT 0,
@@ -521,6 +560,23 @@ export const SCHEMA_SQL = `
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS currency_period_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    currency_code TEXT NOT NULL,
+    fiscal_period_id INTEGER REFERENCES fiscal_periods(id) ON DELETE CASCADE,
+    period_code TEXT NOT NULL DEFAULT '',
+    effective_from TEXT NOT NULL,
+    effective_to TEXT NOT NULL,
+    exchange_rate REAL NOT NULL,
+    closing_rate REAL NOT NULL DEFAULT 0,
+    rate_source TEXT NOT NULL DEFAULT 'manual',
+    notes TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(currency_code, effective_from, effective_to)
+  );
+
   CREATE TABLE IF NOT EXISTS tax_rates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT NOT NULL UNIQUE,
@@ -544,6 +600,25 @@ export const SCHEMA_SQL = `
     hourly_cost_rate REAL NOT NULL DEFAULT 65,
     hourly_bill_rate REAL NOT NULL DEFAULT 145,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS fiscal_budgets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL UNIQUE,
+    fiscal_period_id INTEGER NOT NULL REFERENCES fiscal_periods(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'Operating Expenses',
+    department TEXT NOT NULL DEFAULT 'General',
+    account_code TEXT NOT NULL DEFAULT '',
+    planned_amount REAL NOT NULL DEFAULT 0,
+    warning_threshold_pct REAL NOT NULL DEFAULT 85,
+    critical_threshold_pct REAL NOT NULL DEFAULT 100,
+    spend_source TEXT NOT NULL DEFAULT 'auto' CHECK (spend_source IN ('auto', 'gl_account', 'supplier_bills', 'payroll', 'bank_debits', 'expenses', 'manual')),
+    manual_actual_amount REAL NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
   CREATE TABLE IF NOT EXISTS fixed_assets (
@@ -1578,6 +1653,223 @@ export async function seedFinanceExtendedData(db: DbClient, actorEmail: string):
         );
     }
   }
+
+  await seedBankReconciliationData(db, actorEmail);
+  await seedFiscalBudgetsData(db, actorEmail);
+  await seedCurrencyPeriodRatesData(db, actorEmail);
+}
+
+export async function seedCurrencyPeriodRatesData(db: DbClient, actorEmail: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO accounting_accounts (code, label, account_class, balance)
+       VALUES
+       ('4300', 'Realized & Unrealized FX Gain', 'revenue', 0.0),
+       ('6350', 'Realized & Unrealized FX Loss', 'expense', 0.0)`
+    )
+    .run();
+
+  const existingCnt = (await db.prepare('SELECT COUNT(*) as cnt FROM currency_period_rates').get()) as { cnt: number };
+  if (existingCnt.cnt > 0) return;
+
+  const periods = (await db
+    .prepare('SELECT id, code, start_date, end_date FROM fiscal_periods ORDER BY start_date ASC')
+    .all()) as Array<{ id: number; code: string; start_date: string; end_date: string }>;
+  if (periods.length === 0) return;
+
+  const periodRatesByCode: Record<
+    string,
+    Array<{ currency: string; rate: number; closing: number; source: string; notes: string }>
+  > = {
+    'FY2026-Q3': [
+      { currency: 'EUR', rate: 0.91, closing: 0.912, source: 'ecb', notes: 'Q3 consolidated average reference rate' },
+      { currency: 'PHP', rate: 56.8, closing: 57.1, source: 'bsp', notes: 'Q3 BSP weighted reference rate' },
+      { currency: 'GBP', rate: 0.78, closing: 0.782, source: 'fed', notes: 'Q3 Bank of England / Fed cross rate' },
+      { currency: 'JPY', rate: 149.2, closing: 150.1, source: 'fed', notes: 'Q3 BOJ settlement average' },
+    ],
+    'FY2026-10': [
+      { currency: 'EUR', rate: 0.915, closing: 0.918, source: 'ecb', notes: 'October monthly close average rate' },
+      { currency: 'PHP', rate: 57.4, closing: 57.8, source: 'bsp', notes: 'October BSP monthly reference rate' },
+      { currency: 'GBP', rate: 0.785, closing: 0.788, source: 'fed', notes: 'October monthly treasury rate' },
+      { currency: 'JPY', rate: 151.0, closing: 151.8, source: 'fed', notes: 'October monthly settlement rate' },
+    ],
+    'FY2026-11': [
+      { currency: 'EUR', rate: 0.92, closing: 0.925, source: 'ecb', notes: 'November operating period rate (ECB fixing)' },
+      { currency: 'PHP', rate: 58.2, closing: 58.5, source: 'bsp', notes: 'November BSP daily average' },
+      { currency: 'GBP', rate: 0.79, closing: 0.793, source: 'fed', notes: 'November corporate treasury desk rate' },
+      { currency: 'JPY', rate: 152.5, closing: 153.2, source: 'fed', notes: 'November Tokyo benchmark rate' },
+    ],
+    'FY2026-12': [
+      { currency: 'EUR', rate: 0.93, closing: 0.93, source: 'manual', notes: 'December year-end budget & close forecast rate' },
+      { currency: 'PHP', rate: 58.75, closing: 58.75, source: 'manual', notes: 'December year-end treasury rate' },
+      { currency: 'GBP', rate: 0.792, closing: 0.792, source: 'manual', notes: 'December year-end treasury rate' },
+      { currency: 'JPY', rate: 153.4, closing: 153.4, source: 'manual', notes: 'December year-end treasury rate' },
+    ],
+  };
+
+  const ins = db.prepare(
+    `INSERT OR IGNORE INTO currency_period_rates
+     (currency_code, fiscal_period_id, period_code, effective_from, effective_to, exchange_rate, closing_rate, rate_source, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  for (const fp of periods) {
+    const entries = periodRatesByCode[fp.code];
+    if (!entries) continue;
+    for (const entry of entries) {
+      await ins.run(
+        entry.currency,
+        fp.id,
+        fp.code,
+        fp.start_date,
+        fp.end_date,
+        entry.rate,
+        entry.closing,
+        entry.source,
+        entry.notes,
+        actorEmail
+      );
+    }
+  }
+}
+
+export async function seedFiscalBudgetsData(db: DbClient, actorEmail: string): Promise<void> {
+  const bCnt = (await db.prepare('SELECT COUNT(*) as cnt FROM fiscal_budgets').get()) as { cnt: number };
+  if (bCnt.cnt > 0) return;
+
+  const periods = (await db
+    .prepare('SELECT id, code FROM fiscal_periods')
+    .all()) as Array<{ id: number; code: string }>;
+  const nov = periods.find((p) => p.code === 'FY2026-11') ?? periods[0];
+  const dec = periods.find((p) => p.code === 'FY2026-12') ?? nov;
+  if (!nov) return;
+
+  const ins = db.prepare(
+    `INSERT INTO fiscal_budgets (ref, fiscal_period_id, name, category, department, account_code, planned_amount, warning_threshold_pct, critical_threshold_pct, spend_source, manual_actual_amount, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  await ins.run(
+    'BUD2611-0001',
+    nov.id,
+    'Direct Inventory & Component Purchases',
+    'Cost of Goods Sold',
+    'Procurement',
+    '5000',
+    8000,
+    85,
+    100,
+    'auto',
+    0,
+    'Monthly supplier procurement ceiling for telemetry hardware replenishment.',
+    actorEmail
+  );
+  await ins.run(
+    'BUD2611-0002',
+    nov.id,
+    'Facilities & Warehouse Lease',
+    'Facilities',
+    'Operations',
+    '6100',
+    6500,
+    85,
+    100,
+    'auto',
+    0,
+    'Chicago distribution center lease and facility overhead budget.',
+    actorEmail
+  );
+  await ins.run(
+    'BUD2611-0003',
+    nov.id,
+    'Payroll & Employee Benefits',
+    'Payroll & Benefits',
+    'Human Resources',
+    '6200',
+    22000,
+    85,
+    100,
+    'auto',
+    0,
+    'Monthly gross payroll and statutory benefit allocation.',
+    actorEmail
+  );
+  await ins.run(
+    'BUD2611-0004',
+    nov.id,
+    'Equipment Depreciation Reserve',
+    'Depreciation & Amortization',
+    'Finance',
+    '6300',
+    1500,
+    85,
+    100,
+    'auto',
+    0,
+    'Monthly scheduled depreciation accrual on plant and calibration assets.',
+    actorEmail
+  );
+  if (dec) {
+    await ins.run(
+      'BUD2612-0001',
+      dec.id,
+      'December Facilities & Year-End Logistics',
+      'Facilities',
+      'Operations',
+      '6100',
+      9000,
+      85,
+      100,
+      'auto',
+      0,
+      'Planned December facility operations and holiday dispatch capacity.',
+      actorEmail
+    );
+  }
+}
+
+export async function seedBankReconciliationData(db: DbClient, actorEmail: string): Promise<void> {
+  const stmtCnt = (await db.prepare('SELECT COUNT(*) as cnt FROM bank_statements').get()) as { cnt: number };
+  if (stmtCnt.cnt > 0) return;
+
+  const opsBank = (await db
+    .prepare("SELECT id, currency FROM bank_accounts ORDER BY CASE WHEN ref = 'BNK-OPS' THEN 0 ELSE 1 END, id ASC LIMIT 1")
+    .get()) as { id: number; currency: string } | undefined;
+  if (!opsBank) return;
+
+  const matchedJe = (await db
+    .prepare("SELECT id, ref, amount FROM journal_entries WHERE ref = 'JRN2611-0002' LIMIT 1")
+    .get()) as { id: number; ref: string; amount: number } | undefined;
+
+  const info = await db
+    .prepare(
+      `INSERT INTO bank_statements (ref, bank_account_id, statement_name, statement_date, period_start, period_end, opening_balance, closing_balance, currency, source_type, status, notes, created_by)
+       VALUES ('BST2611-0001', ?, 'November 2026 Operating Statement', '2026-11-30', '2026-11-01', '2026-11-30', 142729.0, 148920.8, ?, 'csv', 'in_progress', 'Corporate Checking monthly bank statement extract.', ?)`
+    )
+    .run(opsBank.id, opsBank.currency || 'USD', actorEmail);
+
+  const statementId = Number(info.lastInsertRowid);
+  await db
+    .prepare(
+      `INSERT INTO bank_statement_lines (statement_id, tx_date, description, reference, direction, amount, running_balance, match_status, matched_journal_entry_id, matched_journal_ref, matched_at, matched_by, match_note)
+       VALUES
+       (?, '2026-11-01', 'ACH DEBIT CHICAGO DISTRIBUTION WAREHOUSE LEASE', 'LEASE-NOV26', 'debit', 6800.0, 135929.0, 'unmatched', NULL, '', '', '', ''),
+       (?, '2026-11-14', 'WIRE INVOICE IN2611-0001 NORTHWIND MFG CO', 'IN2611-0001', 'credit', 8836.8, 144765.8, ?, ?, ?, ?, ?, ?),
+       (?, '2026-11-18', 'MONTHLY TREASURY WIRE & SERVICE CHARGE', 'FEE-2611-18', 'debit', 45.0, 144720.8, 'unmatched', NULL, '', '', '', ''),
+       (?, '2026-11-22', 'INBOUND WIRE VESPERA LOGISTICS DEPOSIT', 'VESPERA-DEP', 'credit', 4200.0, 148920.8, 'unmatched', NULL, '', '', '', '')`
+    )
+    .run(
+      statementId,
+      statementId,
+      matchedJe ? 'matched' : 'unmatched',
+      matchedJe ? matchedJe.id : null,
+      matchedJe ? matchedJe.ref : '',
+      matchedJe ? '2026-11-15T09:30:00Z' : '',
+      matchedJe ? actorEmail : '',
+      matchedJe ? 'Auto-verified against customer settlement entry' : '',
+      statementId,
+      statementId
+    );
 }
 
 export async function seedHrExtendedData(db: DbClient, actorEmail: string): Promise<void> {
@@ -2353,10 +2645,13 @@ export async function initDatabase(db: DbClient): Promise<void> {
       const row = await db.prepare('SELECT id FROM system_settings WHERE id = 1').get();
       await db.prepare('SELECT invoice_kind, project_id, currency FROM invoices LIMIT 1').get();
       await db.prepare('SELECT reconciled FROM bank_transactions LIMIT 1').get();
-      await db.prepare('SELECT project_id FROM journal_entries LIMIT 1').get();
+      await db.prepare('SELECT project_id, currency, exchange_rate, original_amount FROM journal_entries LIMIT 1').get();
       await db.prepare('SELECT id FROM fixed_assets LIMIT 1').get();
       await db.prepare('SELECT tax_id FROM employees LIMIT 1').get();
       await db.prepare('SELECT id FROM kpi_evaluations LIMIT 1').get();
+      await db.prepare('SELECT id FROM bank_statement_lines LIMIT 1').get();
+      await db.prepare('SELECT id FROM fiscal_budgets LIMIT 1').get();
+      await db.prepare('SELECT id FROM currency_period_rates LIMIT 1').get();
       if (row) {
         d1IsolateSchemaReady = true;
         initializedDbs.add(db);
@@ -2389,6 +2684,9 @@ export async function initDatabase(db: DbClient): Promise<void> {
   await ensureColumn(db, 'bank_transactions', 'reconciled_at', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn(db, 'bank_transactions', 'statement_ref', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn(db, 'journal_entries', 'project_id', 'INTEGER');
+  await ensureColumn(db, 'journal_entries', 'currency', "TEXT NOT NULL DEFAULT 'USD'");
+  await ensureColumn(db, 'journal_entries', 'exchange_rate', 'REAL NOT NULL DEFAULT 1');
+  await ensureColumn(db, 'journal_entries', 'original_amount', 'REAL NOT NULL DEFAULT 0');
   await ensureColumn(db, 'journal_entries', 'is_reversal', 'INTEGER NOT NULL DEFAULT 0');
   await ensureColumn(db, 'journal_entries', 'reversed_entry_ref', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn(db, 'employees', 'employment_type', "TEXT NOT NULL DEFAULT 'Full-Time'");
@@ -2405,6 +2703,9 @@ export async function initDatabase(db: DbClient): Promise<void> {
     await seedExtendedBusinessData(db, 'system-upgrade');
     await seedHrExtendedData(db, 'system-upgrade');
     await seedFinanceExtendedData(db, 'system-upgrade');
+    await seedBankReconciliationData(db, 'system-upgrade');
+    await seedFiscalBudgetsData(db, 'system-upgrade');
+    await seedCurrencyPeriodRatesData(db, 'system-upgrade');
   }
 
   if (db.dialect === 'd1') {
